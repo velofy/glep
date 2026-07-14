@@ -43,13 +43,15 @@ glep index                   explicit (re)build; also lazy on first query
 glep status                  index stats: file count, size, segments, last update
 ```
 
-Flags mirror ripgrep where they overlap: `-i`, `-F`, `-l`, `-g <glob>`, `-t <type>`, `-C <n>`, `--json`. Default human output is byte-compatible with ripgrep's format; `--json` emits machine-readable matches for agents.
+Flags mirror ripgrep where they overlap: `-i`, `-F`, `-l`, `-g <glob>`, `-t <type>` (type table inherited from the `ignore` crate), `-C <n>`, `--json`. Default output is byte-compatible with ripgrep's `--color=never` format (parity is defined against that form); `--json` emits machine-readable matches for agents.
+
+**`--ttl <secs>` (default 0):** skip the freshness sweep if the last one ran within the window. Default always sweeps — always correct. Agents doing read-only exploration bursts can pass e.g. `--ttl 5` to amortize the sweep across consecutive queries; the skill teaches to drop the flag after any file edit.
 
 ## Index format
 
 Directory `.glep/` at project root (added to `.gitignore` on creation). Two memory-mapped files, versioned headers, atomic write-temp-rename updates, advisory flock: single writer, many readers.
 
-- **`manifest`** — file table: path, file ID, mtime, size, skip-flag (binary or over size cap). Doubles as the glob corpus: `--files` filters these paths in memory and never touches the filesystem.
+- **`manifest`** — file table: path, file ID, mtime, size, skip-flag (binary or over size cap). Doubles as the glob corpus: beyond the freshness sweep, `--files` filters these paths in memory with no further filesystem I/O.
 - **`postings`** — trigram → delta-encoded sorted file-ID list. Trigrams are raw bytes; no case folding stored. `-i` expands case variants of each trigram at query time (≤8 lookups per trigram).
 
 **Incremental updates are log-structured:** changed/new files append to a small delta segment; replaced/deleted file IDs enter a tombstone set; delta segments compact into the main index past a size threshold. Query = union over segments minus tombstones. Per-query freshness cost is proportional to what changed, never to repo size.
@@ -91,9 +93,11 @@ Theme: never wrong, never stuck.
 
 ## Success criteria
 
-- Warm content query < 20ms on a 20k-file repo (vs ~100–300ms cold rg).
-- Warm content query < 100ms on a 300k-file monorepo (vs multi-second cold rg).
-- `--files` glob < 10ms regardless of repo size.
+The freshness sweep scales with file count and dominates warm-query time on large repos; criteria are stated end-to-end (sweep included) and sweep-skipped (`--ttl` hit):
+
+- 20k-file repo: warm content query < 50ms end-to-end, < 20ms sweep-skipped (vs ~100–300ms cold rg).
+- 300k-file monorepo: < 300ms end-to-end, < 30ms sweep-skipped (vs multi-second cold rg).
+- `--files` glob: < 10ms past the sweep, any repo size.
 - Zero parity mismatches vs ripgrep in the differential harness.
 - A Claude Code session in an indexed repo routes searches through glep without being asked (hook + skill working).
 
