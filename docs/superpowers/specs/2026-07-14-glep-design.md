@@ -101,6 +101,15 @@ The freshness sweep scales with file count and dominates warm-query time on larg
 - Zero parity mismatches vs ripgrep in the differential harness.
 - A Claude Code session in an indexed repo routes searches through glep without being asked (hook + skill working).
 
+## Distribution
+
+Name verified available on PyPI, crates.io, and GitHub (2026-07-14).
+
+- **PyPI**: `pip install glep` — binary wheels built with maturin (the ruff model: Rust binary, Python-ecosystem reach).
+- **crates.io**: `cargo install glep`.
+- **GitHub**: github.com/anishfyi/glep — releases with prebuilt macOS/Linux binaries.
+- Homebrew tap later, if adoption warrants.
+
 ## Out of scope (v1)
 
 - Multi-repo / machine-wide indexes (index format shouldn't preclude it, but no v1 work).
