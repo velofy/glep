@@ -163,6 +163,11 @@ impl Index {
         v.sort();
         v
     }
+
+    #[cfg(test)]
+    fn has_delta(&self) -> bool {
+        self.delta.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -239,13 +244,23 @@ mod tests {
     }
 
     #[test]
-    fn stale_delta_is_ignored() {
+    fn stale_delta_is_ignored_matching_delta_attaches() {
         let dir = corpus();
         Index::build(dir.path(), 1_048_576).unwrap();
         let mut map = std::collections::BTreeMap::new();
         map.insert(0x0061_6263u32, vec![0u32]);
+
+        // Stale generation: delta must be dropped.
         postings::write(&dir.path().join(".glep/delta.bin"), &map, 12345).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(!idx.has_delta());
         assert_eq!(idx.live_files().len(), 4);
+        drop(idx);
+
+        // Matching generation: delta must attach.
+        let man = manifest::Manifest::load(&dir.path().join(".glep/manifest.bin")).unwrap();
+        postings::write(&dir.path().join(".glep/delta.bin"), &map, man.generation).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(idx.has_delta());
     }
 }
