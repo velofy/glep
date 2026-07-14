@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 200" role="img" aria-label="glep: indexed grep and glob">
+  <!-- plaque -->
+  <rect x="0" y="0" width="480" height="200" rx="28" fill="#0E1A24"/>
+
+  <!-- wordmark: stroke-constructed lowercase, round terminals -->
+  <g stroke="#F3EDE3" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- g -->
+    <circle cx="158" cy="76" r="24"/>
+    <path d="M182 47 V118 Q182 138 160 138 L152 138"/>
+    <!-- l -->
+    <path d="M210 28 V107"/>
+    <!-- e -->
+    <path d="M230 76 H278"/>
+    <path d="M278 76 A24 24 0 1 0 266 97"/>
+    <!-- p -->
+    <path d="M302 45 V138"/>
+    <circle cx="326" cy="76" r="24"/>
+  </g>
+
+  <!-- trigram windows: gle / lep, overlapping on le -->
+  <rect x="132" y="156" width="148" height="8" rx="4" fill="#FFB454"/>
+  <rect x="203" y="170" width="149" height="8" rx="4" fill="#FF7847"/>
+</svg>

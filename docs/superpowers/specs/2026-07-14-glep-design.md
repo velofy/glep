@@ -1,12 +1,12 @@
-# glep — Design Spec
+# glep Design Spec
 
 **Date:** 2026-07-14
-**Status:** Approved pending user review
+**Status:** Approved
 **One-liner:** An indexed grep+glob CLI for AI agents. Ripgrep pays the full scan cost on every query; glep pays it once and answers subsequent queries from a persistent, self-healing trigram index.
 
 ## Purpose
 
-Claude Code agents call Grep and Glob constantly. Both re-traverse and (for Grep) re-scan the repo on every call. On monorepo-scale projects a single search costs seconds, multiplied across dozens of calls per session. glep replaces both tools with index-backed equivalents: warm content queries in ~1–20ms, glob listings with zero filesystem I/O.
+Claude Code agents call Grep and Glob constantly. Both re-traverse and (for Grep) re-scan the repo on every call. On monorepo-scale projects a single search costs seconds, multiplied across dozens of calls per session. glep replaces both tools with index-backed equivalents: warm content queries in ~1-20ms, glob listings with zero filesystem traversal.
 
 This is the same conclusion Cursor reached with their indexed search for agents (sparse n-grams, local index). glep is the no-daemon, open, CLI-shaped version of that idea, built on ripgrep's own crates so output correctness is inherited rather than reimplemented.
 
@@ -29,7 +29,7 @@ One binary, `glep`, no background processes. Four modules with narrow interfaces
 |---|---|---|
 | `walk` | Parallel gitignore-aware traversal + mtime sweep, via the `ignore` crate | `sweep(root) -> Vec<FileMeta>` |
 | `index` | Build/open/update/query the trigram index | `Index::open()`, `update(changes)`, `candidates(plan) -> FileSet` |
-| `query` | Regex → trigram query planning (Cox's algorithm), via `regex-syntax` | `plan(regex) -> Plan::{And, Or, All}` |
+| `query` | Regex to trigram query planning (Cox's algorithm), via `regex-syntax` | `plan(regex) -> Plan::{And, Or, All}` |
 | `search` | Run matches over candidate files, via `grep-searcher`/`grep-regex` | `run(pattern, files, opts) -> matches` |
 
 Key dependencies (all BurntSushi's ripgrep internals): `ignore`, `grep-searcher`, `grep-regex`, `regex-syntax`, plus `memmap2` for index access.
@@ -38,32 +38,32 @@ Key dependencies (all BurntSushi's ripgrep internals): `ignore`, `grep-searcher`
 
 ```
 glep <pattern> [path...]     content search (Grep replacement)
-glep --files [glob]          glob listing (Glob replacement) — pure index lookup
+glep --files [glob]          glob listing (Glob replacement), pure index lookup
 glep index                   explicit (re)build; also lazy on first query
 glep status                  index stats: file count, size, segments, last update
 ```
 
 Flags mirror ripgrep where they overlap: `-i`, `-F`, `-l`, `-g <glob>`, `-t <type>` (type table inherited from the `ignore` crate), `-C <n>`, `--json`. Default output is byte-compatible with ripgrep's `--color=never` format (parity is defined against that form); `--json` emits machine-readable matches for agents.
 
-**`--ttl <secs>` (default 0):** skip the freshness sweep if the last one ran within the window. Default always sweeps — always correct. Agents doing read-only exploration bursts can pass e.g. `--ttl 5` to amortize the sweep across consecutive queries; the skill teaches to drop the flag after any file edit.
+**`--ttl <secs>` (default 0):** skip the freshness sweep if the last one ran within the window. Default always sweeps, so results are always correct. Agents doing read-only exploration bursts can pass e.g. `--ttl 5` to amortize the sweep across consecutive queries; the skill teaches to drop the flag after any file edit.
 
 ## Index format
 
 Directory `.glep/` at project root (added to `.gitignore` on creation). Two memory-mapped files, versioned headers, atomic write-temp-rename updates, advisory flock: single writer, many readers.
 
-- **`manifest`** — file table: path, file ID, mtime, size, skip-flag (binary or over size cap). Doubles as the glob corpus: beyond the freshness sweep, `--files` filters these paths in memory with no further filesystem I/O.
-- **`postings`** — trigram → delta-encoded sorted file-ID list. Trigrams are raw bytes; no case folding stored. `-i` expands case variants of each trigram at query time (≤8 lookups per trigram).
+- **`manifest`**: file table with path, file ID, mtime, size, skip-flag (binary or over size cap). Doubles as the glob corpus: beyond the freshness sweep, `--files` filters these paths in memory with no further filesystem I/O.
+- **`postings`**: trigram to delta-encoded sorted file-ID list. Trigrams are raw bytes; no case folding stored. `-i` expands case variants of each trigram at query time (at most 8 lookups per trigram).
 
 **Incremental updates are log-structured:** changed/new files append to a small delta segment; replaced/deleted file IDs enter a tombstone set; delta segments compact into the main index past a size threshold. Query = union over segments minus tombstones. Per-query freshness cost is proportional to what changed, never to repo size.
 
 ## Query paths
 
 **Content query:**
-1. Sweep: parallel mtime+size walk, diff against manifest → reindex changed files, tombstone deleted ones.
-2. Plan: extract required literals from the regex → trigram plan (`AND` within a literal, `OR` across alternations).
-3. Candidates: intersect/union postings → candidate file set.
+1. Sweep: parallel mtime+size walk, diff against manifest, reindex changed files, tombstone deleted ones.
+2. Plan: extract required literals from the regex, build the trigram plan (`AND` within a literal, `OR` across alternations).
+3. Candidates: intersect/union postings into a candidate file set.
 4. Match: `grep-searcher` over candidates plus all skip-flagged text files (so results stay complete).
-5. Fallback: if the plan degenerates to `All` (`.*`, 1–2 char patterns), scan every manifest file in parallel — no traversal cost, so still faster than cold ripgrep. Never a wrong answer; worst case is rg-speed.
+5. Fallback: if the plan degenerates to `All` (`.*`, 1-2 char patterns), scan every manifest file in parallel. There is no traversal cost, so this still beats cold ripgrep. Never a wrong answer; worst case is rg-speed.
 
 **Glob query (`--files`):** match the glob against manifest paths in memory after the sweep. No I/O beyond the sweep itself.
 
@@ -71,18 +71,18 @@ Directory `.glep/` at project root (added to `.gitignore` on creation). Two memo
 
 ## Claude Code integration
 
-- **Skill** (`~/.claude/skills/glep/SKILL.md`): triggers on code-search tasks; teaches Grep→`glep`, Glob→`glep --files`, `--json` for parsing. Same distribution pattern as curl_reap.
-- **Hook**: `PreToolUse` on built-in `Grep` and `Glob`. The hook script translates tool params (pattern, path, glob, case mode, output mode) to an equivalent `glep` command line and denies with that suggestion, so the agent retries via Bash+glep. It passes through untouched when the glep binary is missing or the project has no `.glep/` — vanilla sessions are never broken.
+- **Skill** (`~/.claude/skills/glep/SKILL.md`): triggers on code-search tasks; teaches Grep to `glep`, Glob to `glep --files`, `--json` for parsing. Same distribution pattern as curl_reap.
+- **Hook**: `PreToolUse` on built-in `Grep` and `Glob`. The hook script translates the tool's params (pattern, path, glob, case mode, output mode) to an equivalent `glep` command line and denies with that suggestion, so the agent retries via Bash+glep. It passes through untouched when the glep binary is missing or the project has no `.glep/`, so vanilla sessions are never broken.
 
 ## Error handling
 
 Theme: never wrong, never stuck.
 
-- Corrupt or version-mismatched index → delete and rebuild automatically; note on stderr.
-- Writer lock held by another process → answer read-only from the existing index, live-scanning swept-as-changed files; skip the index write.
-- Oversized (default cap 1MB, `--max-filesize` to change) or unindexable files → skip-flagged in manifest, always live-scanned during content queries.
-- Not a git repo / no .gitignore → `ignore` crate degrades gracefully; glep works in any directory.
-- First build on a huge repo → progress on stderr; cost ≈ one ripgrep scan.
+- Corrupt or version-mismatched index: delete and rebuild automatically; note on stderr.
+- Writer lock held by another process: answer read-only from the existing index, live-scanning swept-as-changed files; skip the index write.
+- Oversized (default cap 1MB, `--max-filesize` to change) or unindexable files: skip-flagged in manifest, always live-scanned during content queries.
+- Not a git repo / no .gitignore: the `ignore` crate degrades gracefully; glep works in any directory.
+- First build on a huge repo: progress on stderr; cost is about one ripgrep scan.
 
 ## Testing
 
@@ -95,7 +95,7 @@ Theme: never wrong, never stuck.
 
 The freshness sweep scales with file count and dominates warm-query time on large repos; criteria are stated end-to-end (sweep included) and sweep-skipped (`--ttl` hit):
 
-- 20k-file repo: warm content query < 50ms end-to-end, < 20ms sweep-skipped (vs ~100–300ms cold rg).
+- 20k-file repo: warm content query < 50ms end-to-end, < 20ms sweep-skipped (vs ~100-300ms cold rg).
 - 300k-file monorepo: < 300ms end-to-end, < 30ms sweep-skipped (vs multi-second cold rg).
 - `--files` glob: < 10ms past the sweep, any repo size.
 - Zero parity mismatches vs ripgrep in the differential harness.
@@ -105,15 +105,15 @@ The freshness sweep scales with file count and dominates warm-query time on larg
 
 Name verified available on PyPI, crates.io, and GitHub (2026-07-14).
 
-- **PyPI**: `pip install glep` — binary wheels built with maturin (the ruff model: Rust binary, Python-ecosystem reach).
+- **PyPI**: `pip install glep`, binary wheels built with maturin (the ruff model: Rust binary, Python-ecosystem reach).
 - **crates.io**: `cargo install glep`.
-- **GitHub**: github.com/anishfyi/glep — releases with prebuilt macOS/Linux binaries.
+- **GitHub**: github.com/anishfyi/glep, releases with prebuilt macOS/Linux binaries.
 - Homebrew tap later, if adoption warrants.
 
 ## Out of scope (v1)
 
 - Multi-repo / machine-wide indexes (index format shouldn't preclude it, but no v1 work).
-- Positional trigrams / index-only answers (Zoekt-style) — revisit only if candidate-scan latency proves insufficient.
+- Positional trigrams / index-only answers (Zoekt-style); revisit only if candidate-scan latency proves insufficient.
 - Any daemon or file watcher; any MCP server (house rule).
 - Semantic / embedding search; ranking.
 - Windows support (macOS + Linux first).

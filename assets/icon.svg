@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="glep icon: trigram window over glyph cells">
+  <defs>
+    <linearGradient id="lit" x1="54" y1="128" x2="170" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB454"/>
+      <stop offset="1" stop-color="#FF7847"/>
+    </linearGradient>
+  </defs>
+
+  <!-- badge -->
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="#0E1A24"/>
+
+  <!-- glyph cells with the silhouette of g, l, e, p -->
+  <rect x="54"  y="100" width="32" height="96" rx="8" fill="url(#lit)"/>
+  <rect x="96"  y="68"  width="32" height="96" rx="8" fill="url(#lit)"/>
+  <rect x="138" y="100" width="32" height="64" rx="8" fill="url(#lit)"/>
+  <rect x="180" y="100" width="32" height="96" rx="8" fill="#22384A"/>
+
+  <!-- the trigram window over the first three glyphs -->
+  <rect x="44" y="58" width="136" height="148" rx="20" fill="none" stroke="#FFB454" stroke-width="5"/>
+</svg>
