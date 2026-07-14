@@ -238,6 +238,83 @@ impl Index {
         paths
     }
 
+    pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
+        if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
+            return Ok(Vec::new());
+        }
+        let swept = walk::sweep(&self.root)?;
+        let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
+            .manifest
+            .live_entries()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+
+        let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed
+        for meta in &swept {
+            match by_path.remove(meta.path.as_path()) {
+                Some(e) if e.mtime_ns == meta.mtime_ns && e.size == meta.size => {}
+                _ => fresh.push(meta.clone()),
+            }
+        }
+        // whatever remains in by_path was deleted from disk
+        let dead_ids: Vec<u32> = by_path.values().map(|e| e.id).collect();
+        let changed_old_ids: Vec<u32> = fresh
+            .iter()
+            .filter_map(|m| {
+                self.manifest
+                    .live_entries()
+                    .find(|e| e.path == m.path)
+                    .map(|e| e.id)
+            })
+            .collect();
+
+        if self.read_only {
+            return Ok(fresh.into_iter().map(|m| m.path).collect());
+        }
+        if fresh.is_empty() && dead_ids.is_empty() {
+            self.manifest.last_sweep_epoch = now_epoch();
+            self.manifest.save(&self.dir.join("manifest.bin"))?;
+            return Ok(Vec::new());
+        }
+
+        for id in dead_ids.into_iter().chain(changed_old_ids) {
+            self.manifest.entries[id as usize].flags |= manifest::FLAG_DEAD;
+        }
+        let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        if let Some(delta) = &self.delta {
+            for (tri, ids) in delta.iter_all() {
+                map.insert(tri, ids);
+            }
+        }
+        for meta in &fresh {
+            let id = self.manifest.add(meta);
+            self.manifest.entries[id as usize].flags =
+                index_file(&self.root, meta, id, max_filesize, &mut map);
+        }
+        for ids in map.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        postings::write(&self.dir.join("delta.bin"), &map, self.manifest.generation)?;
+        self.manifest.last_sweep_epoch = now_epoch();
+        self.manifest.save(&self.dir.join("manifest.bin"))?;
+        self.delta = Some(Postings::open(&self.dir.join("delta.bin"))?);
+
+        // Compaction: delta grew past a tenth of main. Full rebuild is the
+        // simple, correct v1 compaction strategy.
+        let main_size = std::fs::metadata(self.dir.join("postings.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let delta_size = std::fs::metadata(self.dir.join("delta.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if main_size > 0 && delta_size > main_size / 10 {
+            drop(self.lock.take()); // release before build re-acquires
+            *self = Index::build(&self.root, max_filesize)?;
+        }
+        Ok(Vec::new())
+    }
+
     #[cfg(test)]
     fn has_delta(&self) -> bool {
         self.delta.is_some()
@@ -374,5 +451,60 @@ mod tests {
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let c = idx.candidates(&crate::plan::Plan::All, false);
         assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
+    }
+
+    #[test]
+    fn update_sees_new_and_changed_files() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "freshneedle here").unwrap();
+        // ensure mtime moves even on coarse filesystems
+        std::fs::write(dir.path().join("a.txt"), "hello changedneedle").unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        let plan = crate::plan::build("freshneedle", true);
+        assert_eq!(
+            idx.candidates(&plan, false),
+            vec![std::path::PathBuf::from("new.txt")]
+        );
+        let plan2 = crate::plan::build("changedneedle", true);
+        assert_eq!(
+            idx.candidates(&plan2, false),
+            vec![std::path::PathBuf::from("a.txt")]
+        );
+    }
+
+    #[test]
+    fn update_tombstones_deleted_files() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        let plan = crate::plan::build("hello", true);
+        assert!(idx.candidates(&plan, false).is_empty());
+    }
+
+    #[test]
+    fn update_respects_ttl() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
+        idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
+        let plan = crate::plan::build("ttlneedle", true);
+        assert!(idx.candidates(&plan, false).is_empty());
+        idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
+        assert_eq!(idx.candidates(&plan, false).len(), 1);
+    }
+
+    #[test]
+    fn update_persists_across_reopen() {
+        let dir = corpus();
+        {
+            let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+            std::fs::write(dir.path().join("persist.txt"), "persistneedle").unwrap();
+            idx.update(1_048_576, 0).unwrap();
+        }
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("persistneedle", true);
+        assert_eq!(idx.candidates(&plan, false).len(), 1);
     }
 }

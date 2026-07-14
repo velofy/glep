@@ -155,6 +155,15 @@ impl Postings {
         }
         Some(ids)
     }
+
+    pub fn iter_all(&self) -> Vec<(u32, Vec<u32>)> {
+        (0..self.n)
+            .map(|i| {
+                let tri = self.entry(i).0;
+                (tri, self.lookup(tri).unwrap_or_default())
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
