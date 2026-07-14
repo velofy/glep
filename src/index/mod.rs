@@ -1,10 +1,11 @@
 pub mod manifest;
 pub mod postings;
 
+use crate::plan::Plan;
 use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
-use manifest::{Manifest, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use manifest::{Manifest, FLAG_DEAD, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
 use postings::Postings;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -164,6 +165,79 @@ impl Index {
         v
     }
 
+    fn postings_for(&self, tri: u32, ci: bool) -> Vec<u32> {
+        let tris = if ci {
+            trigram::case_variants(tri)
+        } else {
+            vec![tri]
+        };
+        let mut ids = Vec::new();
+        for t in tris {
+            for seg in [self.main.as_ref(), self.delta.as_ref()].into_iter().flatten() {
+                if let Some(v) = seg.lookup(t) {
+                    ids.extend(v);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn is_live(&self, id: u32) -> bool {
+        self.manifest
+            .entries
+            .get(id as usize)
+            .map_or(false, |e| e.flags & FLAG_DEAD == 0)
+    }
+
+    pub fn candidates(&self, plan: &Plan, case_insensitive: bool) -> Vec<PathBuf> {
+        let mut ids: Vec<u32> = match plan {
+            Plan::All => self
+                .manifest
+                .live_entries()
+                .filter(|e| e.flags & FLAG_SKIP_BINARY == 0)
+                .map(|e| e.id)
+                .collect(),
+            Plan::Groups(groups) => {
+                let mut union: Vec<u32> = Vec::new();
+                for group in groups {
+                    let mut iter = group.iter();
+                    let mut acc = match iter.next() {
+                        Some(&t) => self.postings_for(t, case_insensitive),
+                        None => continue,
+                    };
+                    for &t in iter {
+                        if acc.is_empty() {
+                            break;
+                        }
+                        let next = self.postings_for(t, case_insensitive);
+                        acc.retain(|id| next.binary_search(id).is_ok());
+                    }
+                    union.extend(acc);
+                }
+                // Skip-flagged text files were never indexed; always scan them.
+                union.extend(
+                    self.manifest
+                        .live_entries()
+                        .filter(|e| e.flags & FLAG_SKIP_TOO_LARGE != 0)
+                        .map(|e| e.id),
+                );
+                union.sort_unstable();
+                union.dedup();
+                union
+            }
+        };
+        ids.retain(|&id| self.is_live(id));
+        let mut paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|&id| self.manifest.entries[id as usize].path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     #[cfg(test)]
     fn has_delta(&self) -> bool {
         self.delta.is_some()
@@ -262,5 +336,43 @@ mod tests {
         postings::write(&dir.path().join(".glep/delta.bin"), &map, man.generation).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert!(idx.has_delta());
+    }
+
+    #[test]
+    fn candidates_narrow_by_trigram() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("hello", true);
+        let c = idx.candidates(&plan, false);
+        assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
+    }
+
+    #[test]
+    fn candidates_case_insensitive_uses_variants() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("HELLO", true);
+        assert!(idx.candidates(&plan, false).is_empty());
+        let c = idx.candidates(&plan, true);
+        assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
+    }
+
+    #[test]
+    fn candidates_include_oversized_files_always() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
+        let plan = crate::plan::build("hello", true);
+        let c = idx.candidates(&plan, false);
+        assert!(c.contains(&std::path::PathBuf::from("a.txt")));
+        assert!(c.contains(&std::path::PathBuf::from("big.txt")));
+        assert!(!c.contains(&std::path::PathBuf::from("bin.dat")));
+    }
+
+    #[test]
+    fn candidates_all_returns_live_non_binary() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let c = idx.candidates(&crate::plan::Plan::All, false);
+        assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
     }
 }
