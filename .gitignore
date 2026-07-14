@@ -1,1 +1,4 @@
 .superpowers/
+/target
+/dist
+.glep/

@@ -1,0 +1,3 @@
+mod trigram;
+
+fn main() {}

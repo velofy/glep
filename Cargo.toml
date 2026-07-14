@@ -1,0 +1,28 @@
+[package]
+name = "glep"
+version = "0.1.0"
+edition = "2021"
+description = "Indexed grep + glob for AI agents"
+license = "MIT"
+repository = "https://github.com/anishfyi/glep"
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+globset = "0.4"
+grep-printer = "0.2"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+memmap2 = "0.9"
+rayon = "1"
+regex-syntax = "0.8"
+serde = { version = "1", features = ["derive"] }
+termcolor = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
