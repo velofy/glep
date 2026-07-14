@@ -92,3 +92,39 @@ fn status_subcommand_reports() {
         .success()
         .stdout(predicates::str::contains("files: 2"));
 }
+
+#[test]
+fn rooted_glob_does_not_cross_directories() {
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+    std::fs::write(
+        dir.path().join("src/deep/nested.rs"),
+        "pub fn hello_deep() {}\n",
+    )
+    .unwrap();
+    glep(dir.path())
+        .args(["--files", "src/*.rs"])
+        .assert()
+        .success()
+        .stdout("src/lib.rs\n");
+    let out = glep(dir.path())
+        .args(["-g", "src/*.rs", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("src/lib.rs"));
+    assert!(!s.contains("nested"));
+}
+
+#[test]
+fn bare_glob_matches_at_any_depth() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["--files", "*.rs"])
+        .assert()
+        .success()
+        .stdout("src/lib.rs\n");
+}

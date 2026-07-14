@@ -39,17 +39,31 @@ pub struct Args {
     pub max_filesize: u64,
 }
 
+fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
+    // gitignore semantics: a slash-free pattern matches at any depth;
+    // once a pattern contains a slash, * must not cross separators.
+    let pat = if g.contains('/') {
+        g.to_string()
+    } else {
+        format!("**/{g}")
+    };
+    Ok(globset::GlobBuilder::new(&pat)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
 fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
     if !args.paths.is_empty() {
         files.retain(|f| args.paths.iter().any(|p| f.starts_with(p)));
     }
     if !args.globs.is_empty() {
-        let mut b = globset::GlobSetBuilder::new();
-        for g in &args.globs {
-            b.add(globset::Glob::new(g)?);
-        }
-        let set = b.build()?;
-        files.retain(|f| set.is_match(f));
+        let matchers = args
+            .globs
+            .iter()
+            .map(|g| build_glob(g))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        files.retain(|f| matchers.iter().any(|m| m.is_match(f)));
     }
     if !args.types.is_empty() {
         let mut tb = ignore::types::TypesBuilder::new();
@@ -102,7 +116,7 @@ pub fn run() -> anyhow::Result<i32> {
         files.dedup();
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
-            let glob = globset::Glob::new(g)?.compile_matcher();
+            let glob = build_glob(g)?;
             files.retain(|f| glob.is_match(f));
         }
         let args2 = Args { pattern: None, ..args };
