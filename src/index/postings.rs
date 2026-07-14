@@ -19,16 +19,19 @@ pub fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-pub fn read_varint(buf: &[u8]) -> (u64, &[u8]) {
+pub fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
     let mut v = 0u64;
-    let mut shift = 0;
-    let mut i = 0;
+    let mut shift = 0u32;
+    let mut i = 0usize;
     loop {
+        if i >= buf.len() || shift >= 64 {
+            return None; // truncated or overlong varint: corrupt blob
+        }
         let byte = buf[i];
         v |= ((byte & 0x7f) as u64) << shift;
         i += 1;
         if byte & 0x80 == 0 {
-            return (v, &buf[i..]);
+            return Some((v, &buf[i..]));
         }
         shift += 7;
     }
@@ -41,6 +44,7 @@ pub fn write(path: &Path, map: &BTreeMap<u32, Vec<u32>>) -> anyhow::Result<()> {
         let start = blob.len() as u64;
         let mut prev = 0u32;
         for &id in ids {
+            debug_assert!(id >= prev, "postings ids must be sorted ascending");
             write_varint(&mut blob, (id - prev) as u64);
             prev = id;
         }
@@ -70,6 +74,9 @@ pub struct Postings {
 impl Postings {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
+        // Safety: the map is read-only and glep replaces index files only via
+        // atomic rename; a concurrent external truncation would SIGBUS, which
+        // we accept for an internal index file.
         let mmap = unsafe { Mmap::map(&file)? };
         anyhow::ensure!(
             mmap.len() >= HEADER && &mmap[..8] == MAGIC,
@@ -79,7 +86,16 @@ impl Postings {
         anyhow::ensure!(version == VERSION, "postings version mismatch");
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
         anyhow::ensure!(mmap.len() >= HEADER + n * ENTRY, "truncated postings table");
-        Ok(Self { mmap, n })
+        let p = Self { mmap, n };
+        let blob_len = p.mmap.len() - HEADER - n * ENTRY;
+        for i in 0..n {
+            let (_, off, len) = p.entry(i);
+            anyhow::ensure!(
+                off.checked_add(len).map_or(false, |end| end <= blob_len),
+                "postings table entry out of bounds"
+            );
+        }
+        Ok(p)
     }
 
     pub fn trigram_count(&self) -> usize {
@@ -116,10 +132,19 @@ impl Postings {
         let mut ids = Vec::new();
         let mut cur = 0u32;
         while !slice.is_empty() {
-            let (v, rest) = read_varint(slice);
-            cur = cur.wrapping_add(v as u32);
-            ids.push(cur);
-            slice = rest;
+            match read_varint(slice) {
+                Some((v, rest)) => {
+                    cur = cur.wrapping_add(v as u32);
+                    ids.push(cur);
+                    slice = rest;
+                }
+                None => {
+                    eprintln!(
+                        "glep: postings blob corrupt; treating trigram as empty (run: glep index)"
+                    );
+                    return None;
+                }
+            }
         }
         Some(ids)
     }
@@ -160,9 +185,32 @@ mod tests {
         for v in [0u64, 1, 127, 128, 300, 1 << 20, u32::MAX as u64] {
             buf.clear();
             write_varint(&mut buf, v);
-            let (got, rest) = read_varint(&buf);
+            let (got, rest) = read_varint(&buf).unwrap();
             assert_eq!(got, v);
             assert!(rest.is_empty());
         }
+    }
+
+    #[test]
+    fn truncated_varint_is_detected() {
+        assert!(read_varint(&[0x80]).is_none());
+        assert!(read_varint(&[]).is_none());
+        let overlong = [0xffu8; 11];
+        assert!(read_varint(&overlong).is_none());
+    }
+
+    #[test]
+    fn open_rejects_out_of_bounds_table_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("oob.bin");
+        let mut map = BTreeMap::new();
+        map.insert(7u32, vec![1u32, 2]);
+        write(&p, &map).unwrap();
+        let mut bytes = std::fs::read(&p).unwrap();
+        // corrupt the entry's len field (last 4 bytes of the 16-byte entry)
+        let len_pos = 16 + 12;
+        bytes[len_pos..len_pos + 4].copy_from_slice(&1000u32.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(Postings::open(&p).is_err());
     }
 }
