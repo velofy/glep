@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install ripgrep
+      - run: cargo test --all
+      - name: hook tests
+        run: |
+          cargo build
+          PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
+      - name: em-dash ban
+        run: |
+          ! grep -rn $'—\|–' --include='*' . --exclude-dir=target --exclude-dir=.git
