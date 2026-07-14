@@ -17,6 +17,7 @@ reindex), so results are always fresh.
 | Grep with glob filter | `glep -g '*.rs' -e 'X'` |
 | Grep files_with_matches | `glep -l -e 'X'` |
 | Grep case-insensitive | `glep -i -e 'X'` |
+| Grep with type filter | `glep -t rust -e 'X'` |
 | Grep with context N | `glep -C N -e 'X'` |
 | Glob pattern P | `glep --files 'P'` |
 | List all files | `glep --files` |

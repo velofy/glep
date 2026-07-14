@@ -78,7 +78,15 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
 }
 
 pub fn run() -> anyhow::Result<i32> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // With -e/--regexp the positional pattern slot is free; a bare
+    // positional there is a path (e.g. `glep -e foo src`).
+    if args.regexp.is_some() && !args.files {
+        if let Some(p) = args.pattern.take() {
+            args.paths.insert(0, PathBuf::from(p));
+        }
+    }
     let root = std::env::current_dir()?;
 
     // Subcommand-style words in the pattern slot.

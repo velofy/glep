@@ -166,3 +166,21 @@ fn files_mode_no_match_exits_one() {
     let dir = corpus();
     glep(dir.path()).args(["--files", "*.zig"]).assert().code(1);
 }
+
+#[test]
+fn explicit_regexp_with_path_scopes_results() {
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join("other")).unwrap();
+    std::fs::write(dir.path().join("other/c.txt"), "hello elsewhere\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-e", "hello", "src"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("src/lib.rs"));
+    assert!(!s.contains("notes.txt"));
+    assert!(!s.contains("other/c.txt"));
+}

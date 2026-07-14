@@ -20,6 +20,8 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         allow()
+    if not isinstance(data, dict):
+        allow()
     tool = data.get("tool_name", "")
     ti = data.get("tool_input", {}) or {}
     cwd = data.get("cwd") or os.getcwd()

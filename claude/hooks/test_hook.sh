@@ -27,4 +27,11 @@ echo "$OUT" | grep -q "glep --files '\*\*/\*.py'" || { echo "FAIL: bad glob mapp
 OUT=$(run_hook '{"tool_name":"Grep","tool_input":{"pattern":"x","output_mode":"count"},"cwd":"'"$TMP"'"}')
 [ -z "$OUT" ] || { echo "FAIL: count mode should pass through"; exit 1; }
 
+# 5. Non-object JSON: must allow (exit 0, no output, no crash)
+set +e
+OUT=$(echo 'null' | python3 "$HOOK" 2>/dev/null)
+RC=$?
+set -e
+[ "$RC" -eq 0 ] && [ -z "$OUT" ] || { echo "FAIL: non-object JSON should exit 0 with no output (rc=$RC out=$OUT)"; exit 1; }
+
 echo "hook tests: OK"
