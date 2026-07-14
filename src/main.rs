@@ -1,3 +1,4 @@
+mod index;
 mod trigram;
 mod walk;
 
