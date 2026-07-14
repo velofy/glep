@@ -19,27 +19,32 @@ fn trigrams_of(lit: &[u8]) -> Option<Vec<u32>> {
     Some(tris)
 }
 
-pub fn build(pattern: &str, fixed: bool) -> Plan {
-    if fixed {
-        return match trigrams_of(pattern.as_bytes()) {
-            Some(t) => Plan::Groups(vec![t]),
-            None => Plan::All,
+pub fn build(pattern: &str, fixed: bool, case_insensitive: bool) -> Plan {
+    let literals: Vec<Vec<u8>> = if fixed {
+        vec![pattern.as_bytes().to_vec()]
+    } else {
+        let hir = match regex_syntax::parse(pattern) {
+            Ok(h) => h,
+            Err(_) => return Plan::All, // engine will surface the real error
         };
+        let seq = regex_syntax::hir::literal::Extractor::new().extract(&hir);
+        match seq.literals() {
+            Some(l) if !l.is_empty() => l.iter().map(|lit| lit.as_bytes().to_vec()).collect(),
+            _ => return Plan::All,
+        }
+    };
+
+    // ASCII case variants cannot cover Unicode case folding; with -i and
+    // any non-ASCII literal byte, only a full scan is sound.
+    if case_insensitive && literals.iter().any(|l| l.iter().any(|&b| b >= 0x80)) {
+        return Plan::All;
     }
-    let hir = match regex_syntax::parse(pattern) {
-        Ok(h) => h,
-        Err(_) => return Plan::All, // engine will surface the real error
-    };
-    let seq = regex_syntax::hir::literal::Extractor::new().extract(&hir);
-    let lits = match seq.literals() {
-        Some(l) if !l.is_empty() => l,
-        _ => return Plan::All,
-    };
-    let mut groups = Vec::with_capacity(lits.len());
-    for lit in lits {
+
+    let mut groups = Vec::with_capacity(literals.len());
+    for lit in &literals {
         // Inexact prefixes are still REQUIRED substrings, so they narrow
         // soundly as long as they carry at least one trigram.
-        match trigrams_of(lit.as_bytes()) {
+        match trigrams_of(lit) {
             Some(t) => groups.push(t),
             None => return Plan::All,
         }
@@ -54,7 +59,7 @@ mod tests {
 
     #[test]
     fn fixed_string_is_single_and_group() {
-        match build("hello", true) {
+        match build("hello", true, false) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 1);
                 assert!(g[0].contains(&pack(b"hel")));
@@ -66,7 +71,7 @@ mod tests {
 
     #[test]
     fn literal_regex_extracts_trigrams() {
-        match build("fn main", false) {
+        match build("fn main", false, false) {
             Plan::Groups(g) => assert!(g[0].contains(&pack(b"mai"))),
             Plan::All => panic!("expected groups"),
         }
@@ -74,7 +79,7 @@ mod tests {
 
     #[test]
     fn alternation_yields_or_groups() {
-        match build("foobar|bazqux", false) {
+        match build("foobar|bazqux", false, false) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 2);
                 assert!(g[0].contains(&pack(b"foo")) || g[1].contains(&pack(b"foo")));
@@ -85,18 +90,28 @@ mod tests {
 
     #[test]
     fn unnarrowing_patterns_are_all() {
-        assert!(matches!(build(".*", false), Plan::All));
-        assert!(matches!(build("a", false), Plan::All));
-        assert!(matches!(build("ab", true), Plan::All));
-        assert!(matches!(build("[", false), Plan::All)); // unparseable: fall back
+        assert!(matches!(build(".*", false, false), Plan::All));
+        assert!(matches!(build("a", false, false), Plan::All));
+        assert!(matches!(build("ab", true, false), Plan::All));
+        assert!(matches!(build("[", false, false), Plan::All)); // unparseable: fall back
     }
 
     #[test]
     fn prefix_of_wildcard_pattern_still_narrows() {
         // "needle.*" requires the literal "needle" prefix
-        match build("needle.*", false) {
+        match build("needle.*", false, false) {
             Plan::Groups(g) => assert!(g[0].contains(&pack(b"nee"))),
             Plan::All => panic!("expected groups"),
+        }
+    }
+
+    #[test]
+    fn unicode_case_insensitive_falls_back_to_all() {
+        assert!(matches!(build("caf\u{e9}", false, true), Plan::All));
+        assert!(matches!(build("caf\u{e9}", true, true), Plan::All));
+        match build("caf\u{e9}", false, false) {
+            Plan::Groups(_) => {}
+            Plan::All => panic!("case-sensitive non-ASCII should still narrow"),
         }
     }
 }

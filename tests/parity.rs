@@ -29,6 +29,11 @@ fn corpus() -> tempfile::TempDir {
     .unwrap();
     std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
     std::fs::write(dir.path().join("skipme.log"), "hello hidden\n").unwrap();
+    std::fs::write(
+        dir.path().join("unicode.txt"),
+        "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\nplain line\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -76,6 +81,8 @@ fn parity_with_ripgrep() {
         &["-l", "hello"],
         &["-C", "1", "answer"],
         &["zz_no_match_zz"],
+        &["-i", "caf\u{e9}"],
+        &["-C", "1", "hello"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

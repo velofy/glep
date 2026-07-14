@@ -72,13 +72,19 @@ pub fn run(
     let mut ordered = results;
     ordered.sort_by_key(|(i, _, _)| *i);
     let mut found = false;
+    let separate = opts.context > 0 && !opts.files_with_matches && !opts.json;
+    let mut printed_any = false;
     for (i, buf, matched) in ordered {
         if matched {
             found = true;
             if opts.files_with_matches {
                 writeln!(out, "{}", files[i].display())?;
             } else {
+                if separate && printed_any {
+                    writeln!(out, "--")?;
+                }
                 out.write_all(&buf)?;
+                printed_any = true;
             }
         }
     }

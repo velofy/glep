@@ -139,7 +139,7 @@ pub fn run() -> anyhow::Result<i32> {
         Some(p) => p,
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
-    let query_plan = plan::build(&pattern, args.fixed_strings);
+    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     let mut files = idx.candidates(&query_plan, args.ignore_case);
     files.extend(extra);
     files.sort();

@@ -17,7 +17,7 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 - The regex becomes a trigram plan, postings intersection yields a handful of candidate files, and ripgrep's searcher runs over just those.
 - Patterns trigrams can't narrow fall back to a full parallel scan: never a wrong answer, worst case is rg-speed.
 
-## Planned interface
+## Interface
 
 ```bash
 glep 'fn parse_intent' src/     # content search (Grep replacement)

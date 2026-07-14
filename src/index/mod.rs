@@ -419,7 +419,7 @@ mod tests {
     fn candidates_narrow_by_trigram() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("hello", true);
+        let plan = crate::plan::build("hello", true, false);
         let c = idx.candidates(&plan, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
@@ -428,7 +428,7 @@ mod tests {
     fn candidates_case_insensitive_uses_variants() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("HELLO", true);
+        let plan = crate::plan::build("HELLO", true, false);
         assert!(idx.candidates(&plan, false).is_empty());
         let c = idx.candidates(&plan, true);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
@@ -438,7 +438,7 @@ mod tests {
     fn candidates_include_oversized_files_always() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
-        let plan = crate::plan::build("hello", true);
+        let plan = crate::plan::build("hello", true, false);
         let c = idx.candidates(&plan, false);
         assert!(c.contains(&std::path::PathBuf::from("a.txt")));
         assert!(c.contains(&std::path::PathBuf::from("big.txt")));
@@ -461,12 +461,12 @@ mod tests {
         // ensure mtime moves even on coarse filesystems
         std::fs::write(dir.path().join("a.txt"), "hello changedneedle").unwrap();
         idx.update(1_048_576, 0).unwrap();
-        let plan = crate::plan::build("freshneedle", true);
+        let plan = crate::plan::build("freshneedle", true, false);
         assert_eq!(
             idx.candidates(&plan, false),
             vec![std::path::PathBuf::from("new.txt")]
         );
-        let plan2 = crate::plan::build("changedneedle", true);
+        let plan2 = crate::plan::build("changedneedle", true, false);
         assert_eq!(
             idx.candidates(&plan2, false),
             vec![std::path::PathBuf::from("a.txt")]
@@ -479,7 +479,7 @@ mod tests {
         let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         idx.update(1_048_576, 0).unwrap();
-        let plan = crate::plan::build("hello", true);
+        let plan = crate::plan::build("hello", true, false);
         assert!(idx.candidates(&plan, false).is_empty());
     }
 
@@ -489,7 +489,7 @@ mod tests {
         let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
         idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
-        let plan = crate::plan::build("ttlneedle", true);
+        let plan = crate::plan::build("ttlneedle", true, false);
         assert!(idx.candidates(&plan, false).is_empty());
         idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
         assert_eq!(idx.candidates(&plan, false).len(), 1);
@@ -504,7 +504,7 @@ mod tests {
             idx.update(1_048_576, 0).unwrap();
         }
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("persistneedle", true);
+        let plan = crate::plan::build("persistneedle", true, false);
         assert_eq!(idx.candidates(&plan, false).len(), 1);
     }
 
@@ -524,7 +524,7 @@ mod tests {
             idx.manifest.generation, gen_before,
             "compaction rebuilds with a fresh generation"
         );
-        let plan = crate::plan::build("uniqtoken1999", true);
+        let plan = crate::plan::build("uniqtoken1999", true, false);
         assert_eq!(
             idx.candidates(&plan, false),
             vec![std::path::PathBuf::from("bulk.txt")]

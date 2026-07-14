@@ -101,6 +101,9 @@ impl Postings {
         Ok(p)
     }
 
+    /// Index introspection helper; exercised by unit tests and kept for
+    /// status/debug tooling.
+    #[allow(dead_code)]
     pub fn trigram_count(&self) -> usize {
         self.n
     }

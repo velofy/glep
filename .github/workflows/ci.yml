@@ -20,4 +20,8 @@ jobs:
           PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
       - name: em-dash ban
         run: |
-          ! grep -rn $'—\|–' --include='*' . --exclude-dir=target --exclude-dir=.git
+          set +e
+          grep -rIn $'—\|–' . --exclude-dir=target --exclude-dir=.git --exclude-dir=.glep
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ]
