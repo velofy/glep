@@ -26,6 +26,13 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+fn new_generation() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
 /// Read content and record trigrams unless the file is skip-flagged.
 /// Returns the flags to store for this entry.
 fn index_file(
@@ -80,6 +87,7 @@ impl Index {
         let (lock, read_only) = Self::acquire_lock(&dir);
         anyhow::ensure!(!read_only, "another glep holds the index lock");
 
+        let generation = new_generation();
         let metas = walk::sweep(root)?;
         let mut man = Manifest::default();
         let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -91,7 +99,8 @@ impl Index {
             man.entries[id as usize].flags = index_file(root, meta, id, max_filesize, &mut map);
         }
         man.last_sweep_epoch = now_epoch();
-        postings::write(&dir.join("postings.bin"), &map)?;
+        man.generation = generation;
+        postings::write(&dir.join("postings.bin"), &map, generation)?;
         let _ = std::fs::remove_file(dir.join("delta.bin"));
         man.save(&dir.join("manifest.bin"))?;
         let main = Postings::open(&dir.join("postings.bin"))?;
@@ -111,14 +120,20 @@ impl Index {
         let try_open = || -> anyhow::Result<(Manifest, Postings, Option<Postings>)> {
             let man = Manifest::load(&dir.join("manifest.bin"))?;
             let main = Postings::open(&dir.join("postings.bin"))?;
+            anyhow::ensure!(
+                main.generation() == man.generation,
+                "index generation mismatch (torn write)"
+            );
             let delta = match Postings::open(&dir.join("delta.bin")) {
-                Ok(d) => Some(d),
-                Err(_) => None,
+                // A delta from another generation is a leftover; drop it.
+                Ok(d) if d.generation() == man.generation => Some(d),
+                _ => None,
             };
             Ok((man, main, delta))
         };
         if dir.join("manifest.bin").exists() {
-            match try_open() {
+            let opened = try_open().or_else(|_| try_open());
+            match opened {
                 Ok((man, main, delta)) => {
                     let (lock, read_only) = Self::acquire_lock(&dir);
                     return Ok(Index {
@@ -203,6 +218,33 @@ mod tests {
         let dir = corpus();
         Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::write(dir.path().join(".glep/postings.bin"), b"garbage").unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert_eq!(idx.live_files().len(), 4);
+    }
+
+    #[test]
+    fn generation_mismatch_triggers_rebuild() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        // Tear the pair: stamp the manifest with a different generation.
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let mut man = manifest::Manifest::load(&mpath).unwrap();
+        man.generation ^= 0xdead_beef;
+        man.save(&mpath).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert_eq!(idx.live_files().len(), 4);
+        let man2 = manifest::Manifest::load(&mpath).unwrap();
+        let post = postings::Postings::open(&dir.path().join(".glep/postings.bin")).unwrap();
+        assert_eq!(man2.generation, post.generation());
+    }
+
+    #[test]
+    fn stale_delta_is_ignored() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(0x0061_6263u32, vec![0u32]);
+        postings::write(&dir.path().join(".glep/delta.bin"), &map, 12345).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert_eq!(idx.live_files().len(), 4);
     }

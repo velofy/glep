@@ -19,6 +19,7 @@ pub struct FileEntry {
 pub struct Manifest {
     pub entries: Vec<FileEntry>,
     pub last_sweep_epoch: u64,
+    pub generation: u64,
 }
 
 impl Manifest {

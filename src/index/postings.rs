@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"GLEPPOST";
-const VERSION: u32 = 1;
-const HEADER: usize = 16; // magic 8 + version 4 + count 4
+const VERSION: u32 = 2;
+const HEADER: usize = 24; // magic 8 + version 4 + count 4 + generation 8
 const ENTRY: usize = 16; // trigram 4 + offset 8 + len 4
 
 pub fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
@@ -37,7 +37,7 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, &[u8])> {
     }
 }
 
-pub fn write(path: &Path, map: &BTreeMap<u32, Vec<u32>>) -> anyhow::Result<()> {
+pub fn write(path: &Path, map: &BTreeMap<u32, Vec<u32>>, generation: u64) -> anyhow::Result<()> {
     let mut blob = Vec::new();
     let mut table = Vec::with_capacity(map.len());
     for (&tri, ids) in map {
@@ -54,6 +54,7 @@ pub fn write(path: &Path, map: &BTreeMap<u32, Vec<u32>>) -> anyhow::Result<()> {
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    out.extend_from_slice(&generation.to_le_bytes());
     for (tri, off, len) in &table {
         out.extend_from_slice(&tri.to_le_bytes());
         out.extend_from_slice(&off.to_le_bytes());
@@ -69,6 +70,7 @@ pub fn write(path: &Path, map: &BTreeMap<u32, Vec<u32>>) -> anyhow::Result<()> {
 pub struct Postings {
     mmap: Mmap,
     n: usize,
+    generation: u64,
 }
 
 impl Postings {
@@ -85,8 +87,9 @@ impl Postings {
         let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
         anyhow::ensure!(version == VERSION, "postings version mismatch");
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let generation = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         anyhow::ensure!(mmap.len() >= HEADER + n * ENTRY, "truncated postings table");
-        let p = Self { mmap, n };
+        let p = Self { mmap, n, generation };
         let blob_len = p.mmap.len() - HEADER - n * ENTRY;
         for i in 0..n {
             let (_, off, len) = p.entry(i);
@@ -100,6 +103,10 @@ impl Postings {
 
     pub fn trigram_count(&self) -> usize {
         self.n
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn entry(&self, i: usize) -> (u32, usize, usize) {
@@ -162,13 +169,14 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert(5u32, vec![0u32, 1, 300, 70000]);
         map.insert(9u32, vec![2u32]);
-        write(&p, &map).unwrap();
+        write(&p, &map, 42).unwrap();
         let post = Postings::open(&p).unwrap();
         assert_eq!(post.trigram_count(), 2);
         assert_eq!(post.lookup(5), Some(vec![0, 1, 300, 70000]));
         assert_eq!(post.lookup(9), Some(vec![2]));
         assert_eq!(post.lookup(6), None);
         assert_eq!(post.lookup(99), None);
+        assert_eq!(post.generation(), 42);
     }
 
     #[test]
@@ -205,10 +213,10 @@ mod tests {
         let p = dir.path().join("oob.bin");
         let mut map = BTreeMap::new();
         map.insert(7u32, vec![1u32, 2]);
-        write(&p, &map).unwrap();
+        write(&p, &map, 1).unwrap();
         let mut bytes = std::fs::read(&p).unwrap();
         // corrupt the entry's len field (last 4 bytes of the 16-byte entry)
-        let len_pos = 16 + 12;
+        let len_pos = 24 + 12;
         bytes[len_pos..len_pos + 4].copy_from_slice(&1000u32.to_le_bytes());
         std::fs::write(&p, &bytes).unwrap();
         assert!(Postings::open(&p).is_err());
