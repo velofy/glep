@@ -507,4 +507,42 @@ mod tests {
         let plan = crate::plan::build("persistneedle", true);
         assert_eq!(idx.candidates(&plan, false).len(), 1);
     }
+
+    #[test]
+    fn compaction_folds_delta_into_main() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let gen_before = idx.manifest.generation;
+        // A change set with far more trigrams than the tiny main index
+        // pushes delta.bin past main/10 and must trigger compaction.
+        let big: String = (0..2000).map(|i| format!("uniqtoken{i} ")).collect();
+        std::fs::write(dir.path().join("bulk.txt"), &big).unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        assert!(!idx.has_delta(), "delta should be folded into main");
+        assert!(!dir.path().join(".glep/delta.bin").exists());
+        assert_ne!(
+            idx.manifest.generation, gen_before,
+            "compaction rebuilds with a fresh generation"
+        );
+        let plan = crate::plan::build("uniqtoken1999", true);
+        assert_eq!(
+            idx.candidates(&plan, false),
+            vec![std::path::PathBuf::from("bulk.txt")]
+        );
+    }
+
+    #[test]
+    fn read_only_update_writes_nothing_and_returns_fresh_paths() {
+        let dir = corpus();
+        let _writer = Index::build(dir.path(), 1_048_576).unwrap(); // holds the lock
+        let mut reader = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(reader.read_only);
+        std::fs::write(dir.path().join("hot.txt"), "hotneedle").unwrap();
+        let manifest_before = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+        let extra = reader.update(1_048_576, 0).unwrap();
+        assert_eq!(extra, vec![std::path::PathBuf::from("hot.txt")]);
+        let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+        assert_eq!(manifest_before, manifest_after, "read-only update must not write");
+        assert!(!dir.path().join(".glep/delta.bin").exists());
+    }
 }
