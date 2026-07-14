@@ -128,3 +128,41 @@ fn bare_glob_matches_at_any_depth() {
         .success()
         .stdout("src/lib.rs\n");
 }
+
+#[test]
+fn files_mode_lists_all_sorted() {
+    let dir = corpus();
+    glep(dir.path())
+        .arg("--files")
+        .assert()
+        .success()
+        .stdout("notes.txt\nsrc/lib.rs\n");
+}
+
+#[test]
+fn files_mode_with_glob() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["--files", "**/*.rs"])
+        .assert()
+        .success()
+        .stdout("src/lib.rs\n");
+}
+
+#[test]
+fn files_mode_sees_brand_new_file() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    std::fs::write(dir.path().join("brand_new.md"), "x").unwrap();
+    glep(dir.path())
+        .args(["--files", "*.md"])
+        .assert()
+        .success()
+        .stdout("brand_new.md\n");
+}
+
+#[test]
+fn files_mode_no_match_exits_one() {
+    let dir = corpus();
+    glep(dir.path()).args(["--files", "*.zig"]).assert().code(1);
+}
