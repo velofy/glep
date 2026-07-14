@@ -13,31 +13,39 @@ pub struct FileMeta {
 /// Parallel gitignore-aware sweep. Skips hidden entries (default), so
 /// .git/ and .glep/ never appear. Returns files sorted by relative path.
 pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let walker = ignore::WalkBuilder::new(root).require_git(false).build_parallel();
     walker.run(|| {
         Box::new(|entry| {
-            if let Ok(e) = entry {
-                if e.file_type().map_or(false, |t| t.is_file()) {
-                    if let Ok(md) = e.metadata() {
-                        let mtime_ns = md
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
-                        let rel = e
-                            .path()
-                            .strip_prefix(root)
-                            .unwrap_or(e.path())
-                            .to_path_buf();
-                        collected.lock().unwrap().push(FileMeta {
-                            path: rel,
-                            mtime_ns,
-                            size: md.len(),
-                        });
+            match entry {
+                Ok(e) => {
+                    if e.file_type().map_or(false, |t| t.is_file()) {
+                        if let Ok(md) = e.metadata() {
+                            let mtime_ns = md
+                                .modified()
+                                .ok()
+                                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0);
+                            let rel = e
+                                .path()
+                                .strip_prefix(root)
+                                .unwrap_or(e.path())
+                                .to_path_buf();
+                            collected.lock().unwrap().push(FileMeta {
+                                path: rel,
+                                mtime_ns,
+                                size: md.len(),
+                            });
+                        }
                     }
                 }
+                Err(err) => eprintln!("glep: {err}"),
             }
             ignore::WalkState::Continue
         })
@@ -70,5 +78,12 @@ mod tests {
         assert_eq!(paths, vec!["b.txt", "src/a.rs"]);
         assert!(metas[0].size == 5);
         assert!(metas[0].mtime_ns > 0);
+    }
+
+    #[test]
+    fn sweep_missing_root_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        assert!(sweep(&missing).is_err());
     }
 }
