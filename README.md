@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="400" alt="glep">
+  <img src="https://raw.githubusercontent.com/anishfyi/glep/main/assets/logo.svg" width="400" alt="glep">
 </p>
 
 <p align="center"><strong>Indexed grep + glob for AI agents.</strong></p>
@@ -51,4 +51,4 @@ Claude Code integration (skill + hook): `claude/install.sh`.
 
 ## Status
 
-v0.1.0. Spec: [docs/superpowers/specs/2026-07-14-glep-design.md](docs/superpowers/specs/2026-07-14-glep-design.md).
+Spec: [docs/superpowers/specs/2026-07-14-glep-design.md](https://github.com/anishfyi/glep/blob/main/docs/superpowers/specs/2026-07-14-glep-design.md).
