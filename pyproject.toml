@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "glep"
+description = "Indexed grep + glob for AI agents"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/anishfyi/glep"
+
+[tool.maturin]
+bindings = "bin"

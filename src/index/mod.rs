@@ -1,0 +1,548 @@
+pub mod manifest;
+pub mod postings;
+
+use crate::plan::Plan;
+use crate::trigram;
+use crate::walk::{self, FileMeta};
+use fs2::FileExt;
+use manifest::{Manifest, FLAG_DEAD, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use postings::Postings;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+pub struct Index {
+    pub root: PathBuf,
+    pub dir: PathBuf,
+    pub manifest: Manifest,
+    main: Option<Postings>,
+    delta: Option<Postings>,
+    pub read_only: bool,
+    lock: Option<std::fs::File>,
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn new_generation() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
+/// Read content and record trigrams unless the file is skip-flagged.
+/// Returns the flags to store for this entry.
+fn index_file(
+    root: &Path,
+    meta: &FileMeta,
+    id: u32,
+    max_filesize: u64,
+    map: &mut BTreeMap<u32, Vec<u32>>,
+) -> u8 {
+    if meta.size > max_filesize {
+        return FLAG_SKIP_TOO_LARGE;
+    }
+    let content = match std::fs::read(root.join(&meta.path)) {
+        Ok(c) => c,
+        Err(_) => return FLAG_SKIP_TOO_LARGE, // unreadable: treat as live-scan-only
+    };
+    let sniff = &content[..content.len().min(8192)];
+    if sniff.contains(&0) {
+        return FLAG_SKIP_BINARY;
+    }
+    for tri in trigram::extract(&content) {
+        map.entry(tri).or_default().push(id);
+    }
+    0
+}
+
+impl Index {
+    fn acquire_lock(dir: &Path) -> (Option<std::fs::File>, bool) {
+        let lock_path = dir.join("lock");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => match f.try_lock_exclusive() {
+                Ok(()) => (Some(f), false),
+                Err(_) => (None, true),
+            },
+            Err(_) => (None, true),
+        }
+    }
+
+    pub fn build(root: &Path, max_filesize: u64) -> anyhow::Result<Index> {
+        let dir = root.join(".glep");
+        std::fs::create_dir_all(&dir)?;
+        // Self-ignoring directory: git never tracks the index, and we never
+        // have to touch the user's .gitignore.
+        let self_ignore = dir.join(".gitignore");
+        if !self_ignore.exists() {
+            std::fs::write(&self_ignore, "*\n")?;
+        }
+        let (lock, read_only) = Self::acquire_lock(&dir);
+        anyhow::ensure!(!read_only, "another glep holds the index lock");
+
+        let generation = new_generation();
+        let metas = walk::sweep(root)?;
+        let mut man = Manifest::default();
+        let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (n, meta) in metas.iter().enumerate() {
+            if n > 0 && n % 5000 == 0 {
+                eprintln!("glep: indexed {n} files...");
+            }
+            let id = man.add(meta);
+            man.entries[id as usize].flags = index_file(root, meta, id, max_filesize, &mut map);
+        }
+        man.last_sweep_epoch = now_epoch();
+        man.generation = generation;
+        postings::write(&dir.join("postings.bin"), &map, generation)?;
+        let _ = std::fs::remove_file(dir.join("delta.bin"));
+        man.save(&dir.join("manifest.bin"))?;
+        let main = Postings::open(&dir.join("postings.bin"))?;
+        Ok(Index {
+            root: root.to_path_buf(),
+            dir,
+            manifest: man,
+            main: Some(main),
+            delta: None,
+            read_only: false,
+            lock,
+        })
+    }
+
+    pub fn open_or_build(root: &Path, max_filesize: u64) -> anyhow::Result<Index> {
+        let dir = root.join(".glep");
+        let try_open = || -> anyhow::Result<(Manifest, Postings, Option<Postings>)> {
+            let man = Manifest::load(&dir.join("manifest.bin"))?;
+            let main = Postings::open(&dir.join("postings.bin"))?;
+            anyhow::ensure!(
+                main.generation() == man.generation,
+                "index generation mismatch (torn write)"
+            );
+            let delta = match Postings::open(&dir.join("delta.bin")) {
+                // A delta from another generation is a leftover; drop it.
+                Ok(d) if d.generation() == man.generation => Some(d),
+                _ => None,
+            };
+            Ok((man, main, delta))
+        };
+        if dir.join("manifest.bin").exists() {
+            let opened = try_open().or_else(|_| try_open());
+            match opened {
+                Ok((man, main, delta)) => {
+                    let (lock, read_only) = Self::acquire_lock(&dir);
+                    return Ok(Index {
+                        root: root.to_path_buf(),
+                        dir,
+                        manifest: man,
+                        main: Some(main),
+                        delta,
+                        read_only,
+                        lock,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("glep: index unreadable ({e}); rebuilding");
+                }
+            }
+        }
+        Self::build(root, max_filesize)
+    }
+
+    pub fn live_files(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self
+            .manifest
+            .live_entries()
+            .map(|e| e.path.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn postings_for(&self, tri: u32, ci: bool) -> Vec<u32> {
+        let tris = if ci {
+            trigram::case_variants(tri)
+        } else {
+            vec![tri]
+        };
+        let mut ids = Vec::new();
+        for t in tris {
+            for seg in [self.main.as_ref(), self.delta.as_ref()].into_iter().flatten() {
+                if let Some(v) = seg.lookup(t) {
+                    ids.extend(v);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn is_live(&self, id: u32) -> bool {
+        self.manifest
+            .entries
+            .get(id as usize)
+            .map_or(false, |e| e.flags & FLAG_DEAD == 0)
+    }
+
+    pub fn candidates(&self, plan: &Plan, case_insensitive: bool) -> Vec<PathBuf> {
+        let mut ids: Vec<u32> = match plan {
+            Plan::All => self
+                .manifest
+                .live_entries()
+                .filter(|e| e.flags & FLAG_SKIP_BINARY == 0)
+                .map(|e| e.id)
+                .collect(),
+            Plan::Groups(groups) => {
+                let mut union: Vec<u32> = Vec::new();
+                for group in groups {
+                    let mut iter = group.iter();
+                    let mut acc = match iter.next() {
+                        Some(&t) => self.postings_for(t, case_insensitive),
+                        None => continue,
+                    };
+                    for &t in iter {
+                        if acc.is_empty() {
+                            break;
+                        }
+                        let next = self.postings_for(t, case_insensitive);
+                        acc.retain(|id| next.binary_search(id).is_ok());
+                    }
+                    union.extend(acc);
+                }
+                // Skip-flagged text files were never indexed; always scan them.
+                union.extend(
+                    self.manifest
+                        .live_entries()
+                        .filter(|e| e.flags & FLAG_SKIP_TOO_LARGE != 0)
+                        .map(|e| e.id),
+                );
+                union.sort_unstable();
+                union.dedup();
+                union
+            }
+        };
+        ids.retain(|&id| self.is_live(id));
+        let mut paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|&id| self.manifest.entries[id as usize].path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
+        if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
+            return Ok(Vec::new());
+        }
+        let swept = walk::sweep(&self.root)?;
+        let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
+            .manifest
+            .live_entries()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+
+        let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed
+        for meta in &swept {
+            match by_path.remove(meta.path.as_path()) {
+                Some(e) if e.mtime_ns == meta.mtime_ns && e.size == meta.size => {}
+                _ => fresh.push(meta.clone()),
+            }
+        }
+        // whatever remains in by_path was deleted from disk
+        let dead_ids: Vec<u32> = by_path.values().map(|e| e.id).collect();
+        let changed_old_ids: Vec<u32> = fresh
+            .iter()
+            .filter_map(|m| {
+                self.manifest
+                    .live_entries()
+                    .find(|e| e.path == m.path)
+                    .map(|e| e.id)
+            })
+            .collect();
+
+        if self.read_only {
+            return Ok(fresh.into_iter().map(|m| m.path).collect());
+        }
+        if fresh.is_empty() && dead_ids.is_empty() {
+            self.manifest.last_sweep_epoch = now_epoch();
+            self.manifest.save(&self.dir.join("manifest.bin"))?;
+            return Ok(Vec::new());
+        }
+
+        for id in dead_ids.into_iter().chain(changed_old_ids) {
+            self.manifest.entries[id as usize].flags |= manifest::FLAG_DEAD;
+        }
+        let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        if let Some(delta) = &self.delta {
+            for (tri, ids) in delta.iter_all() {
+                map.insert(tri, ids);
+            }
+        }
+        for meta in &fresh {
+            let id = self.manifest.add(meta);
+            self.manifest.entries[id as usize].flags =
+                index_file(&self.root, meta, id, max_filesize, &mut map);
+        }
+        for ids in map.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        postings::write(&self.dir.join("delta.bin"), &map, self.manifest.generation)?;
+        self.manifest.last_sweep_epoch = now_epoch();
+        self.manifest.save(&self.dir.join("manifest.bin"))?;
+        self.delta = Some(Postings::open(&self.dir.join("delta.bin"))?);
+
+        // Compaction: delta grew past a tenth of main. Full rebuild is the
+        // simple, correct v1 compaction strategy.
+        let main_size = std::fs::metadata(self.dir.join("postings.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let delta_size = std::fs::metadata(self.dir.join("delta.bin"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if main_size > 0 && delta_size > main_size / 10 {
+            drop(self.lock.take()); // release before build re-acquires
+            *self = Index::build(&self.root, max_filesize)?;
+        }
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    fn has_delta(&self) -> bool {
+        self.delta.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn corpus() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "goodbye world").unwrap();
+        std::fs::write(dir.path().join("bin.dat"), b"\x00\x01binary").unwrap();
+        std::fs::write(dir.path().join("big.txt"), "x".repeat(100)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_indexes_text_flags_binary_and_oversized() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 50).unwrap(); // 50-byte cap: big.txt skipped
+        assert!(dir.path().join(".glep/manifest.bin").exists());
+        assert!(dir.path().join(".glep/postings.bin").exists());
+        // index dir self-ignores so git never tracks it
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".glep/.gitignore")).unwrap(),
+            "*\n"
+        );
+        let by_path = |p: &str| {
+            idx.manifest
+                .entries
+                .iter()
+                .find(|e| e.path.to_string_lossy() == p)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_path("a.txt").flags, 0);
+        assert_eq!(by_path("bin.dat").flags, manifest::FLAG_SKIP_BINARY);
+        assert_eq!(by_path("big.txt").flags, manifest::FLAG_SKIP_TOO_LARGE);
+        let files = idx.live_files();
+        assert_eq!(files.len(), 4);
+    }
+
+    #[test]
+    fn open_or_build_reopens_existing() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(!idx.read_only);
+        assert_eq!(idx.live_files().len(), 4);
+    }
+
+    #[test]
+    fn corrupt_index_rebuilds() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join(".glep/postings.bin"), b"garbage").unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert_eq!(idx.live_files().len(), 4);
+    }
+
+    #[test]
+    fn generation_mismatch_triggers_rebuild() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        // Tear the pair: stamp the manifest with a different generation.
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let mut man = manifest::Manifest::load(&mpath).unwrap();
+        man.generation ^= 0xdead_beef;
+        man.save(&mpath).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert_eq!(idx.live_files().len(), 4);
+        let man2 = manifest::Manifest::load(&mpath).unwrap();
+        let post = postings::Postings::open(&dir.path().join(".glep/postings.bin")).unwrap();
+        assert_eq!(man2.generation, post.generation());
+    }
+
+    #[test]
+    fn stale_delta_is_ignored_matching_delta_attaches() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(0x0061_6263u32, vec![0u32]);
+
+        // Stale generation: delta must be dropped.
+        postings::write(&dir.path().join(".glep/delta.bin"), &map, 12345).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(!idx.has_delta());
+        assert_eq!(idx.live_files().len(), 4);
+        drop(idx);
+
+        // Matching generation: delta must attach.
+        let man = manifest::Manifest::load(&dir.path().join(".glep/manifest.bin")).unwrap();
+        postings::write(&dir.path().join(".glep/delta.bin"), &map, man.generation).unwrap();
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(idx.has_delta());
+    }
+
+    #[test]
+    fn candidates_narrow_by_trigram() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("hello", true, false);
+        let c = idx.candidates(&plan, false);
+        assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
+    }
+
+    #[test]
+    fn candidates_case_insensitive_uses_variants() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("HELLO", true, false);
+        assert!(idx.candidates(&plan, false).is_empty());
+        let c = idx.candidates(&plan, true);
+        assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
+    }
+
+    #[test]
+    fn candidates_include_oversized_files_always() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
+        let plan = crate::plan::build("hello", true, false);
+        let c = idx.candidates(&plan, false);
+        assert!(c.contains(&std::path::PathBuf::from("a.txt")));
+        assert!(c.contains(&std::path::PathBuf::from("big.txt")));
+        assert!(!c.contains(&std::path::PathBuf::from("bin.dat")));
+    }
+
+    #[test]
+    fn candidates_all_returns_live_non_binary() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let c = idx.candidates(&crate::plan::Plan::All, false);
+        assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
+    }
+
+    #[test]
+    fn update_sees_new_and_changed_files() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join("new.txt"), "freshneedle here").unwrap();
+        // ensure mtime moves even on coarse filesystems
+        std::fs::write(dir.path().join("a.txt"), "hello changedneedle").unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        let plan = crate::plan::build("freshneedle", true, false);
+        assert_eq!(
+            idx.candidates(&plan, false),
+            vec![std::path::PathBuf::from("new.txt")]
+        );
+        let plan2 = crate::plan::build("changedneedle", true, false);
+        assert_eq!(
+            idx.candidates(&plan2, false),
+            vec![std::path::PathBuf::from("a.txt")]
+        );
+    }
+
+    #[test]
+    fn update_tombstones_deleted_files() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        let plan = crate::plan::build("hello", true, false);
+        assert!(idx.candidates(&plan, false).is_empty());
+    }
+
+    #[test]
+    fn update_respects_ttl() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
+        idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
+        let plan = crate::plan::build("ttlneedle", true, false);
+        assert!(idx.candidates(&plan, false).is_empty());
+        idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
+        assert_eq!(idx.candidates(&plan, false).len(), 1);
+    }
+
+    #[test]
+    fn update_persists_across_reopen() {
+        let dir = corpus();
+        {
+            let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+            std::fs::write(dir.path().join("persist.txt"), "persistneedle").unwrap();
+            idx.update(1_048_576, 0).unwrap();
+        }
+        let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("persistneedle", true, false);
+        assert_eq!(idx.candidates(&plan, false).len(), 1);
+    }
+
+    #[test]
+    fn compaction_folds_delta_into_main() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let gen_before = idx.manifest.generation;
+        // A change set with far more trigrams than the tiny main index
+        // pushes delta.bin past main/10 and must trigger compaction.
+        let big: String = (0..2000).map(|i| format!("uniqtoken{i} ")).collect();
+        std::fs::write(dir.path().join("bulk.txt"), &big).unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        assert!(!idx.has_delta(), "delta should be folded into main");
+        assert!(!dir.path().join(".glep/delta.bin").exists());
+        assert_ne!(
+            idx.manifest.generation, gen_before,
+            "compaction rebuilds with a fresh generation"
+        );
+        let plan = crate::plan::build("uniqtoken1999", true, false);
+        assert_eq!(
+            idx.candidates(&plan, false),
+            vec![std::path::PathBuf::from("bulk.txt")]
+        );
+    }
+
+    #[test]
+    fn read_only_update_writes_nothing_and_returns_fresh_paths() {
+        let dir = corpus();
+        let _writer = Index::build(dir.path(), 1_048_576).unwrap(); // holds the lock
+        let mut reader = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(reader.read_only);
+        std::fs::write(dir.path().join("hot.txt"), "hotneedle").unwrap();
+        let manifest_before = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+        let extra = reader.update(1_048_576, 0).unwrap();
+        assert_eq!(extra, vec![std::path::PathBuf::from("hot.txt")]);
+        let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+        assert_eq!(manifest_before, manifest_after, "read-only update must not write");
+        assert!(!dir.path().join(".glep/delta.bin").exists());
+    }
+}

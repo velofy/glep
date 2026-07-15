@@ -17,7 +17,7 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 - The regex becomes a trigram plan, postings intersection yields a handful of candidate files, and ripgrep's searcher runs over just those.
 - Patterns trigrams can't narrow fall back to a full parallel scan: never a wrong answer, worst case is rg-speed.
 
-## Planned interface
+## Interface
 
 ```bash
 glep 'fn parse_intent' src/     # content search (Grep replacement)
@@ -29,8 +29,16 @@ glep status                     # index stats
 
 Ships with a Claude Code skill and a PreToolUse hook that routes built-in Grep/Glob calls through glep automatically.
 
+## Install
+
+```bash
+pip install glep          # binary wheel, no Rust toolchain needed
+# or
+cargo install glep
+```
+
+Claude Code integration (skill + hook): `claude/install.sh`.
+
 ## Status
 
-Design phase. The full spec: [docs/superpowers/specs/2026-07-14-glep-design.md](docs/superpowers/specs/2026-07-14-glep-design.md).
-
-Planned distribution: `pip install glep` (maturin binary wheels, the ruff model), `cargo install glep`, GitHub releases.
+v0.1.0. Spec: [docs/superpowers/specs/2026-07-14-glep-design.md](docs/superpowers/specs/2026-07-14-glep-design.md).

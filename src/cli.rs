@@ -1,0 +1,160 @@
+use crate::index::Index;
+use crate::{plan, search};
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "glep", version, about = "Indexed grep + glob for AI agents")]
+pub struct Args {
+    /// Pattern, or the subcommands: index, status
+    pub pattern: Option<String>,
+    /// Restrict results to these subtrees
+    pub paths: Vec<PathBuf>,
+    /// Explicit pattern (use when the pattern is literally "index" or "status")
+    #[arg(short = 'e', long = "regexp")]
+    pub regexp: Option<String>,
+    /// List files matching a glob instead of searching content
+    #[arg(long)]
+    pub files: bool,
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
+    #[arg(short = 'F', long)]
+    pub fixed_strings: bool,
+    #[arg(short = 'l', long)]
+    pub files_with_matches: bool,
+    /// Filter candidate files by glob (repeatable)
+    #[arg(short = 'g', long = "glob")]
+    pub globs: Vec<String>,
+    /// Filter candidate files by type from the ignore crate's defaults (repeatable)
+    #[arg(short = 't', long = "type")]
+    pub types: Vec<String>,
+    #[arg(short = 'C', long, default_value_t = 0)]
+    pub context: usize,
+    #[arg(long)]
+    pub json: bool,
+    /// Skip the freshness sweep if the last one ran within this many seconds
+    #[arg(long, default_value_t = 0)]
+    pub ttl: u64,
+    #[arg(long, default_value_t = 1_048_576)]
+    pub max_filesize: u64,
+}
+
+fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
+    // gitignore semantics: a slash-free pattern matches at any depth;
+    // once a pattern contains a slash, * must not cross separators.
+    let pat = if g.contains('/') {
+        g.to_string()
+    } else {
+        format!("**/{g}")
+    };
+    Ok(globset::GlobBuilder::new(&pat)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
+fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
+    if !args.paths.is_empty() {
+        files.retain(|f| args.paths.iter().any(|p| f.starts_with(p)));
+    }
+    if !args.globs.is_empty() {
+        let matchers = args
+            .globs
+            .iter()
+            .map(|g| build_glob(g))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        files.retain(|f| matchers.iter().any(|m| m.is_match(f)));
+    }
+    if !args.types.is_empty() {
+        let mut tb = ignore::types::TypesBuilder::new();
+        tb.add_defaults();
+        for t in &args.types {
+            tb.select(t);
+        }
+        let types = tb.build()?;
+        files.retain(|f| types.matched(f, false).is_whitelist());
+    }
+    Ok(())
+}
+
+pub fn run() -> anyhow::Result<i32> {
+    let mut args = Args::parse();
+
+    // With -e/--regexp the positional pattern slot is free; a bare
+    // positional there is a path (e.g. `glep -e foo src`).
+    if args.regexp.is_some() && !args.files {
+        if let Some(p) = args.pattern.take() {
+            args.paths.insert(0, PathBuf::from(p));
+        }
+    }
+    let root = std::env::current_dir()?;
+
+    // Subcommand-style words in the pattern slot.
+    if args.regexp.is_none() && !args.files {
+        match args.pattern.as_deref() {
+            Some("index") => {
+                let idx = Index::build(&root, args.max_filesize)?;
+                eprintln!("glep: indexed {} files", idx.manifest.live_entries().count());
+                return Ok(0);
+            }
+            Some("status") => {
+                let idx = Index::open_or_build(&root, args.max_filesize)?;
+                let live = idx.manifest.live_entries().count();
+                let skipped = idx
+                    .manifest
+                    .live_entries()
+                    .filter(|e| e.flags != 0)
+                    .count();
+                println!("files: {live}");
+                println!("skipped (binary/oversized): {skipped}");
+                println!("last sweep epoch: {}", idx.manifest.last_sweep_epoch);
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
+
+    let mut idx = Index::open_or_build(&root, args.max_filesize)?;
+    let extra = idx.update(args.max_filesize, args.ttl)?;
+
+    if args.files {
+        let mut files = idx.live_files();
+        files.extend(extra);
+        files.sort();
+        files.dedup();
+        // With --files the pattern slot is the glob.
+        if let Some(g) = args.pattern.as_deref() {
+            let glob = build_glob(g)?;
+            files.retain(|f| glob.is_match(f));
+        }
+        let args2 = Args { pattern: None, ..args };
+        apply_filters(&mut files, &args2)?;
+        for f in &files {
+            println!("{}", f.display());
+        }
+        return Ok(if files.is_empty() { 1 } else { 0 });
+    }
+
+    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
+        Some(p) => p,
+        None => anyhow::bail!("a pattern is required (or --files)"),
+    };
+    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    let mut files = idx.candidates(&query_plan, args.ignore_case);
+    files.extend(extra);
+    files.sort();
+    files.dedup();
+    apply_filters(&mut files, &args)?;
+
+    let opts = search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        context: args.context,
+        json: args.json,
+    };
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+    Ok(if found { 0 } else { 1 })
+}
