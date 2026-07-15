@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glep: indexed grep + glob for AI agents</title>
+<meta name="description" content="glep answers warm code searches from a persistent trigram index in milliseconds, with ripgrep-identical output. Built for coding agents.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Crect width='256' height='256' rx='56' fill='%230E1A24'/%3E%3Crect x='54' y='100' width='32' height='96' rx='8' fill='%23FFB454'/%3E%3Crect x='96' y='68' width='32' height='96' rx='8' fill='%23FF9A4E'/%3E%3Crect x='138' y='100' width='32' height='64' rx='8' fill='%23FF7847'/%3E%3Crect x='180' y='100' width='32' height='96' rx='8' fill='%2322384A'/%3E%3Crect x='44' y='58' width='136' height='148' rx='20' fill='none' stroke='%23FFB454' stroke-width='5'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --ink: #0E1A24;
+    --ink-raise: #13222E;
+    --cell: #22384A;
+    --bone: #F3EDE3;
+    --bone-dim: #A9B4BC;
+    --amber: #FFB454;
+    --ember: #FF7847;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--ink);
+    color: var(--bone);
+    font-family: var(--sans);
+    line-height: 1.6;
+    font-size: 17px;
+  }
+  a { color: var(--amber); text-decoration: none; }
+  a:hover, a:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 2px; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+
+  /* hero */
+  header { padding: 88px 0 56px; }
+  .wordmark { font-family: var(--mono); font-size: clamp(56px, 12vw, 96px); font-weight: 600; letter-spacing: -0.02em; line-height: 1; display: inline-block; position: relative; padding-bottom: 26px; }
+  .wordmark::before, .wordmark::after { content: ""; position: absolute; height: 7px; border-radius: 4px; }
+  .wordmark::before { left: 0; right: 26%; bottom: 14px; background: var(--amber); }
+  .wordmark::after { left: 26%; right: 0; bottom: 0; background: var(--ember); }
+  .tagline { font-size: clamp(20px, 3.4vw, 26px); color: var(--bone); max-width: 34ch; margin-top: 18px; font-weight: 500; }
+  .sub { color: var(--bone-dim); margin-top: 14px; max-width: 58ch; }
+  .cta { margin-top: 32px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .install {
+    font-family: var(--mono); font-size: 15px; background: var(--ink-raise);
+    border: 1px solid var(--cell); border-radius: 10px; padding: 10px 16px; color: var(--bone);
+  }
+  .install b { color: var(--amber); font-weight: 600; }
+  .gh { font-family: var(--mono); font-size: 15px; padding: 10px 16px; border: 1px solid var(--cell); border-radius: 10px; }
+
+  /* trigram demo */
+  .demo { margin-top: 56px; background: var(--ink-raise); border: 1px solid var(--cell); border-radius: 14px; padding: 26px 24px 22px; overflow-x: auto; }
+  .demo-line { font-family: var(--mono); font-size: 16px; white-space: pre; position: relative; display: inline-block; color: var(--bone-dim); padding: 3px 0; }
+  .demo-line .win {
+    position: absolute; top: 0; bottom: 0; width: 3ch; left: 0;
+    border: 2px solid var(--amber); border-radius: 6px;
+    box-shadow: 0 0 18px rgba(255, 180, 84, 0.25);
+    animation: slide 7s steps(26) infinite alternate;
+  }
+  .demo-cap { font-size: 13.5px; color: var(--bone-dim); margin-top: 12px; font-family: var(--mono); }
+  .demo-cap b { color: var(--amber); font-weight: 600; }
+  @keyframes slide { from { transform: translateX(0); } to { transform: translateX(26ch); } }
+  @media (prefers-reduced-motion: reduce) { .demo-line .win { animation: none; left: 12ch; } }
+
+  /* sections */
+  section { padding: 44px 0; }
+  .eyebrow { font-family: var(--mono); font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); }
+  h2 { font-family: var(--mono); font-size: 26px; font-weight: 600; margin: 8px 0 6px; position: relative; display: inline-block; padding-bottom: 18px; }
+  h2::before, h2::after { content: ""; position: absolute; height: 5px; border-radius: 3px; }
+  h2::before { left: 0; width: 62%; bottom: 9px; background: var(--amber); }
+  h2::after { left: 30%; width: 62%; bottom: 0; background: var(--ember); }
+  .lead { color: var(--bone-dim); max-width: 62ch; margin-top: 10px; }
+
+  /* the table */
+  .table-scroll { overflow-x: auto; margin-top: 26px; border: 1px solid var(--cell); border-radius: 14px; }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 15.5px; }
+  th, td { text-align: left; padding: 14px 18px; vertical-align: top; }
+  thead th { font-family: var(--mono); font-size: 13px; letter-spacing: 0.1em; text-transform: uppercase; background: var(--ink-raise); border-bottom: 1px solid var(--cell); }
+  thead th:first-child { color: var(--amber); }
+  thead th:last-child { color: var(--bone-dim); }
+  tbody tr + tr td { border-top: 1px solid var(--cell); }
+  td:first-child { border-right: 1px solid var(--cell); width: 50%; }
+  td b { color: var(--bone); font-weight: 600; }
+  td { color: var(--bone-dim); }
+  .why { font-family: var(--mono); font-size: 13px; color: var(--amber); display: block; margin-top: 4px; }
+  td:last-child .why { color: var(--ember); }
+
+  /* how it works */
+  ol.how { margin-top: 22px; counter-reset: step; list-style: none; display: grid; gap: 14px; }
+  ol.how li { background: var(--ink-raise); border: 1px solid var(--cell); border-radius: 12px; padding: 16px 18px 16px 58px; position: relative; color: var(--bone-dim); }
+  ol.how li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 16px; top: 15px; width: 28px; height: 28px;
+    display: grid; place-items: center; border-radius: 8px;
+    font-family: var(--mono); font-weight: 600; font-size: 14px;
+    background: linear-gradient(135deg, var(--amber), var(--ember)); color: var(--ink);
+  }
+  ol.how b { color: var(--bone); font-weight: 600; }
+  code { font-family: var(--mono); font-size: 0.92em; background: var(--ink-raise); border: 1px solid var(--cell); border-radius: 6px; padding: 1px 6px; color: var(--bone); }
+  ol.how code, td code { background: var(--ink); }
+
+  /* proof strip */
+  .proof { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-top: 24px; }
+  .proof div { border: 1px solid var(--cell); border-radius: 12px; padding: 16px 18px; }
+  .proof .n { font-family: var(--mono); font-size: 22px; font-weight: 600; color: var(--amber); }
+  .proof p { font-size: 14px; color: var(--bone-dim); margin-top: 4px; }
+
+  footer { padding: 48px 0 64px; color: var(--bone-dim); font-size: 14.5px; border-top: 1px solid var(--cell); margin-top: 40px; }
+  footer .wrap { display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <span class="wordmark" role="img" aria-label="glep, with its two trigrams gle and lep underlined">glep</span>
+  <p class="tagline">Indexed grep + glob for AI agents.</p>
+  <p class="sub">ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm searches in milliseconds, with output byte-identical to ripgrep's.</p>
+  <div class="cta">
+    <span class="install"><b>pip</b> install glep</span>
+    <span class="install"><b>cargo</b> install glep</span>
+    <a class="gh" href="https://github.com/anishfyi/glep">github.com/anishfyi/glep &rarr;</a>
+  </div>
+
+  <div class="demo" aria-label="Animated diagram of a trigram window sliding over a line of code">
+    <span class="demo-line">let hits = index.lookup("gle");<span class="win" aria-hidden="true"></span></span>
+    <p class="demo-cap">every 3-byte window of your code is indexed once; <b>queries become lookups</b>, not scans</p>
+  </div>
+</header>
+
+<section class="wrap" id="when">
+  <span class="eyebrow">the honest part</span>
+  <h2>When to use it</h2>
+  <p class="lead">glep is a specialist. It wins when the same tree gets searched again and again; it loses to a cold ripgrep run exactly once, while building its index.</p>
+
+  <div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Use glep</th>
+        <th scope="col">Stick with rg / fd</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>Coding-agent sessions</b> that fire dozens of Grep/Glob calls over one repo. The bundled Claude Code hook reroutes them automatically.
+          <span class="why">pays the scan once, answers every call after from the index</span></td>
+        <td><b>One-off searches</b> in a tree you will never search again.
+          <span class="why">the first query costs a full scan either way; no payback</span></td>
+      </tr>
+      <tr>
+        <td><b>Monorepos and large trees</b> where ripgrep takes hundreds of milliseconds to seconds per query.
+          <span class="why">warm content queries run in roughly 1-20 ms</span></td>
+        <td><b>Small repos</b> where rg already answers in under ~50 ms.
+          <span class="why">indexing overhead nets you nothing measurable</span></td>
+      </tr>
+      <tr>
+        <td><b>Repeated file listings</b>: <code>glep --files '**/*.rs'</code> answers from the manifest with no directory traversal.
+          <span class="why">fd-style listings without touching the filesystem tree</span></td>
+        <td><b>Ephemeral environments</b> (CI runners, throwaway containers) where the index never survives to be reused.
+          <span class="why">cold build per run means rg is simply cheaper</span></td>
+      </tr>
+      <tr>
+        <td><b>Read-heavy exploration bursts</b>: add <code>--ttl 5</code> to amortize the freshness sweep across consecutive queries.
+          <span class="why">sweep once, answer many</span></td>
+        <td><b>Features glep v1 does not have</b>: count mode, replacements, multiline search, PCRE2, compressed files.
+          <span class="why">rg has a decade of surface area; glep covers the agent 95%</span></td>
+      </tr>
+      <tr>
+        <td><b>Anywhere correctness is non-negotiable.</b> Every query self-heals (mtime sweep, incremental reindex); patterns the index cannot narrow fall back to a full parallel scan.
+          <span class="why">never a wrong answer; worst case is rg-speed</span></td>
+        <td><b>Corpora that are mostly binaries or files over the 1 MB cap.</b> Those files skip the index and get live-scanned anyway.
+          <span class="why">an index that indexes nothing is pure overhead</span></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="wrap" id="how">
+  <span class="eyebrow">under the hood</span>
+  <h2>How it works</h2>
+  <ol class="how">
+    <li><b>Index once.</b> A gitignore-aware parallel sweep reads your tree; every distinct 3-byte window lands in a memory-mapped postings file under <code>.glep/</code>, a few percent of corpus size.</li>
+    <li><b>Self-heal on every query.</b> A fast mtime sweep diffs the tree against the manifest; only changed files are re-indexed, into a log-structured delta segment. Edit a file, search, see it. Always.</li>
+    <li><b>Narrow, then match.</b> Your regex becomes a trigram plan; postings intersection shrinks 20,000 files to the handful that can match; ripgrep's own engine runs over just those.</li>
+    <li><b>Stay honest.</b> Output is byte-compatible with <code>rg</code>, exit codes match, and a differential harness in CI compares every release against real ripgrep.</li>
+  </ol>
+</section>
+
+<section class="wrap" id="proof">
+  <span class="eyebrow">receipts</span>
+  <h2>Verified, not vibes</h2>
+  <div class="proof">
+    <div><span class="n">12/12</span><p>pattern classes byte-identical to ripgrep in the differential parity harness, including Unicode case folding and multi-file context</p></div>
+    <div><span class="n">57</span><p>tests: engine units, CLI integration, freshness (edit, search, see it), crash-recovery and corruption paths</p></div>
+    <div><span class="n">0</span><p>daemons, watchers, or background processes; one binary and one directory of index files</p></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>MIT</span>
+    <a href="https://github.com/anishfyi/glep">GitHub</a>
+    <span>built on ripgrep's crates, with respect</span>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -10,6 +10,16 @@ Ripgrep pays the full scan cost on every query. glep pays it once: a persistent,
 
 Coding agents call Grep and Glob dozens of times per session. On monorepo-scale projects each call costs seconds. glep replaces both with index-backed equivalents built on ripgrep's own crates (`ignore`, `grep-searcher`, `regex-syntax`), so correctness is inherited, not reimplemented.
 
+## When to use it
+
+| Use glep | Stick with rg / fd |
+|---|---|
+| Agent sessions firing dozens of searches over one repo (the bundled hook reroutes Grep/Glob) | One-off searches in a tree you will never search again |
+| Monorepos where rg takes 100ms+ per query; warm glep answers in ~1-20ms | Small repos where rg already answers in under ~50ms |
+| Repeated glob listings: `glep --files` reads the manifest, no traversal | Ephemeral CI runners where the index never persists between runs |
+| Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep v1 lacks: count mode, replacements, multiline, PCRE2, compressed files |
+| Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
+
 ## How it works
 
 - A file-level trigram inverted index (the Russ Cox / csearch model) lives in `.glep/`, memory-mapped, a few percent of corpus size.
