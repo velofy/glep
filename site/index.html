@@ -32,8 +32,8 @@
   a:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 2px; }
   .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
 
-  /* hero */
-  header { padding: 88px 0 56px; }
+  /* hero: header.wrap outranks .wrap so vertical padding survives */
+  header.wrap { padding: 96px 24px 64px; }
   .wordmark { font-family: var(--mono); font-size: clamp(56px, 12vw, 96px); font-weight: 600; letter-spacing: -0.02em; line-height: 1; display: inline-block; position: relative; padding-bottom: 26px; }
   .wordmark::before, .wordmark::after { content: ""; position: absolute; height: 7px; border-radius: 4px; }
   .wordmark::before { left: 0; right: 26%; bottom: 14px; background: var(--amber); }
@@ -63,8 +63,8 @@
   @media (prefers-reduced-motion: reduce) { .demo-line .win { animation: none; left: 12ch; } }
 
   /* sections */
-  section { padding: 44px 0; }
-  .eyebrow { font-family: var(--mono); font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); }
+  section.wrap { padding: 48px 24px; }
+  .eyebrow { display: block; font-family: var(--mono); font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber); }
   h2 { font-family: var(--mono); font-size: 26px; font-weight: 600; margin: 8px 0 6px; position: relative; display: inline-block; padding-bottom: 18px; }
   h2::before, h2::after { content: ""; position: absolute; height: 5px; border-radius: 3px; }
   h2::before { left: 0; width: 62%; bottom: 9px; background: var(--amber); }
