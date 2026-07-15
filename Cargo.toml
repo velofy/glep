@@ -5,6 +5,7 @@ edition = "2021"
 description = "Indexed grep + glob for AI agents"
 license = "MIT"
 authors = ["anishfyi"]
+exclude = ["site/", "docs/", "assets/", ".github/", "claude/", "bench/", "pyproject.toml"]
 repository = "https://github.com/anishfyi/glep"
 
 [dependencies]
