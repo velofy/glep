@@ -154,7 +154,10 @@ pub fn run(
             .enumerate()
             .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
                 Ok((buf, matched)) => (i, buf, matched),
-                Err(_) => (i, Vec::new(), false), // vanished/unreadable file: no matches
+                Err(e) => {
+                    eprintln!("glep: {}: {}", rel.display(), e);
+                    (i, Vec::new(), false)
+                }
             })
             .collect();
         results.sort_by_key(|(i, _, _)| *i);

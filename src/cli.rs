@@ -107,7 +107,8 @@ pub fn run() -> anyhow::Result<i32> {
                 return Ok(0);
             }
             Some("status") => {
-                let idx = Index::open_or_build(&root, args.max_filesize)?;
+                let mut idx = Index::open_or_build(&root, args.max_filesize)?;
+                if !idx.read_only { idx.update(args.max_filesize, 0)?; }
                 let live = idx.manifest.live_entries().count();
                 let skipped = idx
                     .manifest

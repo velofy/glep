@@ -195,3 +195,15 @@ fn explicit_regexp_with_path_scopes_results() {
     assert!(!s.contains("notes.txt"));
     assert!(!s.contains("other/c.txt"));
 }
+
+#[test]
+fn status_reflects_live_tree() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    std::fs::write(dir.path().join("third.txt"), "x").unwrap();
+    glep(dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("files: 3"));
+}
