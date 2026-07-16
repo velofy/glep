@@ -9,6 +9,7 @@ pub struct SearchOpts {
     pub files_with_matches: bool,
     pub context: usize,
     pub json: bool,
+    pub count: bool,
 }
 
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
@@ -32,6 +33,20 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
+struct CountSink(u64);
+
+impl grep_searcher::Sink for CountSink {
+    type Error = std::io::Error;
+    fn matched(
+        &mut self,
+        _: &grep_searcher::Searcher,
+        _: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        self.0 += 1;
+        Ok(true)
+    }
+}
+
 fn search_one(
     matcher: &grep_regex::RegexMatcher,
     root: &Path,
@@ -45,6 +60,14 @@ fn search_one(
         .after_context(opts.context)
         .build();
     let full = root.join(rel);
+    if opts.count {
+        let mut sink = CountSink(0);
+        searcher.search_path(matcher, &full, &mut sink)?;
+        if sink.0 > 0 {
+            return Ok((format!("{}:{}\n", rel.display(), sink.0).into_bytes(), true));
+        }
+        return Ok((Vec::new(), false));
+    }
     if opts.files_with_matches {
         let mut sink = FoundSink(false);
         searcher.search_path(matcher, &full, &mut sink)?;
@@ -134,6 +157,7 @@ mod tests {
             files_with_matches: false,
             context: 0,
             json: false,
+            count: false,
         }
     }
 

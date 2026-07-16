@@ -22,6 +22,8 @@ pub struct Args {
     pub fixed_strings: bool,
     #[arg(short = 'l', long)]
     pub files_with_matches: bool,
+    #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
+    pub count: bool,
     /// Filter candidate files by glob (repeatable)
     #[arg(short = 'g', long = "glob")]
     pub globs: Vec<String>,
@@ -152,6 +154,7 @@ pub fn run() -> anyhow::Result<i32> {
         files_with_matches: args.files_with_matches,
         context: args.context,
         json: args.json,
+        count: args.count,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

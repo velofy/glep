@@ -83,6 +83,8 @@ fn parity_with_ripgrep() {
         &["zz_no_match_zz"],
         &["-i", "caf\u{e9}"],
         &["-C", "1", "hello"],
+        &["-c", "hello"],
+        &["-c", "-i", "HELLO"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

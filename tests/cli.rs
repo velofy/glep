@@ -168,6 +168,17 @@ fn files_mode_no_match_exits_one() {
 }
 
 #[test]
+fn count_mode_prints_path_counts() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-c", "hello"])
+        .assert()
+        .success()
+        .stdout("notes.txt:1\nsrc/lib.rs:1\n");
+    glep(dir.path()).args(["-c", "zz_absent"]).assert().code(1);
+}
+
+#[test]
 fn explicit_regexp_with_path_scopes_results() {
     let dir = corpus();
     std::fs::create_dir_all(dir.path().join("other")).unwrap();

@@ -19,6 +19,7 @@ reindex), so results are always fresh.
 | Grep case-insensitive | `glep -i -e 'X'` |
 | Grep with type filter | `glep -t rust -e 'X'` |
 | Grep with context N | `glep -C N -e 'X'` |
+| Grep count mode | `glep -c -e 'X'` |
 | Glob pattern P | `glep --files 'P'` |
 | List all files | `glep --files` |
 
