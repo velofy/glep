@@ -88,6 +88,7 @@ fn parity_with_ripgrep() {
         &["-c", "hello"],
         &["-c", "-i", "HELLO"],
         &["-c", "-C", "1", "hello"],
+        &["-U", "goodbye\\nfoo"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

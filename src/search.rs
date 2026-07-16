@@ -11,12 +11,26 @@ pub struct SearchOpts {
     pub after: usize,
     pub json: bool,
     pub count: bool,
+    pub multiline: bool,
 }
 
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
     b.fixed_strings(opts.fixed);
+    // rg's -U maps to: searcher.multi_line(true) so matches may span lines,
+    // plus a matcher built without a line-terminator restriction so a
+    // literal \n in the pattern is allowed to compile and match. We never
+    // call RegexMatcherBuilder::line_terminator here (its default is
+    // already None/unrestricted), so \n-containing patterns already
+    // compile; the only builder change needed for -U is enabling the
+    // regex "m" flag so ^/$ keep their per-line semantics once the
+    // searcher stops feeding lines one at a time (verified empirically
+    // against real rg: `rg -U '^foo'` still matches at line starts, not
+    // just at the start of the whole file).
+    if opts.multiline {
+        b.multi_line(true);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -59,6 +73,7 @@ fn search_one(
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
+        .multi_line(opts.multiline)
         .build();
     let full = root.join(rel);
     if opts.count {
@@ -161,6 +176,7 @@ mod tests {
             after: 0,
             json: false,
             count: false,
+            multiline: false,
         }
     }
 

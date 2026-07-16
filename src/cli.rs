@@ -38,6 +38,9 @@ pub struct Args {
     pub before_context: Option<usize>,
     #[arg(long)]
     pub json: bool,
+    /// Allow matches to span multiple lines (patterns may contain \n)
+    #[arg(short = 'U', long)]
+    pub multiline: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -162,6 +165,7 @@ pub fn run() -> anyhow::Result<i32> {
         after,
         json: args.json,
         count: args.count,
+        multiline: args.multiline,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
