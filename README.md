@@ -17,7 +17,7 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 | Agent sessions firing dozens of searches over one repo (the bundled hook reroutes Grep/Glob) | One-off searches in a tree you will never search again |
 | Monorepos where rg takes 100ms+ per query; warm glep answers in ~1-20ms | Small repos where rg already answers in under ~50ms |
 | Repeated glob listings: `glep --files` reads the manifest, no traversal | Ephemeral CI runners where the index never persists between runs |
-| Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep v1 lacks: count mode, replacements, multiline, PCRE2, compressed files |
+| Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep lacks: replacements, PCRE2, compressed files |
 | Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
 
 ## Numbers

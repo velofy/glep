@@ -18,8 +18,9 @@ reindex), so results are always fresh.
 | Grep files_with_matches | `glep -l -e 'X'` |
 | Grep case-insensitive | `glep -i -e 'X'` |
 | Grep with type filter | `glep -t rust -e 'X'` |
-| Grep with context N | `glep -C N -e 'X'` |
+| Grep with context N | `glep -C N -e 'X'` (or `-A N` / `-B N`) |
 | Grep count mode | `glep -c -e 'X'` |
+| Grep multiline | `glep -U -e 'X'` |
 | Glob pattern P | `glep --files 'P'` |
 | List all files | `glep --files` |
 
