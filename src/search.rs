@@ -105,7 +105,7 @@ pub fn run(
     // pattern before I/O, matching prior behavior.
     let matcher = build_matcher(pattern, opts)?;
     let mut found = false;
-    let separate = opts.context > 0 && !opts.files_with_matches && !opts.json;
+    let separate = opts.context > 0 && !opts.files_with_matches && !opts.json && !opts.count;
     let mut printed_any = false;
     let mut base = 0usize;
     for chunk in files.chunks(128) {
