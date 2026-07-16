@@ -18,13 +18,26 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     Ok(b.build(pattern)?)
 }
 
+struct FoundSink(bool);
+
+impl grep_searcher::Sink for FoundSink {
+    type Error = std::io::Error;
+    fn matched(
+        &mut self,
+        _: &grep_searcher::Searcher,
+        _: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        self.0 = true;
+        Ok(false) // stop at first match
+    }
+}
+
 fn search_one(
-    pattern: &str,
+    matcher: &grep_regex::RegexMatcher,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
-    let matcher = build_matcher(pattern, opts)?;
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
@@ -32,19 +45,24 @@ fn search_one(
         .after_context(opts.context)
         .build();
     let full = root.join(rel);
+    if opts.files_with_matches {
+        let mut sink = FoundSink(false);
+        searcher.search_path(matcher, &full, &mut sink)?;
+        return Ok((Vec::new(), sink.0));
+    }
     let mut buf = Vec::new();
     let matched;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
-        let mut sink = printer.sink_with_path(&matcher, rel);
-        searcher.search_path(&matcher, &full, &mut sink)?;
+        let mut sink = printer.sink_with_path(matcher, rel);
+        searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     } else {
         let mut printer = grep_printer::StandardBuilder::new()
             .heading(false)
             .build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(&matcher, rel);
-        searcher.search_path(&matcher, &full, &mut sink)?;
+        let mut sink = printer.sink_with_path(matcher, rel);
+        searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     }
     Ok((buf, matched))
@@ -59,34 +77,40 @@ pub fn run(
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
-    // Validate the pattern once up front so bad regexes error before I/O.
-    build_matcher(pattern, opts)?;
-    let results: Vec<(usize, Vec<u8>, bool)> = files
-        .par_iter()
-        .enumerate()
-        .map(|(i, rel)| match search_one(pattern, root, rel, opts) {
-            Ok((buf, matched)) => (i, buf, matched),
-            Err(_) => (i, Vec::new(), false), // vanished/unreadable file: no matches
-        })
-        .collect();
-    let mut ordered = results;
-    ordered.sort_by_key(|(i, _, _)| *i);
+    // Build the matcher once up front; shared by reference across the rayon
+    // closure (grep_regex::RegexMatcher is Sync). This also validates the
+    // pattern before I/O, matching prior behavior.
+    let matcher = build_matcher(pattern, opts)?;
     let mut found = false;
     let separate = opts.context > 0 && !opts.files_with_matches && !opts.json;
     let mut printed_any = false;
-    for (i, buf, matched) in ordered {
-        if matched {
-            found = true;
-            if opts.files_with_matches {
-                writeln!(out, "{}", files[i].display())?;
-            } else {
-                if separate && printed_any {
-                    writeln!(out, "--")?;
+    let mut base = 0usize;
+    for chunk in files.chunks(128) {
+        let mut results: Vec<(usize, Vec<u8>, bool)> = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
+                Ok((buf, matched)) => (i, buf, matched),
+                Err(_) => (i, Vec::new(), false), // vanished/unreadable file: no matches
+            })
+            .collect();
+        results.sort_by_key(|(i, _, _)| *i);
+        for (i, buf, matched) in results {
+            if matched {
+                found = true;
+                let global_i = base + i;
+                if opts.files_with_matches {
+                    writeln!(out, "{}", files[global_i].display())?;
+                } else {
+                    if separate && printed_any {
+                        writeln!(out, "--")?;
+                    }
+                    out.write_all(&buf)?;
+                    printed_any = true;
                 }
-                out.write_all(&buf)?;
-                printed_any = true;
             }
         }
+        base += chunk.len();
     }
     Ok(found)
 }
