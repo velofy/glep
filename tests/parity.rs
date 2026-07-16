@@ -83,6 +83,8 @@ fn parity_with_ripgrep() {
         &["zz_no_match_zz"],
         &["-i", "caf\u{e9}"],
         &["-C", "1", "hello"],
+        &["-A", "1", "hello"],
+        &["-B", "1", "answer"],
         &["-c", "hello"],
         &["-c", "-i", "HELLO"],
         &["-c", "-C", "1", "hello"],

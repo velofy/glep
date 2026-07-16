@@ -30,8 +30,12 @@ pub struct Args {
     /// Filter candidate files by type from the ignore crate's defaults (repeatable)
     #[arg(short = 't', long = "type")]
     pub types: Vec<String>,
-    #[arg(short = 'C', long, default_value_t = 0)]
-    pub context: usize,
+    #[arg(short = 'C', long)]
+    pub context: Option<usize>,
+    #[arg(short = 'A', long = "after-context")]
+    pub after_context: Option<usize>,
+    #[arg(short = 'B', long = "before-context")]
+    pub before_context: Option<usize>,
     #[arg(long)]
     pub json: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
@@ -148,11 +152,14 @@ pub fn run() -> anyhow::Result<i32> {
     files.dedup();
     apply_filters(&mut files, &args)?;
 
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
     let opts = search::SearchOpts {
         case_insensitive: args.ignore_case,
         fixed: args.fixed_strings,
         files_with_matches: args.files_with_matches,
-        context: args.context,
+        before,
+        after,
         json: args.json,
         count: args.count,
     };

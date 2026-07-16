@@ -7,7 +7,8 @@ pub struct SearchOpts {
     pub case_insensitive: bool,
     pub fixed: bool,
     pub files_with_matches: bool,
-    pub context: usize,
+    pub before: usize,
+    pub after: usize,
     pub json: bool,
     pub count: bool,
 }
@@ -56,8 +57,8 @@ fn search_one(
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
-        .before_context(opts.context)
-        .after_context(opts.context)
+        .before_context(opts.before)
+        .after_context(opts.after)
         .build();
     let full = root.join(rel);
     if opts.count {
@@ -105,7 +106,8 @@ pub fn run(
     // pattern before I/O, matching prior behavior.
     let matcher = build_matcher(pattern, opts)?;
     let mut found = false;
-    let separate = opts.context > 0 && !opts.files_with_matches && !opts.json && !opts.count;
+    let separate =
+        (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
     let mut printed_any = false;
     let mut base = 0usize;
     for chunk in files.chunks(128) {
@@ -155,7 +157,8 @@ mod tests {
             case_insensitive: false,
             fixed: false,
             files_with_matches: false,
-            context: 0,
+            before: 0,
+            after: 0,
             json: false,
             count: false,
         }

@@ -47,10 +47,12 @@ def main():
             cmd += ["-g", ti["glob"]]
         if ti.get("type"):
             cmd += ["-t", ti["type"]]
-        for ctx_key in ("-C", "-A", "-B"):
-            if ti.get(ctx_key):
-                cmd += ["-C", str(ti[ctx_key])]
-                break
+        if ti.get("-C"):
+            cmd += ["-C", str(ti["-C"])]
+        if ti.get("-A"):
+            cmd += ["-A", str(ti["-A"])]
+        if ti.get("-B"):
+            cmd += ["-B", str(ti["-B"])]
         cmd += ["-e", pat]
         pattern_idx = len(cmd) - 1
         if ti.get("path"):
