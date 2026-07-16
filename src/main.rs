@@ -5,6 +5,8 @@ mod search;
 mod timing;
 mod trigram;
 mod walk;
+#[cfg(target_os = "macos")]
+mod walk_bulk;
 
 fn main() {
     match cli::run() {

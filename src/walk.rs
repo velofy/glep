@@ -77,7 +77,34 @@ impl Drop for Collector<'_> {
 
 /// Parallel gitignore-aware sweep. Skips hidden entries (default), so
 /// .git/ and .glep/ never appear. Returns files sorted by relative path.
+///
+/// On macOS this dispatches to `walk_bulk::sweep_bulk`, a getattrlistbulk
+/// based fast path that collapses the per-file stat() storm into one
+/// syscall per directory (see walk_bulk.rs for the design). Setting the
+/// env var GLEP_NO_BULK_SWEEP forces this portable walker instead. Any
+/// `Err` from sweep_bulk also falls back to this walker, with a warning on
+/// stderr, so a bug in the macOS-only fast path can never surface as a
+/// hard failure, only as a missed speedup for that one sweep.
 pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+            match crate::walk_bulk::sweep_bulk(root) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    eprintln!("glep: bulk sweep failed ({e}), falling back to walker sweep");
+                }
+            }
+        }
+    }
+    sweep_walker(root)
+}
+
+/// Portable, non-macOS-specific sweep: `ignore::WalkParallel` plus a
+/// `stat()`-class metadata() call per file. This is the sole implementation
+/// on non-macOS platforms, and the fallback / correctness reference on
+/// macOS (see `sweep` above and the differential tests below).
+fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",
@@ -125,5 +152,111 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does_not_exist");
         assert!(sweep(&missing).is_err());
+    }
+
+    /// Differential parity between the macOS getattrlistbulk fast path
+    /// (`walk_bulk::sweep_bulk`) and the portable walker
+    /// (`sweep_walker`, this file's original implementation, kept as the
+    /// fallback and correctness reference). Both must agree exactly on a
+    /// fixture that exercises nested directories, a root-level .gitignore,
+    /// a NESTED .gitignore that only applies to its own subtree, a hidden
+    /// file, a hidden directory, and plain files.
+    #[cfg(target_os = "macos")]
+    mod bulk_parity {
+        use super::*;
+
+        fn build_fixture() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("sub/deeper")).unwrap();
+            std::fs::create_dir_all(dir.path().join(".hidden_dir")).unwrap();
+
+            std::fs::write(dir.path().join("root.txt"), "root file").unwrap();
+            std::fs::write(dir.path().join("skip.log"), "gitignored at root").unwrap();
+            std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+            std::fs::write(dir.path().join(".hidden_file"), "dotfile, always skipped").unwrap();
+            std::fs::write(dir.path().join(".hidden_dir/inside.txt"), "never visited").unwrap();
+
+            std::fs::write(dir.path().join("sub/normal.txt"), "normal sub file").unwrap();
+            std::fs::write(dir.path().join("sub/local.txt"), "ignored only under sub/").unwrap();
+            std::fs::write(dir.path().join("sub/.gitignore"), "local.txt\n").unwrap();
+
+            std::fs::write(dir.path().join("sub/deeper/nested.txt"), "deep file").unwrap();
+            std::fs::write(dir.path().join("sub/deeper/also.log"), "still root-ignored").unwrap();
+            dir
+        }
+
+        #[test]
+        fn sweep_bulk_matches_sweep_walker_exactly() {
+            let dir = build_fixture();
+
+            let mut walker = sweep_walker(dir.path()).unwrap();
+            let mut bulk = crate::walk_bulk::sweep_bulk(dir.path()).unwrap();
+            walker.sort_by(|a, b| a.path.cmp(&b.path));
+            bulk.sort_by(|a, b| a.path.cmp(&b.path));
+
+            let walker_paths: Vec<_> = walker.iter().map(|m| m.path.clone()).collect();
+            let bulk_paths: Vec<_> = bulk.iter().map(|m| m.path.clone()).collect();
+            assert_eq!(walker_paths, bulk_paths, "sweep_bulk and sweep_walker disagree on file set");
+
+            // Sanity: gitignore scoping actually took effect (root pattern
+            // applies everywhere, nested pattern applies only under sub/,
+            // hidden file and hidden dir never appear).
+            let expect: Vec<PathBuf> = [
+                "root.txt",
+                "sub/deeper/nested.txt",
+                "sub/normal.txt",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+            assert_eq!(walker_paths, expect);
+
+            assert_eq!(walker.len(), bulk.len());
+            for (w, b) in walker.iter().zip(bulk.iter()) {
+                assert_eq!(w.path, b.path);
+                assert_eq!(w.size, b.size, "size mismatch for {:?}", w.path);
+                assert_eq!(
+                    w.mtime_ns, b.mtime_ns,
+                    "mtime_ns resolution mismatch for {:?}: walker={} bulk={}",
+                    w.path, w.mtime_ns, b.mtime_ns
+                );
+            }
+        }
+
+        /// The resolution check above (exact mtime_ns equality) is the
+        /// unit-level guarantee; this is the end-to-end one. `Index::update`
+        /// decides "did this file change" purely by comparing stored
+        /// mtime_ns/size against a fresh sweep's mtime_ns/size. If the two
+        /// sweep implementations disagreed on mtime_ns resolution (e.g. one
+        /// truncated to whole seconds), every file would look changed the
+        /// first time a query switched sweep paths, forcing a full reindex.
+        /// Build with one path, update with the other, both directions:
+        /// zero files should ever look reindexed.
+        #[test]
+        fn mtime_resolution_survives_switching_sweep_paths_zero_reindex() {
+            use crate::index::Index;
+
+            // Case 1: build via the walker path, update via the bulk path.
+            let dir = build_fixture();
+            std::env::set_var("GLEP_NO_BULK_SWEEP", "1");
+            let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+            std::env::remove_var("GLEP_NO_BULK_SWEEP");
+            idx.update(1_048_576, 0).unwrap();
+            assert!(
+                !dir.path().join(".glep/delta.bin").exists(),
+                "walker-built index saw files as changed after switching to the bulk sweep"
+            );
+
+            // Case 2: build via the bulk path, update via the walker path.
+            let dir2 = build_fixture();
+            let mut idx2 = Index::build(dir2.path(), 1_048_576).unwrap();
+            std::env::set_var("GLEP_NO_BULK_SWEEP", "1");
+            idx2.update(1_048_576, 0).unwrap();
+            std::env::remove_var("GLEP_NO_BULK_SWEEP");
+            assert!(
+                !dir2.path().join(".glep/delta.bin").exists(),
+                "bulk-built index saw files as changed after switching to the walker sweep"
+            );
+        }
     }
 }
