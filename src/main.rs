@@ -2,6 +2,7 @@ mod cli;
 mod index;
 mod plan;
 mod search;
+mod timing;
 mod trigram;
 mod walk;
 
