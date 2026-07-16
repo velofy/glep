@@ -20,6 +20,19 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 | Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep v1 lacks: count mode, replacements, multiline, PCRE2, compressed files |
 | Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
 
+## Numbers
+
+Linux kernel 6.12 checkout: 86,605 files, ~1.5 GB. Apple Silicon macOS, hyperfine medians, warm filesystem cache, rg and fd at their default parallelism.
+
+| Scenario | glep | glep --ttl 5 | ripgrep | fd |
+|---|---|---|---|---|
+| Rare pattern | 221 ms | 21 ms | 1.39 s | |
+| Common pattern (~10k matches) | | 90 ms | 1.54 s | |
+| List all .c files (--files) | 242 ms | 44 ms | | 92 ms |
+| Index build (one-time) | 24 s | | | |
+
+Default glep pays the self-healing freshness sweep (a stat of every file) on each query; `--ttl` amortizes it across read bursts. Index size: 154 MB, about 10% of the corpus. The parity harness pins byte-equality with rg's output; speed differs, bytes do not.
+
 ## How it works
 
 - A file-level trigram inverted index (the Russ Cox / csearch model) lives in `.glep/`, memory-mapped, a few percent of corpus size.
