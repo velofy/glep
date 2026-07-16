@@ -5,6 +5,7 @@ on:
 jobs:
   wheels:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -30,6 +31,7 @@ jobs:
           path: dist
   publish:
     needs: wheels
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
