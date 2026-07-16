@@ -243,6 +243,11 @@ impl Index {
             return Ok(Vec::new());
         }
         let swept = walk::sweep(&self.root)?;
+        let id_by_path: std::collections::HashMap<&Path, u32> = self
+            .manifest
+            .live_entries()
+            .map(|e| (e.path.as_path(), e.id))
+            .collect();
         let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
             .manifest
             .live_entries()
@@ -260,12 +265,7 @@ impl Index {
         let dead_ids: Vec<u32> = by_path.values().map(|e| e.id).collect();
         let changed_old_ids: Vec<u32> = fresh
             .iter()
-            .filter_map(|m| {
-                self.manifest
-                    .live_entries()
-                    .find(|e| e.path == m.path)
-                    .map(|e| e.id)
-            })
+            .filter_map(|m| id_by_path.get(m.path.as_path()).copied())
             .collect();
 
         if self.read_only {
@@ -273,7 +273,13 @@ impl Index {
         }
         if fresh.is_empty() && dead_ids.is_empty() {
             self.manifest.last_sweep_epoch = now_epoch();
-            self.manifest.save(&self.dir.join("manifest.bin"))?;
+            // The persisted epoch is consumed solely by ttl checks; skip the
+            // write when ttl is unused so a no-op query stays write-free. A
+            // later process may then see a slightly stale epoch, which can
+            // only cause an extra sweep, never a missed one.
+            if ttl_secs > 0 {
+                self.manifest.save(&self.dir.join("manifest.bin"))?;
+            }
             return Ok(Vec::new());
         }
 
@@ -529,6 +535,17 @@ mod tests {
             idx.candidates(&plan, false),
             vec![std::path::PathBuf::from("bulk.txt")]
         );
+    }
+
+    #[test]
+    fn noop_update_without_ttl_writes_nothing() {
+        let dir = corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let before = std::fs::metadata(&mpath).unwrap().modified().unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        let after = std::fs::metadata(&mpath).unwrap().modified().unwrap();
+        assert_eq!(before, after, "no-op update with ttl 0 must not rewrite the manifest");
     }
 
     #[test]
