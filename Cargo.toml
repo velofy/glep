@@ -1,6 +1,6 @@
 [package]
 name = "glep"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Indexed grep + glob for AI agents"
 license = "MIT"
@@ -14,6 +14,7 @@ bincode = "1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 globset = "0.4"
+grep-matcher = "0.1"
 grep-printer = "0.2"
 grep-regex = "0.1"
 grep-searcher = "0.1"

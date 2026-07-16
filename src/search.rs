@@ -7,14 +7,30 @@ pub struct SearchOpts {
     pub case_insensitive: bool,
     pub fixed: bool,
     pub files_with_matches: bool,
-    pub context: usize,
+    pub before: usize,
+    pub after: usize,
     pub json: bool,
+    pub count: bool,
+    pub multiline: bool,
 }
 
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
     b.fixed_strings(opts.fixed);
+    // rg's -U maps to: searcher.multi_line(true) so matches may span lines,
+    // plus a matcher built without a line-terminator restriction so a
+    // literal \n in the pattern is allowed to compile and match. We never
+    // call RegexMatcherBuilder::line_terminator here (its default is
+    // already None/unrestricted), so \n-containing patterns already
+    // compile; the only builder change needed for -U is enabling the
+    // regex "m" flag so ^/$ keep their per-line semantics once the
+    // searcher stops feeding lines one at a time (verified empirically
+    // against real rg: `rg -U '^foo'` still matches at line starts, not
+    // just at the start of the whole file).
+    if opts.multiline {
+        b.multi_line(true);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -32,6 +48,36 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
+struct CountSink<'a> {
+    matcher: &'a grep_regex::RegexMatcher,
+    multiline: bool,
+    count: u64,
+}
+
+impl grep_searcher::Sink for CountSink<'_> {
+    type Error = std::io::Error;
+    fn matched(
+        &mut self,
+        _: &grep_searcher::Searcher,
+        m: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        if self.multiline {
+            use grep_matcher::Matcher;
+            let mut n = 0u64;
+            self.matcher
+                .find_iter(m.bytes(), |_| {
+                    n += 1;
+                    true
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            self.count += n.max(1);
+        } else {
+            self.count += 1;
+        }
+        Ok(true)
+    }
+}
+
 fn search_one(
     matcher: &grep_regex::RegexMatcher,
     root: &Path,
@@ -41,10 +87,26 @@ fn search_one(
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
-        .before_context(opts.context)
-        .after_context(opts.context)
+        .before_context(opts.before)
+        .after_context(opts.after)
+        .multi_line(opts.multiline)
         .build();
     let full = root.join(rel);
+    if opts.count {
+        let mut sink = CountSink {
+            matcher,
+            multiline: opts.multiline,
+            count: 0,
+        };
+        searcher.search_path(matcher, &full, &mut sink)?;
+        if sink.count > 0 {
+            return Ok((
+                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
+                true,
+            ));
+        }
+        return Ok((Vec::new(), false));
+    }
     if opts.files_with_matches {
         let mut sink = FoundSink(false);
         searcher.search_path(matcher, &full, &mut sink)?;
@@ -82,7 +144,8 @@ pub fn run(
     // pattern before I/O, matching prior behavior.
     let matcher = build_matcher(pattern, opts)?;
     let mut found = false;
-    let separate = opts.context > 0 && !opts.files_with_matches && !opts.json;
+    let separate =
+        (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
     let mut printed_any = false;
     let mut base = 0usize;
     for chunk in files.chunks(128) {
@@ -91,7 +154,10 @@ pub fn run(
             .enumerate()
             .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
                 Ok((buf, matched)) => (i, buf, matched),
-                Err(_) => (i, Vec::new(), false), // vanished/unreadable file: no matches
+                Err(e) => {
+                    eprintln!("glep: {}: {}", rel.display(), e);
+                    (i, Vec::new(), false)
+                }
             })
             .collect();
         results.sort_by_key(|(i, _, _)| *i);
@@ -132,8 +198,11 @@ mod tests {
             case_insensitive: false,
             fixed: false,
             files_with_matches: false,
-            context: 0,
+            before: 0,
+            after: 0,
             json: false,
+            count: false,
+            multiline: false,
         }
     }
 

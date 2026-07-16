@@ -23,11 +23,20 @@ echo "$OUT" | grep -q "glep -i -g '\*.rs' -e 'foo bar'" || { echo "FAIL: bad com
 OUT=$(run_hook '{"tool_name":"Glob","tool_input":{"pattern":"**/*.py"},"cwd":"'"$TMP"'"}')
 echo "$OUT" | grep -q "glep --files '\*\*/\*.py'" || { echo "FAIL: bad glob mapping: $OUT"; exit 1; }
 
-# 4. Grep count mode passes through (glep has no --count in v1)
+# 4. Grep count mode maps to glep -c
 OUT=$(run_hook '{"tool_name":"Grep","tool_input":{"pattern":"x","output_mode":"count"},"cwd":"'"$TMP"'"}')
-[ -z "$OUT" ] || { echo "FAIL: count mode should pass through"; exit 1; }
+echo "$OUT" | grep -q '"permissionDecision": "deny"' || { echo "FAIL: expected deny for count mode"; exit 1; }
+echo "$OUT" | grep -q "glep -c -e 'x'" || { echo "FAIL: bad count command: $OUT"; exit 1; }
 
-# 5. Non-object JSON: must allow (exit 0, no output, no crash)
+# 5. Grep -A context maps to glep -A, not -C
+OUT=$(run_hook '{"tool_name":"Grep","tool_input":{"pattern":"x","-A":2},"cwd":"'"$TMP"'"}')
+echo "$OUT" | grep -q '"permissionDecision": "deny"' || { echo "FAIL: expected deny for -A context"; exit 1; }
+echo "$OUT" | grep -q "glep -A 2 -e 'x'" || { echo "FAIL: bad -A command: $OUT"; exit 1; }
+if echo "$OUT" | grep -q -- "-C"; then
+  echo "FAIL: -A payload should not produce -C: $OUT"; exit 1
+fi
+
+# 6. Non-object JSON: must allow (exit 0, no output, no crash)
 set +e
 OUT=$(echo 'null' | python3 "$HOOK" 2>/dev/null)
 RC=$?

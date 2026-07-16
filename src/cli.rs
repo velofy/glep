@@ -22,16 +22,25 @@ pub struct Args {
     pub fixed_strings: bool,
     #[arg(short = 'l', long)]
     pub files_with_matches: bool,
+    #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
+    pub count: bool,
     /// Filter candidate files by glob (repeatable)
     #[arg(short = 'g', long = "glob")]
     pub globs: Vec<String>,
     /// Filter candidate files by type from the ignore crate's defaults (repeatable)
     #[arg(short = 't', long = "type")]
     pub types: Vec<String>,
-    #[arg(short = 'C', long, default_value_t = 0)]
-    pub context: usize,
+    #[arg(short = 'C', long)]
+    pub context: Option<usize>,
+    #[arg(short = 'A', long = "after-context")]
+    pub after_context: Option<usize>,
+    #[arg(short = 'B', long = "before-context")]
+    pub before_context: Option<usize>,
     #[arg(long)]
     pub json: bool,
+    /// Allow matches to span multiple lines (patterns may contain \n)
+    #[arg(short = 'U', long)]
+    pub multiline: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -98,7 +107,8 @@ pub fn run() -> anyhow::Result<i32> {
                 return Ok(0);
             }
             Some("status") => {
-                let idx = Index::open_or_build(&root, args.max_filesize)?;
+                let mut idx = Index::open_or_build(&root, args.max_filesize)?;
+                if !idx.read_only { idx.update(args.max_filesize, 0)?; }
                 let live = idx.manifest.live_entries().count();
                 let skipped = idx
                     .manifest
@@ -146,12 +156,17 @@ pub fn run() -> anyhow::Result<i32> {
     files.dedup();
     apply_filters(&mut files, &args)?;
 
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
     let opts = search::SearchOpts {
         case_insensitive: args.ignore_case,
         fixed: args.fixed_strings,
         files_with_matches: args.files_with_matches,
-        context: args.context,
+        before,
+        after,
         json: args.json,
+        count: args.count,
+        multiline: args.multiline,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

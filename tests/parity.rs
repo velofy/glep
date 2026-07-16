@@ -34,6 +34,7 @@ fn corpus() -> tempfile::TempDir {
         "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\nplain line\n",
     )
     .unwrap();
+    std::fs::write(dir.path().join("adjacent.txt"), "aXb\ncXd\naXb\ncXd\n").unwrap();
     dir
 }
 
@@ -83,6 +84,13 @@ fn parity_with_ripgrep() {
         &["zz_no_match_zz"],
         &["-i", "caf\u{e9}"],
         &["-C", "1", "hello"],
+        &["-A", "1", "hello"],
+        &["-B", "1", "answer"],
+        &["-c", "hello"],
+        &["-c", "-i", "HELLO"],
+        &["-c", "-C", "1", "hello"],
+        &["-U", "goodbye\\nfoo"],
+        &["-U", "-c", "a.b\\nc.d"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

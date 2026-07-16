@@ -31,24 +31,30 @@ def main():
     if not os.path.isdir(os.path.join(cwd, ".glep")):
         allow()
 
+    pattern_idx = None
     if tool == "Grep":
         pat = ti.get("pattern")
-        if not pat or ti.get("output_mode") == "count":
+        if not pat:
             allow()
         cmd = ["glep"]
         if ti.get("-i"):
             cmd.append("-i")
         if ti.get("output_mode") == "files_with_matches":
             cmd.append("-l")
+        elif ti.get("output_mode") == "count":
+            cmd.append("-c")
         if ti.get("glob"):
             cmd += ["-g", ti["glob"]]
         if ti.get("type"):
             cmd += ["-t", ti["type"]]
-        for ctx_key in ("-C", "-A", "-B"):
-            if ti.get(ctx_key):
-                cmd += ["-C", str(ti[ctx_key])]
-                break
+        if ti.get("-C"):
+            cmd += ["-C", str(ti["-C"])]
+        if ti.get("-A"):
+            cmd += ["-A", str(ti["-A"])]
+        if ti.get("-B"):
+            cmd += ["-B", str(ti["-B"])]
         cmd += ["-e", pat]
+        pattern_idx = len(cmd) - 1
         if ti.get("path"):
             cmd.append(ti["path"])
     elif tool == "Glob":
@@ -56,12 +62,21 @@ def main():
         if not pat:
             allow()
         cmd = ["glep", "--files", pat]
+        pattern_idx = len(cmd) - 1
         if ti.get("path"):
             cmd.append(ti["path"])
     else:
         allow()
 
-    shown = " ".join(shlex.quote(c) for c in cmd)
+    # The search/glob pattern is always shown single-quoted for visual
+    # clarity, regardless of whether the shell strictly requires it.
+    parts = []
+    for idx, c in enumerate(cmd):
+        if idx == pattern_idx:
+            parts.append("'" + c.replace("'", "'\"'\"'") + "'")
+        else:
+            parts.append(shlex.quote(c))
+    shown = " ".join(parts)
     print(
         json.dumps(
             {
