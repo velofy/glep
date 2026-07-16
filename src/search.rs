@@ -48,16 +48,32 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
-struct CountSink(u64);
+struct CountSink<'a> {
+    matcher: &'a grep_regex::RegexMatcher,
+    multiline: bool,
+    count: u64,
+}
 
-impl grep_searcher::Sink for CountSink {
+impl grep_searcher::Sink for CountSink<'_> {
     type Error = std::io::Error;
     fn matched(
         &mut self,
         _: &grep_searcher::Searcher,
-        _: &grep_searcher::SinkMatch<'_>,
+        m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        self.0 += 1;
+        if self.multiline {
+            use grep_matcher::Matcher;
+            let mut n = 0u64;
+            self.matcher
+                .find_iter(m.bytes(), |_| {
+                    n += 1;
+                    true
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            self.count += n.max(1);
+        } else {
+            self.count += 1;
+        }
         Ok(true)
     }
 }
@@ -77,10 +93,17 @@ fn search_one(
         .build();
     let full = root.join(rel);
     if opts.count {
-        let mut sink = CountSink(0);
+        let mut sink = CountSink {
+            matcher,
+            multiline: opts.multiline,
+            count: 0,
+        };
         searcher.search_path(matcher, &full, &mut sink)?;
-        if sink.0 > 0 {
-            return Ok((format!("{}:{}\n", rel.display(), sink.0).into_bytes(), true));
+        if sink.count > 0 {
+            return Ok((
+                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
+                true,
+            ));
         }
         return Ok((Vec::new(), false));
     }

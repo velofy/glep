@@ -277,6 +277,7 @@ dependencies = [
  "clap",
  "fs2",
  "globset",
+ "grep-matcher",
  "grep-printer",
  "grep-regex",
  "grep-searcher",
