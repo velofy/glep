@@ -207,3 +207,42 @@ fn status_reflects_live_tree() {
         .success()
         .stdout(predicates::str::contains("files: 3"));
 }
+
+/// Global excludes (`~/.config/git/ignore`) must be honored identically
+/// whether a sweep goes through the macOS bulk fast path or the portable
+/// walker (GLEP_NO_BULK_SWEEP=1 forces the latter). This used to be an
+/// in-process test that mutated the process-global HOME env var under a
+/// mutex; that mutex only guarded against other tests in the same file
+/// that also touched HOME, not every other test in the binary that
+/// transitively reads it during a sweep, so parallel test runs could race
+/// on HOME. Running each variant as its own subprocess (assert_cmd spawns
+/// a real child process per Command) makes HOME/XDG_CONFIG_HOME truly
+/// per-process instead of process-global, so there is nothing left to
+/// race on and no mutex is needed.
+#[test]
+fn global_excludes_honored_identically_across_sweep_paths() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("old.bak"), "needle_bak").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/git")).unwrap();
+    std::fs::write(home.path().join(".config/git/ignore"), "*.bak\n").unwrap();
+
+    let run = |no_bulk: bool| {
+        let mut c = glep(dir.path());
+        c.args(["--files"])
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME");
+        if no_bulk {
+            c.env("GLEP_NO_BULK_SWEEP", "1");
+        }
+        let out = c.assert().success().get_output().stdout.clone();
+        String::from_utf8(out).unwrap()
+    };
+    // fresh index per variant so the sweep actually runs under each path
+    std::fs::remove_dir_all(dir.path().join(".glep")).ok();
+    let bulk = run(false);
+    std::fs::remove_dir_all(dir.path().join(".glep")).ok();
+    let walker = run(true);
+    assert_eq!(bulk, walker);
+    assert!(!bulk.contains("old.bak"), "global excludes must hide old.bak");
+}

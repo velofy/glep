@@ -26,7 +26,7 @@ Linux kernel 6.12 checkout: 86,605 files, ~1.5 GB. Apple Silicon macOS, hyperfin
 
 | Scenario | glep | glep --ttl 5 | ripgrep | fd |
 |---|---|---|---|---|
-| Rare pattern | 221 ms | 21 ms | 1.39 s | |
+| Rare pattern | 173 ms | 21 ms | 1.42 s | |
 | Common pattern (~10k matches) | | 90 ms | 1.54 s | |
 | List all .c files (--files) | 242 ms | 44 ms | | 92 ms |
 | Index build (one-time) | 24 s | | | |

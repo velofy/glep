@@ -1,4 +1,5 @@
 use crate::index::Index;
+use crate::timing::Timings;
 use crate::{plan, search};
 use clap::Parser;
 use std::path::PathBuf;
@@ -124,8 +125,10 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
+    let mut timings = Timings::new();
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
-    let extra = idx.update(args.max_filesize, args.ttl)?;
+    timings.stage("index_open");
+    let extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
 
     if args.files {
         let mut files = idx.live_files();
@@ -142,6 +145,7 @@ pub fn run() -> anyhow::Result<i32> {
         for f in &files {
             println!("{}", f.display());
         }
+        timings.finish();
         return Ok(if files.is_empty() { 1 } else { 0 });
     }
 
@@ -150,11 +154,13 @@ pub fn run() -> anyhow::Result<i32> {
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    timings.stage("plan");
     let mut files = idx.candidates(&query_plan, args.ignore_case);
     files.extend(extra);
     files.sort();
     files.dedup();
     apply_filters(&mut files, &args)?;
+    timings.stage("candidates");
 
     let before = args.before_context.or(args.context).unwrap_or(0);
     let after = args.after_context.or(args.context).unwrap_or(0);
@@ -171,5 +177,7 @@ pub fn run() -> anyhow::Result<i32> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+    timings.stage("search");
+    timings.finish();
     Ok(if found { 0 } else { 1 })
 }

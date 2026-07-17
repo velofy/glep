@@ -2,6 +2,7 @@ pub mod manifest;
 pub mod postings;
 
 use crate::plan::Plan;
+use crate::timing::Timings;
 use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
@@ -239,10 +240,35 @@ impl Index {
     }
 
     pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
+        self.update_impl(max_filesize, ttl_secs, None)
+    }
+
+    /// Same as `update`, but records sweep_walk/sweep_diff/index_write
+    /// stages on the given Timings. Kept as a sibling method (rather than
+    /// growing `update`'s signature) so existing callers and tests are
+    /// untouched.
+    pub fn update_timed(
+        &mut self,
+        max_filesize: u64,
+        ttl_secs: u64,
+        timings: &mut Timings,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        self.update_impl(max_filesize, ttl_secs, Some(timings))
+    }
+
+    fn update_impl(
+        &mut self,
+        max_filesize: u64,
+        ttl_secs: u64,
+        mut timings: Option<&mut Timings>,
+    ) -> anyhow::Result<Vec<PathBuf>> {
         if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
             return Ok(Vec::new());
         }
         let swept = walk::sweep(&self.root)?;
+        if let Some(t) = &mut timings {
+            t.stage("sweep_walk");
+        }
         let id_by_path: std::collections::HashMap<&Path, u32> = self
             .manifest
             .live_entries()
@@ -267,8 +293,14 @@ impl Index {
             .iter()
             .filter_map(|m| id_by_path.get(m.path.as_path()).copied())
             .collect();
+        if let Some(t) = &mut timings {
+            t.stage("sweep_diff");
+        }
 
         if self.read_only {
+            if let Some(t) = &mut timings {
+                t.stage("index_write");
+            }
             return Ok(fresh.into_iter().map(|m| m.path).collect());
         }
         if fresh.is_empty() && dead_ids.is_empty() {
@@ -279,6 +311,9 @@ impl Index {
             // only cause an extra sweep, never a missed one.
             if ttl_secs > 0 {
                 self.manifest.save(&self.dir.join("manifest.bin"))?;
+            }
+            if let Some(t) = &mut timings {
+                t.stage("index_write");
             }
             return Ok(Vec::new());
         }
@@ -317,6 +352,9 @@ impl Index {
         if main_size > 0 && delta_size > main_size / 10 {
             drop(self.lock.take()); // release before build re-acquires
             *self = Index::build(&self.root, max_filesize)?;
+        }
+        if let Some(t) = &mut timings {
+            t.stage("index_write");
         }
         Ok(Vec::new())
     }
