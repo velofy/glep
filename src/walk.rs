@@ -270,21 +270,24 @@ mod tests {
     /// exactly one divergence and asserts the *public* dispatcher (`sweep`,
     /// what `Index::build`/`update` actually call) matches `sweep_walker`
     /// exactly, the same correctness bar `bulk_parity` above holds the
-    /// common-case fixture to. Scenarios 2-4 also assert `sweep_bulk`
+    /// common-case fixture to. Scenarios 2 and 3 also assert `sweep_bulk`
     /// itself (not just the dispatcher after a fallback) gets the right
     /// answer, proving the new ancestor-matcher seeding actually runs on
     /// the fast path; scenarios 1 and 5 assert the opposite, that
-    /// `sweep_bulk` refuses (`Err`) rather than approximate.
+    /// `sweep_bulk` refuses (`Err`) rather than approximate. Scenario 4
+    /// (the global excludes file) now lives in
+    /// tests/cli.rs::global_excludes_honored_identically_across_sweep_paths
+    /// instead of here: it needs to mutate the process-global HOME env
+    /// var, and doing that in-process raced against every other test in
+    /// the binary that transitively reads HOME during a sweep, not just
+    /// tests in this module; a subprocess per variant, which assert_cmd
+    /// gives for free, makes HOME truly per-process instead. This module
+    /// also carries a commondir-resolution test, a defect a later
+    /// re-review found in the fix for these five: `resolve_gitdir_file`'s
+    /// handling of a worktree whose `commondir` file is missing.
     #[cfg(target_os = "macos")]
     mod divergence_scenarios {
         use super::*;
-
-        // Guards HOME/XDG_CONFIG_HOME mutation in
-        // `global_excludes_file_is_honored`: env vars are process-global,
-        // so without this a concurrently-running test that also resolves a
-        // global gitignore (any sweep call, on this or another thread)
-        // could transiently see the wrong HOME.
-        static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
         fn paths_of(metas: &[FileMeta]) -> Vec<String> {
             let mut v: Vec<String> =
@@ -380,55 +383,60 @@ mod tests {
             assert_eq!(files, vec!["keep.txt".to_string()]);
         }
 
-        /// Scenario 4: a global `core.excludesfile` equivalent (`*.bak` via
-        /// `~/.config/git/ignore`). Needs an isolated HOME/XDG_CONFIG_HOME,
-        /// which are process-global state (see ENV_MUTEX above); restores
-        /// both vars before returning, including on panic via
-        /// `catch_unwind`, so a failing assertion here can't wedge HOME for
-        /// every other test in the binary.
+        /// Commondir defect: a `.git` gitdir-pointer file above the sweep
+        /// root whose target directory exists but has NO `commondir` file,
+        /// i.e. an orphaned/unlinked worktree. The `ignore` crate's own
+        /// `resolve_git_commondir` (ignore-0.4.28/src/dir.rs) refuses to
+        /// guess that the per-worktree dir doubles as the common dir in
+        /// this case: it gives up and the caller falls back to an EMPTY
+        /// exclude matcher (see `resolve_gitdir_file`'s doc comment in
+        /// walk_bulk.rs). Parity means the bulk fast path must do the same:
+        /// load NOTHING from `fake_gitdir/info/exclude`, not guess that it
+        /// applies to the sweep root. `secret.txt` must therefore show up
+        /// in BOTH sweeps.
         #[test]
-        fn global_excludes_file_is_honored() {
-            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        fn orphan_worktree_commondir_missing_matches_ignore_crate_empty_matcher() {
+            let outer = tempfile::tempdir().unwrap();
+            let gitdir_holder = tempfile::tempdir().unwrap();
+            let fake_gitdir = gitdir_holder.path().join("fake_gitdir");
+            std::fs::create_dir_all(fake_gitdir.join("info")).unwrap();
+            std::fs::write(fake_gitdir.join("info/exclude"), "secret.txt\n").unwrap();
+            // Deliberately no `fake_gitdir/commondir` file: this is the
+            // orphaned-worktree case the fix targets.
 
-            let fakehome = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(fakehome.path().join(".config/git")).unwrap();
-            std::fs::write(fakehome.path().join(".config/git/ignore"), "*.bak\n").unwrap();
+            std::fs::write(
+                outer.path().join(".git"),
+                format!("gitdir: {}\n", fake_gitdir.display()),
+            )
+            .unwrap();
 
-            let root_dir = tempfile::tempdir().unwrap();
-            let root = root_dir.path();
+            let root = outer.path().join("sweep_root");
+            std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join("keep.txt"), "keep me").unwrap();
-            std::fs::write(root.join("old.bak"), "stale").unwrap();
+            std::fs::write(root.join("secret.txt"), "shh").unwrap();
 
-            let prev_home = std::env::var_os("HOME");
-            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-            std::env::set_var("HOME", fakehome.path());
-            std::env::remove_var("XDG_CONFIG_HOME");
+            let bulk = crate::walk_bulk::sweep_bulk(&root).expect(
+                "bulk sweep should resolve the gitdir pointer directly, not fall back, \
+                 even though its commondir is missing",
+            );
+            let bulk_paths = paths_of(&bulk);
+            assert!(
+                bulk_paths.contains(&"secret.txt".to_string()),
+                "bulk sweep must NOT guess fake_gitdir/info/exclude applies: the ignore \
+                 crate gives up and uses an empty matcher when commondir is missing"
+            );
 
-            let result = std::panic::catch_unwind(|| {
-                let bulk = crate::walk_bulk::sweep_bulk(root).expect(
-                    "bulk sweep should resolve the global excludes file directly, not fall back",
-                );
-                assert_eq!(
-                    paths_of(&bulk),
-                    vec!["keep.txt".to_string()],
-                    "bulk sweep should honor the global core.excludesfile"
-                );
-                assert_parity(root)
-            });
-
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-
-            match result {
-                Ok(files) => assert_eq!(files, vec!["keep.txt".to_string()]),
-                Err(e) => std::panic::resume_unwind(e),
-            }
+            let files = assert_parity(&root);
+            assert!(
+                files.contains(&"secret.txt".to_string()),
+                "sweep() and sweep_walker() must both include secret.txt: the ignore \
+                 crate's own walker also uses an empty matcher here"
+            );
+            assert_eq!(
+                files,
+                vec!["keep.txt".to_string(), "secret.txt".to_string()],
+                "both keep.txt and secret.txt should be swept, nothing else"
+            );
         }
 
         /// Scenario 5: an `.ignore` whitelist (`!important.log`) overriding

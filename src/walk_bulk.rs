@@ -397,10 +397,15 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 /// marker) to the real git directory, then follow *that* directory's own
 /// `commondir` file if present, since `info/exclude` lives in the common
 /// dir, not necessarily the per-worktree one. Mirrors `resolve_git_commondir`
-/// in the `ignore` crate itself. Any I/O or parse failure comes back as
-/// `Err` rather than a guess, per the "never approximate, fall back
-/// instead" rule for this indirection (see module docs).
-fn resolve_gitdir_file(dot_git: &Path) -> anyhow::Result<PathBuf> {
+/// in the `ignore` crate itself, including what that crate does when the
+/// `commondir` file can't be resolved: it does NOT assume the per-worktree
+/// git dir doubles as the common dir, it gives up and the caller falls back
+/// to an EMPTY exclude matcher. `Ok(None)` here reproduces that give-up
+/// case, so `load_git_exclude` below loads nothing rather than guessing.
+/// Only a failure to read/parse the *outer* gitdir-pointer file itself
+/// comes back as `Err`, per the "never approximate, fall back to the
+/// walker instead" rule for that indirection (see module docs).
+fn resolve_gitdir_file(dot_git: &Path) -> anyhow::Result<Option<PathBuf>> {
     let contents = std::fs::read_to_string(dot_git)
         .map_err(|e| anyhow::anyhow!("{}: {e}", dot_git.display()))?;
     let first_line = contents.lines().next().unwrap_or("");
@@ -411,19 +416,29 @@ fn resolve_gitdir_file(dot_git: &Path) -> anyhow::Result<PathBuf> {
     let real_git_dir = parent.join(raw.trim());
 
     let commondir_file = real_git_dir.join("commondir");
-    match std::fs::read_to_string(&commondir_file) {
-        Ok(contents) => {
-            let line = contents.lines().next().unwrap_or("").trim();
-            anyhow::ensure!(!line.is_empty(), "{}: empty commondir", commondir_file.display());
-            let commondir_path = Path::new(line);
-            Ok(if commondir_path.is_relative() {
-                real_git_dir.join(commondir_path)
-            } else {
-                commondir_path.to_path_buf()
-            })
-        }
-        Err(_) => Ok(real_git_dir),
+    let commondir_contents = match std::fs::read_to_string(&commondir_file) {
+        Ok(c) => c,
+        // No commondir file (or unreadable): matches resolve_git_commondir
+        // in the ignore crate, which gives up here rather than treating
+        // real_git_dir as the common dir. An orphaned/unlinked worktree's
+        // gitdir has no relation to wherever the real common dir's
+        // info/exclude actually lives, so guessing it is real_git_dir would
+        // be wrong, not just imprecise.
+        Err(_) => return Ok(None),
+    };
+    let line = commondir_contents.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        // Same give-up-to-empty-matcher outcome as a missing file: an
+        // empty/blank commondir is unresolvable, not a reason to abort the
+        // whole bulk sweep.
+        return Ok(None);
     }
+    let commondir_path = Path::new(line);
+    Ok(Some(if commondir_path.is_relative() {
+        real_git_dir.join(commondir_path)
+    } else {
+        commondir_path.to_path_buf()
+    }))
 }
 
 /// Load `<gitroot>/.git/info/exclude` as a `Gitignore` rooted at `gitroot`,
@@ -443,7 +458,15 @@ fn load_git_exclude(gitroot: &Path) -> anyhow::Result<Option<Gitignore>> {
     let git_common_dir = if meta.is_dir() {
         dot_git
     } else if meta.is_file() {
-        resolve_gitdir_file(&dot_git)?
+        match resolve_gitdir_file(&dot_git)? {
+            Some(dir) => dir,
+            // commondir file missing/unreadable/empty: the ignore crate
+            // gives up and uses an empty exclude matcher rather than
+            // guessing, see resolve_gitdir_file's doc comment. Match that
+            // by loading nothing instead of falling back to the
+            // per-worktree git dir's own (nonexistent) info/exclude.
+            None => return Ok(None),
+        }
     } else {
         anyhow::bail!("{}: .git is neither a directory nor a file", dot_git.display());
     };
