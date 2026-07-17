@@ -7,6 +7,14 @@ fn glep(dir: &Path) -> Command {
     c
 }
 
+/// Convert a forward-slash path literal to the platform's native separator,
+/// for comparing against glep's own (platform-native) path output. Glob
+/// PATTERN arguments stay forward-slash (globset semantics); only expected
+/// OUTPUT strings go through this.
+fn p(s: &str) -> String {
+    s.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 fn corpus() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -23,7 +31,9 @@ fn content_search_builds_index_and_matches() {
         .assert()
         .success()
         .stdout(predicates::str::contains("notes.txt:1:hello there"))
-        .stdout(predicates::str::contains("src/lib.rs:1:pub fn hello_world() {}"));
+        .stdout(predicates::str::contains(p(
+            "src/lib.rs:1:pub fn hello_world() {}",
+        )));
     assert!(dir.path().join(".glep/postings.bin").exists());
 }
 
@@ -50,7 +60,7 @@ fn path_filter_restricts_results() {
         .stdout
         .clone();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("src/lib.rs"));
+    assert!(s.contains(p("src/lib.rs").as_str()));
     assert!(!s.contains("notes.txt"));
 }
 
@@ -61,7 +71,7 @@ fn files_with_matches_flag() {
         .args(["-l", "hello"])
         .assert()
         .success()
-        .stdout("notes.txt\nsrc/lib.rs\n");
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
 }
 
 #[test]
@@ -106,7 +116,7 @@ fn rooted_glob_does_not_cross_directories() {
         .args(["--files", "src/*.rs"])
         .assert()
         .success()
-        .stdout("src/lib.rs\n");
+        .stdout(p("src/lib.rs\n"));
     let out = glep(dir.path())
         .args(["-g", "src/*.rs", "hello"])
         .assert()
@@ -115,7 +125,7 @@ fn rooted_glob_does_not_cross_directories() {
         .stdout
         .clone();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("src/lib.rs"));
+    assert!(s.contains(p("src/lib.rs").as_str()));
     assert!(!s.contains("nested"));
 }
 
@@ -126,7 +136,7 @@ fn bare_glob_matches_at_any_depth() {
         .args(["--files", "*.rs"])
         .assert()
         .success()
-        .stdout("src/lib.rs\n");
+        .stdout(p("src/lib.rs\n"));
 }
 
 #[test]
@@ -136,7 +146,7 @@ fn files_mode_lists_all_sorted() {
         .arg("--files")
         .assert()
         .success()
-        .stdout("notes.txt\nsrc/lib.rs\n");
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
 }
 
 #[test]
@@ -146,7 +156,7 @@ fn files_mode_with_glob() {
         .args(["--files", "**/*.rs"])
         .assert()
         .success()
-        .stdout("src/lib.rs\n");
+        .stdout(p("src/lib.rs\n"));
 }
 
 #[test]
@@ -174,7 +184,7 @@ fn count_mode_prints_path_counts() {
         .args(["-c", "hello"])
         .assert()
         .success()
-        .stdout("notes.txt:1\nsrc/lib.rs:1\n");
+        .stdout(p("notes.txt:1\nsrc/lib.rs:1\n"));
     glep(dir.path()).args(["-c", "zz_absent"]).assert().code(1);
 }
 
@@ -191,9 +201,9 @@ fn explicit_regexp_with_path_scopes_results() {
         .stdout
         .clone();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("src/lib.rs"));
+    assert!(s.contains(p("src/lib.rs").as_str()));
     assert!(!s.contains("notes.txt"));
-    assert!(!s.contains("other/c.txt"));
+    assert!(!s.contains(p("other/c.txt").as_str()));
 }
 
 #[test]

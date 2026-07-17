@@ -7,18 +7,22 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install ripgrep
+        shell: bash
       - run: cargo test --all
+        shell: bash
       - name: hook tests
+        shell: bash
         run: |
           cargo build
           PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
       - name: em-dash ban
+        shell: bash
         run: |
           set +e
           grep -rInE $'\xe2\x80\x94|\xe2\x80\x93' . --exclude-dir=target --exclude-dir=.git --exclude-dir=.glep
