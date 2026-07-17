@@ -21,7 +21,7 @@ jobs:
       - name: em-dash ban
         run: |
           set +e
-          grep -rIn $'—\|–' . --exclude-dir=target --exclude-dir=.git --exclude-dir=.glep
+          grep -rInE $'\xe2\x80\x94|\xe2\x80\x93' . --exclude-dir=target --exclude-dir=.git --exclude-dir=.glep
           rc=$?
           set -e
           [ "$rc" -eq 1 ]
