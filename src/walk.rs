@@ -126,6 +126,13 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 mod tests {
     use super::*;
 
+    /// Convert a forward-slash path literal to the platform's native
+    /// separator, for comparing against paths that came off a real sweep
+    /// (which carry the OS's native separator).
+    fn p(s: &str) -> String {
+        s.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
     #[test]
     fn sweep_finds_files_sorted_and_respects_gitignore() {
         let dir = tempfile::tempdir().unwrap();
@@ -142,7 +149,7 @@ mod tests {
             .iter()
             .map(|m| m.path.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(paths, vec!["b.txt", "src/a.rs"]);
+        assert_eq!(paths, vec![p("b.txt"), p("src/a.rs")]);
         assert!(metas[0].size == 5);
         assert!(metas[0].mtime_ns > 0);
     }
