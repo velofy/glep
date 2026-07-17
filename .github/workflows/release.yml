@@ -9,6 +9,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: windows-latest
           - os: ubuntu-latest
           - os: ubuntu-24.04-arm
           - os: macos-14
