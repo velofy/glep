@@ -241,7 +241,8 @@ fn global_excludes_honored_identically_across_sweep_paths() {
         let mut c = glep(dir.path());
         c.args(["--files"])
             .env("HOME", home.path())
-            .env_remove("XDG_CONFIG_HOME");
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"));
         if no_bulk {
             c.env("GLEP_NO_BULK_SWEEP", "1");
         }
