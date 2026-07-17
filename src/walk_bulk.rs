@@ -20,11 +20,20 @@
 //! `rayon::current_thread_index()`) and are only merged into a single
 //! sorted `Vec` once, at the very end of the sweep.
 //!
-//! Ignore semantics mirror `walk::sweep`'s `ignore::WalkBuilder` defaults
-//! for the common cases: hidden (dot-prefixed) entries are skipped, and
-//! `.gitignore` files are honored per directory level, stacked along the
-//! recursion, with no dependency on an actual `.git` directory being
-//! present (the same "require_git(false)" behavior `sweep` opts into).
+//! Ignore semantics mirror `walk::sweep`'s `ignore::WalkBuilder` defaults:
+//! hidden (dot-prefixed) entries are skipped, and `.gitignore` files are
+//! honored per directory level, stacked along the recursion, with no
+//! dependency on an actual `.git` directory being present (the same
+//! "require_git(false)" behavior `sweep` opts into). Beyond the sweep
+//! root's own and nested `.gitignore` files, `sweep` (via the `ignore`
+//! crate, `parents(true)`) also honors: global excludes
+//! (`core.excludesfile` / `$XDG_CONFIG_HOME/git/ignore` /
+//! `~/.config/git/ignore`), `.git/info/exclude`, ancestor `.gitignore`
+//! files above the sweep root, and `.ignore` files (plus their whitelist
+//! overrides). `build_ancestor_stack` seeds the matcher stack with the
+//! first three of those before the walk starts (see its doc comment for
+//! precedence order); `.ignore`/`.rgignore` are handled by refusing to
+//! walk at all wherever one is found, see below.
 //!
 //! Correctness posture: any anomaly while parsing a `getattrlistbulk`
 //! result buffer (an offset or length that doesn't fit inside the buffer)
@@ -33,7 +42,13 @@
 //! Anything narrower, like one directory being unreadable (permission
 //! denied, deleted mid-scan), is non-fatal: it is reported on stderr and
 //! that subtree is skipped, exactly like `walk::sweep` does for individual
-//! entry errors from the `ignore` crate.
+//! entry errors from the `ignore` crate. The same Fatal path is also used,
+//! deliberately, whenever a directory contains a `.ignore` or `.rgignore`
+//! file: their precedence relative to `.gitignore` (an `.ignore` whitelist
+//! entry can override a `.gitignore` ignore entry, for instance) isn't
+//! reimplemented here, so rather than risk an approximate match this bulk
+//! path bows out and lets the portable walker, which gets that precedence
+//! right by construction, handle the whole sweep instead.
 
 #![cfg(target_os = "macos")]
 
@@ -355,6 +370,181 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &st
     }
 }
 
+/// Bound on how many levels above the sweep root to look for ancestor
+/// `.gitignore` files when no `.git` directory brackets the search. The
+/// real `ignore` crate (via `parents(true)`) walks all the way to the
+/// filesystem root regardless of git; capping here trades a little fidelity
+/// for a sweep root outside any repo (e.g. a plain checkout-less directory)
+/// for not doing an unbounded stat() climb on every single sweep. A sweep
+/// root inside a real repo isn't affected: the walk stops at the git root.
+const ANCESTOR_GITIGNORE_CAP: usize = 10;
+
+/// Walk up from `start` (inclusive) looking for the nearest ancestor
+/// directory containing a `.git` entry, directory or gitlink file. `start`
+/// should already be canonicalized so `.parent()` walks real directories.
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Follow a `.git` gitdir-pointer file (a worktree's `gitdir: <path>`
+/// marker) to the real git directory, then follow *that* directory's own
+/// `commondir` file if present, since `info/exclude` lives in the common
+/// dir, not necessarily the per-worktree one. Mirrors `resolve_git_commondir`
+/// in the `ignore` crate itself. Any I/O or parse failure comes back as
+/// `Err` rather than a guess, per the "never approximate, fall back
+/// instead" rule for this indirection (see module docs).
+fn resolve_gitdir_file(dot_git: &Path) -> anyhow::Result<PathBuf> {
+    let contents = std::fs::read_to_string(dot_git)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", dot_git.display()))?;
+    let first_line = contents.lines().next().unwrap_or("");
+    let raw = first_line.strip_prefix("gitdir: ").ok_or_else(|| {
+        anyhow::anyhow!("{}: unrecognized gitdir pointer format", dot_git.display())
+    })?;
+    let parent = dot_git.parent().unwrap_or_else(|| Path::new("."));
+    let real_git_dir = parent.join(raw.trim());
+
+    let commondir_file = real_git_dir.join("commondir");
+    match std::fs::read_to_string(&commondir_file) {
+        Ok(contents) => {
+            let line = contents.lines().next().unwrap_or("").trim();
+            anyhow::ensure!(!line.is_empty(), "{}: empty commondir", commondir_file.display());
+            let commondir_path = Path::new(line);
+            Ok(if commondir_path.is_relative() {
+                real_git_dir.join(commondir_path)
+            } else {
+                commondir_path.to_path_buf()
+            })
+        }
+        Err(_) => Ok(real_git_dir),
+    }
+}
+
+/// Load `<gitroot>/.git/info/exclude` as a `Gitignore` rooted at `gitroot`,
+/// or `None` when there's no `.git` there or no `info/exclude` inside it.
+/// I/O errors reading or parsing the exclude file itself are non-fatal (a
+/// stderr warning, treated as absent), matching how the root/nested
+/// `.gitignore` loader in `scan_recursive` handles the same class of error.
+/// Only the gitdir-pointer indirection (see `resolve_gitdir_file`) is
+/// treated as fatal.
+fn load_git_exclude(gitroot: &Path) -> anyhow::Result<Option<Gitignore>> {
+    let dot_git = gitroot.join(".git");
+    let meta = match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+
+    let git_common_dir = if meta.is_dir() {
+        dot_git
+    } else if meta.is_file() {
+        resolve_gitdir_file(&dot_git)?
+    } else {
+        anyhow::bail!("{}: .git is neither a directory nor a file", dot_git.display());
+    };
+
+    let exclude_path = git_common_dir.join("info/exclude");
+    if !exclude_path.is_file() {
+        return Ok(None);
+    }
+    let mut builder = GitignoreBuilder::new(gitroot);
+    if let Some(err) = builder.add(&exclude_path) {
+        eprintln!("glep: {}: {err}", exclude_path.display());
+        return Ok(None);
+    }
+    match builder.build() {
+        Ok(gi) => Ok(Some(gi)),
+        Err(err) => {
+            eprintln!("glep: {}: {err}", exclude_path.display());
+            Ok(None)
+        }
+    }
+}
+
+/// Precedence-ordered matcher stack seeded from every gitignore source that
+/// applies above the sweep root, lowest precedence first: global excludes,
+/// then `.git/info/exclude`, then ancestor `.gitignore` files from the git
+/// root (or a bounded cap when there is none, see `ANCESTOR_GITIGNORE_CAP`)
+/// down to the sweep root's parent. `is_ignored` keeps the last decisive
+/// verdict as it walks a matcher stack, so this order makes a more specific
+/// ancestor's rule beat a less specific one, matching the precedence
+/// `ignore` itself uses. The sweep root's own and nested `.gitignore` files
+/// are layered on top of whatever this returns, by `scan_recursive` as it
+/// descends.
+///
+/// Reading any of these sources is best-effort and non-fatal EXCEPT
+/// resolving a worktree's `.git` gitdir-pointer file, which surfaces as
+/// `Err` straight out of this function (and therefore out of `sweep_bulk`,
+/// forcing the walker fallback) if it can't be resolved outright.
+fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>> {
+    let mut stack = Vec::new();
+
+    // Global excludes: resolves core.excludesfile / $XDG_CONFIG_HOME/git/ignore
+    // / ~/.config/git/ignore exactly like `ignore::WalkBuilder` does by
+    // default (relative to the process's current_dir, since `sweep_walker`
+    // never calls `.current_dir()` either, so this matches it exactly).
+    let (global, err) = Gitignore::global();
+    if let Some(err) = err {
+        eprintln!("glep: global gitignore: {err}");
+    }
+    if !global.is_empty() {
+        stack.push(Arc::new(global));
+    }
+
+    let canon_root = sweep_root.canonicalize().unwrap_or_else(|_| sweep_root.to_path_buf());
+    let git_root = find_git_root(&canon_root);
+
+    if let Some(ref gitroot) = git_root {
+        if let Some(gi) = load_git_exclude(gitroot)? {
+            stack.push(Arc::new(gi));
+        }
+    }
+
+    // Ancestor .gitignore files, collected child-to-root then reversed so
+    // they get pushed outermost first (lowest precedence among themselves).
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    if git_root.as_deref() != Some(canon_root.as_path()) {
+        let mut cur = canon_root.parent();
+        let mut depth = 0usize;
+        while let Some(dir) = cur {
+            ancestors.push(dir.to_path_buf());
+            let hit_git_root = git_root.as_deref() == Some(dir);
+            depth += 1;
+            if hit_git_root {
+                break;
+            }
+            if git_root.is_none() && depth >= ANCESTOR_GITIGNORE_CAP {
+                break;
+            }
+            cur = dir.parent();
+        }
+    }
+    ancestors.reverse();
+
+    for dir in ancestors {
+        let gi_path = dir.join(".gitignore");
+        if !gi_path.is_file() {
+            continue;
+        }
+        let mut builder = GitignoreBuilder::new(&dir);
+        if let Some(err) = builder.add(&gi_path) {
+            eprintln!("glep: {}: {err}", gi_path.display());
+            continue;
+        }
+        match builder.build() {
+            Ok(gi) => stack.push(Arc::new(gi)),
+            Err(err) => eprintln!("glep: {}: {err}", gi_path.display()),
+        }
+    }
+
+    Ok(stack)
+}
+
 fn scan_recursive<'scope>(
     scope: &rayon::Scope<'scope>,
     root: &'scope Path,
@@ -378,8 +568,34 @@ fn scan_recursive<'scope>(
         }
     };
 
+    // Single pass over this directory's files to find both the local
+    // .gitignore (existing behavior) and any .ignore/.rgignore (the
+    // divergence trap from the module docs: their precedence relative to
+    // .gitignore isn't reimplemented here, so their presence anywhere sends
+    // the whole sweep back to the walker instead of risking a wrong match).
+    let mut has_local_gitignore = false;
+    let mut has_divergent_ignore_file = false;
+    for f in &scan.files {
+        if f.name == ".gitignore" {
+            has_local_gitignore = true;
+        } else if f.name == ".ignore" || f.name == ".rgignore" {
+            has_divergent_ignore_file = true;
+        }
+    }
+
+    if has_divergent_ignore_file {
+        let mut slot = fatal.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(anyhow::anyhow!(
+                "{}: contains .ignore/.rgignore, deferring to the walker",
+                dir.display()
+            ));
+        }
+        return;
+    }
+
     let mut stack = matchers;
-    if scan.files.iter().any(|f| f.name == ".gitignore") {
+    if has_local_gitignore {
         let mut builder = GitignoreBuilder::new(&dir);
         if let Some(err) = builder.add(dir.join(".gitignore")) {
             eprintln!("glep: {}: {err}", dir.join(".gitignore").display());
@@ -429,6 +645,14 @@ fn scan_recursive<'scope>(
 /// subdirectories are pushed back onto the queue, and files accumulate in
 /// one buffer per worker thread that gets merged into the final sorted
 /// `Vec` only once, at the end.
+///
+/// Before the scan starts, `build_ancestor_stack` seeds the matcher stack
+/// with every gitignore source above the sweep root (global excludes,
+/// `.git/info/exclude`, ancestor `.gitignore` files); an `Err` from that
+/// seeding step (currently only an unresolvable worktree gitdir pointer)
+/// aborts before any directory is touched and propagates out of
+/// `sweep_bulk` like any other fatal error, sending the whole sweep to the
+/// walker fallback.
 pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
@@ -436,13 +660,15 @@ pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
         root.display()
     );
 
+    let seed_matchers = build_ancestor_stack(root)?;
+
     let num_slots = rayon::current_num_threads().max(1);
     let buffers: Vec<Mutex<Vec<FileMeta>>> =
         (0..num_slots).map(|_| Mutex::new(Vec::new())).collect();
     let fatal: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
     rayon::scope(|scope| {
-        scan_recursive(scope, root, root.to_path_buf(), Vec::new(), &buffers, &fatal);
+        scan_recursive(scope, root, root.to_path_buf(), seed_matchers, &buffers, &fatal);
     });
 
     if let Some(e) = fatal.into_inner().unwrap() {

@@ -259,4 +259,203 @@ mod tests {
             );
         }
     }
+
+    /// The five sweep_bulk vs. sweep_walker divergences an opus review
+    /// found, and the fix in walk_bulk.rs (see its module docs and
+    /// `build_ancestor_stack`) closes: gitignore sources above the sweep
+    /// root that the bulk fast path never used to look at, plus `.ignore`/
+    /// `.rgignore` files, whose precedence relative to `.gitignore` isn't
+    /// reimplemented and instead trips the walker fallback (item B in the
+    /// fix design). Each test below builds a fixture that reproduces
+    /// exactly one divergence and asserts the *public* dispatcher (`sweep`,
+    /// what `Index::build`/`update` actually call) matches `sweep_walker`
+    /// exactly, the same correctness bar `bulk_parity` above holds the
+    /// common-case fixture to. Scenarios 2-4 also assert `sweep_bulk`
+    /// itself (not just the dispatcher after a fallback) gets the right
+    /// answer, proving the new ancestor-matcher seeding actually runs on
+    /// the fast path; scenarios 1 and 5 assert the opposite, that
+    /// `sweep_bulk` refuses (`Err`) rather than approximate.
+    #[cfg(target_os = "macos")]
+    mod divergence_scenarios {
+        use super::*;
+
+        // Guards HOME/XDG_CONFIG_HOME mutation in
+        // `global_excludes_file_is_honored`: env vars are process-global,
+        // so without this a concurrently-running test that also resolves a
+        // global gitignore (any sweep call, on this or another thread)
+        // could transiently see the wrong HOME.
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+        fn paths_of(metas: &[FileMeta]) -> Vec<String> {
+            let mut v: Vec<String> =
+                metas.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        }
+
+        /// Asserts the public dispatcher and the walker reference agree
+        /// exactly on the file set for `root`, and returns that file set.
+        fn assert_parity(root: &Path) -> Vec<String> {
+            let dispatched = sweep(root).unwrap();
+            let walked = sweep_walker(root).unwrap();
+            let dispatched_paths = paths_of(&dispatched);
+            let walked_paths = paths_of(&walked);
+            assert_eq!(
+                dispatched_paths, walked_paths,
+                "sweep() and sweep_walker() disagree on file set for {}",
+                root.display()
+            );
+            dispatched_paths
+        }
+
+        /// Scenario 1: an `.ignore` file at the sweep root
+        /// (`vendored.txt` pattern). The bulk fast path doesn't know
+        /// `.ignore` precedence, so it must trip the divergence trap
+        /// (Fatal, item B) and defer the whole sweep to the walker, which
+        /// excludes `vendored.txt` correctly via `.ignore`.
+        #[test]
+        fn dot_ignore_file_triggers_walker_fallback() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("keep.txt"), "keep me").unwrap();
+            std::fs::write(dir.path().join("vendored.txt"), "vendored content").unwrap();
+            std::fs::write(dir.path().join(".ignore"), "vendored.txt\n").unwrap();
+
+            assert!(
+                crate::walk_bulk::sweep_bulk(dir.path()).is_err(),
+                "bulk sweep should refuse a directory with .ignore, not approximate it"
+            );
+
+            let files = assert_parity(dir.path());
+            assert_eq!(files, vec!["keep.txt".to_string()]);
+        }
+
+        /// Scenario 2: a `.gitignore` above the sweep root (`*.log`), no
+        /// `.git` anywhere. `build_ancestor_stack`'s ancestor-.gitignore
+        /// search (item A) should pick this up on the bulk fast path
+        /// itself, no fallback needed.
+        #[test]
+        fn ancestor_gitignore_above_root_is_honored() {
+            let outer = tempfile::tempdir().unwrap();
+            std::fs::write(outer.path().join(".gitignore"), "*.log\n").unwrap();
+            let root = outer.path().join("sweep_root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("keep.txt"), "keep me").unwrap();
+            std::fs::write(root.join("debug.log"), "noisy").unwrap();
+
+            let bulk = crate::walk_bulk::sweep_bulk(&root)
+                .expect("bulk sweep should honor an ancestor .gitignore directly, not fall back");
+            assert_eq!(
+                paths_of(&bulk),
+                vec!["keep.txt".to_string()],
+                "bulk sweep should honor the ancestor .gitignore's *.log rule"
+            );
+
+            let files = assert_parity(&root);
+            assert_eq!(files, vec!["keep.txt".to_string()]);
+        }
+
+        /// Scenario 3: `.git/info/exclude` above the sweep root
+        /// (`secret.txt`). `build_ancestor_stack` walks up to find the git
+        /// root and loads its info/exclude (item A); also handled on the
+        /// bulk fast path directly, no fallback needed.
+        #[test]
+        fn git_info_exclude_above_root_is_honored() {
+            let outer = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(outer.path().join(".git/info")).unwrap();
+            std::fs::write(outer.path().join(".git/info/exclude"), "secret.txt\n").unwrap();
+            let root = outer.path().join("sweep_root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("keep.txt"), "keep me").unwrap();
+            std::fs::write(root.join("secret.txt"), "shh").unwrap();
+
+            let bulk = crate::walk_bulk::sweep_bulk(&root)
+                .expect("bulk sweep should resolve .git/info/exclude directly, not fall back");
+            assert_eq!(
+                paths_of(&bulk),
+                vec!["keep.txt".to_string()],
+                "bulk sweep should honor .git/info/exclude"
+            );
+
+            let files = assert_parity(&root);
+            assert_eq!(files, vec!["keep.txt".to_string()]);
+        }
+
+        /// Scenario 4: a global `core.excludesfile` equivalent (`*.bak` via
+        /// `~/.config/git/ignore`). Needs an isolated HOME/XDG_CONFIG_HOME,
+        /// which are process-global state (see ENV_MUTEX above); restores
+        /// both vars before returning, including on panic via
+        /// `catch_unwind`, so a failing assertion here can't wedge HOME for
+        /// every other test in the binary.
+        #[test]
+        fn global_excludes_file_is_honored() {
+            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+            let fakehome = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(fakehome.path().join(".config/git")).unwrap();
+            std::fs::write(fakehome.path().join(".config/git/ignore"), "*.bak\n").unwrap();
+
+            let root_dir = tempfile::tempdir().unwrap();
+            let root = root_dir.path();
+            std::fs::write(root.join("keep.txt"), "keep me").unwrap();
+            std::fs::write(root.join("old.bak"), "stale").unwrap();
+
+            let prev_home = std::env::var_os("HOME");
+            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("HOME", fakehome.path());
+            std::env::remove_var("XDG_CONFIG_HOME");
+
+            let result = std::panic::catch_unwind(|| {
+                let bulk = crate::walk_bulk::sweep_bulk(root).expect(
+                    "bulk sweep should resolve the global excludes file directly, not fall back",
+                );
+                assert_eq!(
+                    paths_of(&bulk),
+                    vec!["keep.txt".to_string()],
+                    "bulk sweep should honor the global core.excludesfile"
+                );
+                assert_parity(root)
+            });
+
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+
+            match result {
+                Ok(files) => assert_eq!(files, vec!["keep.txt".to_string()]),
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+
+        /// Scenario 5: an `.ignore` whitelist (`!important.log`) overriding
+        /// a `.gitignore` blanket `*.log`. The bulk fast path doesn't
+        /// reimplement that cross-file precedence, so `.ignore`'s mere
+        /// presence (item B) must trip the fallback, same mechanism as
+        /// scenario 1, but here the walker's correct answer *includes* a
+        /// file the old bulk path used to wrongly drop.
+        #[test]
+        fn dot_ignore_whitelist_overrides_gitignore() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+            std::fs::write(dir.path().join(".ignore"), "!important.log\n").unwrap();
+            std::fs::write(dir.path().join("important.log"), "keep this one").unwrap();
+            std::fs::write(dir.path().join("other.log"), "still noisy").unwrap();
+            std::fs::write(dir.path().join("keep.txt"), "keep me").unwrap();
+
+            assert!(
+                crate::walk_bulk::sweep_bulk(dir.path()).is_err(),
+                "bulk sweep should refuse a directory with .ignore, not approximate it"
+            );
+
+            let files = assert_parity(dir.path());
+            assert_eq!(
+                files,
+                vec!["important.log".to_string(), "keep.txt".to_string()]
+            );
+        }
+    }
 }

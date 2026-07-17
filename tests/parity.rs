@@ -29,6 +29,12 @@ fn corpus() -> tempfile::TempDir {
     .unwrap();
     std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
     std::fs::write(dir.path().join("skipme.log"), "hello hidden\n").unwrap();
+    // .ignore is a distinct source from .gitignore (ripgrep/rg-specific,
+    // not a git concept): exercises the macOS bulk sweep's walker-fallback
+    // path end to end (see src/walk_bulk.rs's divergence trap) alongside
+    // the .gitignore case above.
+    std::fs::write(dir.path().join(".ignore"), "skipme2.txt\n").unwrap();
+    std::fs::write(dir.path().join("skipme2.txt"), "hello hidden via dot-ignore\n").unwrap();
     std::fs::write(
         dir.path().join("unicode.txt"),
         "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\nplain line\n",
