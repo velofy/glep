@@ -20,6 +20,7 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://anishfyi.github.io/glep/"
 Repository = "https://github.com/anishfyi/glep"
 
 [tool.maturin]
