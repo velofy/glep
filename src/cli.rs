@@ -63,6 +63,20 @@ fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
         .compile_matcher())
 }
 
+fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for p in paths.iter_mut() {
+        if p.is_absolute() {
+            let canonical_p = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
+            if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
+                *p = rel.to_path_buf();
+            }
+        } else if let Ok(stripped) = p.strip_prefix(".") {
+            *p = stripped.to_path_buf();
+        }
+    }
+}
+
 fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
     if !args.paths.is_empty() {
         files.retain(|f| args.paths.iter().any(|p| f.starts_with(p)));
@@ -98,6 +112,7 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
     let root = std::env::current_dir()?;
+    normalize_path_filters(&mut args.paths, &root);
 
     // Subcommand-style words in the pattern slot.
     if args.regexp.is_none() && !args.files {

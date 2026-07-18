@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>glep: indexed grep + glob for AI agents</title>
 <meta name="description" content="glep answers warm code searches from a persistent trigram index in milliseconds, with ripgrep-identical output. Built for coding agents.">
+<link rel="canonical" href="https://anishfyi.github.io/glep/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="glep: indexed grep + glob for AI agents">
+<meta property="og:description" content="Warm code searches in 21 ms on a Linux kernel checkout; ripgrep on the same box: 1.4 s. Byte-identical text output, no daemon. pip install glep.">
+<meta property="og:url" content="https://anishfyi.github.io/glep/">
+<meta property="og:image" content="https://anishfyi.github.io/glep/social-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="glep: indexed grep + glob for AI agents">
+<meta name="twitter:description" content="Warm code searches in 21 ms; ripgrep same box: 1.4 s. Byte-identical text output, no daemon.">
+<meta name="twitter:image" content="https://anishfyi.github.io/glep/social-card.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Crect width='256' height='256' rx='56' fill='%230E1A24'/%3E%3Crect x='54' y='100' width='32' height='96' rx='8' fill='%23FFB454'/%3E%3Crect x='96' y='68' width='32' height='96' rx='8' fill='%23FF9A4E'/%3E%3Crect x='138' y='100' width='32' height='64' rx='8' fill='%23FF7847'/%3E%3Crect x='180' y='100' width='32' height='96' rx='8' fill='%2322384A'/%3E%3Crect x='44' y='58' width='136' height='148' rx='20' fill='none' stroke='%23FFB454' stroke-width='5'/%3E%3C/svg%3E">
 <style>
   :root {
@@ -30,6 +42,8 @@
   a { color: var(--amber); text-decoration: none; }
   a:hover, a:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
   a:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 2px; }
+  a.install { color: var(--bone); }
+  a.install:hover { text-decoration: none; border-color: var(--amber); }
   .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
 
   /* hero: header.wrap outranks .wrap so vertical padding survives */
@@ -112,12 +126,12 @@
 <body>
 
 <header class="wrap">
-  <span class="wordmark" role="img" aria-label="glep, with its two trigrams gle and lep underlined">glep</span>
+  <h1 class="wordmark" aria-label="glep, with its two trigrams gle and lep underlined">glep</h1>
   <p class="tagline">Indexed grep + glob for AI agents.</p>
-  <p class="sub">ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm searches in milliseconds, with output byte-identical to ripgrep's.</p>
+  <p class="sub">ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm searches in milliseconds, with text output byte-identical to ripgrep's.</p>
   <div class="cta">
-    <span class="install"><b>pip</b> install glep</span>
-    <span class="install"><b>cargo</b> install glep</span>
+    <a class="install" href="https://pypi.org/project/glep/"><b>pip</b> install glep</a>
+    <a class="install" href="https://crates.io/crates/glep"><b>cargo</b> install glep</a>
     <a class="gh" href="https://github.com/anishfyi/glep">github.com/anishfyi/glep &rarr;</a>
   </div>
 
@@ -149,7 +163,7 @@
       </tr>
       <tr>
         <td><b>Monorepos and large trees</b> where ripgrep takes hundreds of milliseconds to seconds per query.
-          <span class="why">warm content queries run in roughly 1-20 ms</span></td>
+          <span class="why">measured: 21 ms burst, 173-298 ms with the full sweep</span></td>
         <td><b>Small repos</b> where rg already answers in under ~50 ms.
           <span class="why">indexing overhead nets you nothing measurable</span></td>
       </tr>
@@ -192,7 +206,7 @@
   <h2>Verified, not vibes</h2>
   <div class="proof">
     <div><span class="n">21 ms</span><p>warm query on a Linux kernel checkout (86,605 files) with --ttl; 173 ms paying the full self-healing sweep (macOS bulk-attribute fast path); ripgrep on the same box: 1.4 s</p></div>
-    <div><span class="n">12/12</span><p>pattern classes byte-identical to ripgrep in the differential parity harness, including Unicode case folding and multi-file context</p></div>
+    <div><span class="n">22/22</span><p>pattern cases byte-identical to ripgrep in the differential parity harness, including Unicode case folding, multiline, counts, and context</p></div>
     <div><span class="n">0</span><p>daemons, watchers, or background processes; one binary and one directory of index files</p></div>
   </div>
 </section>
@@ -200,7 +214,10 @@
 <footer>
   <div class="wrap">
     <span>MIT</span>
+    <span>v0.2.3</span>
     <a href="https://github.com/anishfyi/glep">GitHub</a>
+    <a href="https://pypi.org/project/glep/">PyPI</a>
+    <a href="https://crates.io/crates/glep">crates.io</a>
     <span>built on ripgrep's crates, with respect</span>
   </div>
 </footer>
