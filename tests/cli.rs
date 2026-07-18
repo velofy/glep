@@ -257,3 +257,30 @@ fn global_excludes_honored_identically_across_sweep_paths() {
     assert_eq!(bulk, walker);
     assert!(!bulk.contains("old.bak"), "global excludes must hide old.bak");
 }
+
+#[test]
+fn dot_slash_and_absolute_path_filters_work() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["-e", "hello", "./src"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("lib.rs"));
+    assert!(!s.contains("notes.txt"));
+
+    let abs = dir.path().join("src");
+    let out2 = glep(dir.path())
+        .args(["-e", "hello", abs.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s2 = String::from_utf8(out2).unwrap();
+    assert!(s2.contains("lib.rs"));
+    assert!(!s2.contains("notes.txt"));
+}
