@@ -284,3 +284,39 @@ fn dot_slash_and_absolute_path_filters_work() {
     assert!(s2.contains("lib.rs"));
     assert!(!s2.contains("notes.txt"));
 }
+
+#[test]
+fn dot_path_filter_searches_whole_index() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-l", "hello", "."])
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+}
+
+#[test]
+fn dotted_relative_path_filters_resolve_against_root() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["-e", "hello", "src/../src"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("lib.rs"));
+    assert!(!s.contains("notes.txt"));
+}
+
+#[test]
+fn warns_when_path_filter_outside_index_root() {
+    let dir = corpus();
+    let outside = dir.path().join("outside-tree");
+    glep(dir.path())
+        .args(["-e", "hello", outside.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("outside indexed tree"));
+}

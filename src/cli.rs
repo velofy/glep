@@ -63,17 +63,33 @@ fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
         .compile_matcher())
 }
 
-fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
+fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) -> Vec<PathBuf> {
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut outside = Vec::new();
     for p in paths.iter_mut() {
-        if p.is_absolute() {
-            let canonical_p = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
-            if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
-                *p = rel.to_path_buf();
-            }
-        } else if let Ok(stripped) = p.strip_prefix(".") {
-            *p = stripped.to_path_buf();
+        let original = p.clone();
+        let joined = if p.is_absolute() {
+            p.clone()
+        } else {
+            root.join(&*p)
+        };
+        let canonical_p = std::fs::canonicalize(&joined).unwrap_or_else(|_| joined.clone());
+        if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
+            *p = rel.to_path_buf();
+        } else {
+            outside.push(original);
         }
+    }
+    outside
+}
+
+fn warn_path_filters_outside_root(outside: &[PathBuf], root: &std::path::Path) {
+    for p in outside {
+        eprintln!(
+            "glep: path filter {} is outside indexed tree (cwd={}); cd to the repo first",
+            p.display(),
+            root.display()
+        );
     }
 }
 
@@ -112,7 +128,8 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
     let root = std::env::current_dir()?;
-    normalize_path_filters(&mut args.paths, &root);
+    let outside_paths = normalize_path_filters(&mut args.paths, &root);
+    warn_path_filters_outside_root(&outside_paths, &root);
 
     // Subcommand-style words in the pattern slot.
     if args.regexp.is_none() && !args.files {
