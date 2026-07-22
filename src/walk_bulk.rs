@@ -21,19 +21,24 @@
 //! sorted `Vec` once, at the very end of the sweep.
 //!
 //! Ignore semantics mirror `walk::sweep`'s `ignore::WalkBuilder` defaults:
-//! hidden (dot-prefixed) entries are skipped, and `.gitignore` files are
-//! honored per directory level, stacked along the recursion, with no
+//! hidden (dot-prefixed) entries are now INCLUDED (each emitted `FileMeta`
+//! carries a `hidden` flag, computed the same way `walk.rs` computes it:
+//! true when any path component starts with '.'), and `.gitignore` files
+//! are honored per directory level, stacked along the recursion, with no
 //! dependency on an actual `.git` directory being present (the same
-//! "require_git(false)" behavior `sweep` opts into). Beyond the sweep
-//! root's own and nested `.gitignore` files, `sweep` (via the `ignore`
-//! crate, `parents(true)`) also honors: global excludes
-//! (`core.excludesfile` / `$XDG_CONFIG_HOME/git/ignore` /
-//! `~/.config/git/ignore`), `.git/info/exclude`, ancestor `.gitignore`
-//! files above the sweep root, and `.ignore` files (plus their whitelist
-//! overrides). `build_ancestor_stack` seeds the matcher stack with the
-//! first three of those before the walk starts (see its doc comment for
-//! precedence order); `.ignore`/`.rgignore` are handled by refusing to
-//! walk at all wherever one is found, see below.
+//! "require_git(false)" behavior `sweep` opts into). The sole exception,
+//! independent of hidden-ness and of gitignore rules, is `.git` and
+//! `.glep`: those are hard-excluded at any depth, by component name, never
+//! descended into or emitted (see `is_hard_excluded` below), matching
+//! `walk.rs`'s `is_hard_excluded_component`. Beyond the sweep root's own
+//! and nested `.gitignore` files, `sweep` (via the `ignore` crate,
+//! `parents(true)`) also honors: global excludes (`core.excludesfile` /
+//! `$XDG_CONFIG_HOME/git/ignore` / `~/.config/git/ignore`),
+//! `.git/info/exclude`, ancestor `.gitignore` files above the sweep root,
+//! and `.ignore` files (plus their whitelist overrides). `build_ancestor_stack`
+//! seeds the matcher stack with the first three of those before the walk
+//! starts (see its doc comment for precedence order); `.ignore`/`.rgignore`
+//! are handled by refusing to walk at all wherever one is found, see below.
 //!
 //! Correctness posture: any anomaly while parsing a `getattrlistbulk`
 //! result buffer (an offset or length that doesn't fit inside the buffer)
@@ -52,7 +57,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -124,8 +129,17 @@ fn make_attrlist() -> AttrList {
 /// actually returned for it (a directory never gets ATTR_FILE_DATALENGTH,
 /// for example, since that bit is only set in the RETURNED bitmap for
 /// entries where the fileattr group applies).
+///
+/// `name` is an `OsString` built directly from the raw bytes the kernel
+/// returned (`OsStr::from_bytes`), not a `String::from_utf8_lossy`
+/// conversion: APFS allows filenames that are not valid UTF-8, and lossy
+/// conversion would silently corrupt those names (replacing the invalid
+/// bytes with U+FFFD) before they ever reach a `FileMeta.path`. Carrying
+/// the exact original bytes through `OsString` means such a name round
+/// trips exactly, the same way the portable `ignore`-crate walker's
+/// `DirEntry` paths already do.
 struct BulkEntry {
-    name: String,
+    name: OsString,
     objtype: u32,
     mtime_ns: u128,
     size: u64,
@@ -133,7 +147,7 @@ struct BulkEntry {
 
 struct DirScan {
     files: Vec<BulkEntry>,
-    subdirs: Vec<String>,
+    subdirs: Vec<OsString>,
 }
 
 /// Non-fatal: one directory could not be scanned (permission denied,
@@ -213,7 +227,7 @@ fn parse_bulk_buffer(buf: &[u8], count: i32, out: &mut Vec<BulkEntry>) -> anyhow
         let fileattr_returned = read_u32(buf, cursor + 12)?;
         cursor += 20; // attribute_set_t: 5 x u32
 
-        let mut name = String::new();
+        let mut name = OsString::new();
         let mut objtype: u32 = 0;
         let mut mtime_ns: u128 = 0;
         let mut size: u64 = 0;
@@ -237,7 +251,10 @@ fn parse_bulk_buffer(buf: &[u8], count: i32, out: &mut Vec<BulkEntry>) -> anyhow
                 .get(data_start..data_end)
                 .ok_or_else(|| anyhow::anyhow!("name bytes out of buffer bounds"))?;
             let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-            name = String::from_utf8_lossy(&raw[..nul_pos]).into_owned();
+            // Exact byte-for-byte round trip, valid UTF-8 or not: see the
+            // `BulkEntry::name` doc comment above for why this is not a
+            // `String::from_utf8_lossy` conversion.
+            name = OsStr::from_bytes(&raw[..nul_pos]).to_os_string();
             cursor += 8;
         }
         if common_returned & ATTR_CMN_OBJTYPE != 0 {
@@ -348,14 +365,34 @@ fn bulk_scan_dir(dir: &Path) -> Result<DirScan, ScanError> {
     outcome.map(|()| DirScan { files, subdirs })
 }
 
-/// Combined verdict from a stack of per-directory-level gitignore matchers,
-/// plus the default "skip dot-prefixed entries" rule that applies when no
-/// gitignore file made an explicit decision. Mirrors the precedence the
-/// `ignore` crate uses in its own walker: a decisive match (Ignore or
-/// Whitelist) from a deeper directory's gitignore overrides one from a
-/// shallower directory, and an explicit Whitelist always wins over the
-/// hidden-file default.
-fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &str) -> bool {
+/// True when `name` is a path component that must never be descended into
+/// or emitted, at any depth, regardless of gitignore rules and regardless
+/// of the hidden flag: `.git` and `.glep`. Mirrors
+/// `walk::is_hard_excluded_component`; kept as a separate copy here since
+/// `walk.rs`'s version takes an `&OsStr` built from a real filesystem path
+/// rather than a bulk-scan `BulkEntry::name`, and comparing `OsStr`
+/// directly (rather than through a lossy `String` conversion) is what lets
+/// this stay correct for non-UTF-8 names too.
+fn is_hard_excluded(name: &OsStr) -> bool {
+    name_eq(name, ".git") || name_eq(name, ".glep")
+}
+
+fn name_eq(name: &OsStr, s: &str) -> bool {
+    name == OsStr::new(s)
+}
+
+/// Combined verdict from a stack of per-directory-level gitignore matchers.
+/// Mirrors the precedence the `ignore` crate uses in its own walker: a
+/// decisive match (Ignore or Whitelist) from a deeper directory's
+/// gitignore overrides one from a shallower directory. Hidden (dot-prefixed)
+/// entries are no longer default-ignored here: `sweep`/`sweep_bulk` now
+/// include them, each carrying a `FileMeta::hidden` flag for query-time
+/// filtering instead. `.git` and `.glep` are the one hard exclusion that
+/// bypasses the gitignore stack entirely, checked first.
+fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &OsStr) -> bool {
+    if is_hard_excluded(name) {
+        return true;
+    }
     let mut verdict = ignore::Match::None;
     for gi in stack {
         match gi.matched(abs_path, is_dir) {
@@ -366,7 +403,7 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &st
     match verdict {
         ignore::Match::Ignore(_) => true,
         ignore::Match::Whitelist(_) => false,
-        ignore::Match::None => name.starts_with('.'),
+        ignore::Match::None => false,
     }
 }
 
@@ -599,9 +636,9 @@ fn scan_recursive<'scope>(
     let mut has_local_gitignore = false;
     let mut has_divergent_ignore_file = false;
     for f in &scan.files {
-        if f.name == ".gitignore" {
+        if name_eq(&f.name, ".gitignore") {
             has_local_gitignore = true;
-        } else if f.name == ".ignore" || f.name == ".rgignore" {
+        } else if name_eq(&f.name, ".ignore") || name_eq(&f.name, ".rgignore") {
             has_divergent_ignore_file = true;
         }
     }
@@ -637,16 +674,21 @@ fn scan_recursive<'scope>(
             continue;
         }
         let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
+        let hidden = crate::walk::path_is_hidden(&rel);
         local_files.push(FileMeta {
             path: rel,
             mtime_ns: entry.mtime_ns,
             size: entry.size,
+            hidden,
         });
     }
     if !local_files.is_empty() {
         buffers[slot_idx].lock().unwrap().extend(local_files);
     }
 
+    // .git and .glep are never descended into, hidden or not, gitignored
+    // or not: is_ignored's hard-exclusion check (ahead of the gitignore
+    // stack) covers that here.
     for name in scan.subdirs {
         let abs = dir.join(&name);
         if is_ignored(&stack, &abs, true, &name) {

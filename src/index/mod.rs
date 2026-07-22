@@ -6,7 +6,7 @@ use crate::timing::Timings;
 use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
-use manifest::{Manifest, FLAG_DEAD, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use manifest::{Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
 use postings::Postings;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,7 +98,11 @@ impl Index {
                 eprintln!("glep: indexed {n} files...");
             }
             let id = man.add(meta);
-            man.entries[id as usize].flags = index_file(root, meta, id, max_filesize, &mut map);
+            let mut flags = index_file(root, meta, id, max_filesize, &mut map);
+            if meta.hidden {
+                flags |= FLAG_HIDDEN;
+            }
+            man.entries[id as usize].flags = flags;
         }
         man.last_sweep_epoch = now_epoch();
         man.generation = generation;
@@ -156,10 +160,16 @@ impl Index {
         Self::build(root, max_filesize)
     }
 
-    pub fn live_files(&self) -> Vec<PathBuf> {
+    /// `include_hidden = false` (the default, matching rg) drops entries
+    /// flagged `FLAG_HIDDEN`: files/dirs with a dot-prefixed path
+    /// component. `.git`/`.glep` never reach the manifest at all (hard
+    /// sweep-time exclusion, see walk.rs), so there is no flag for those to
+    /// check here.
+    pub fn live_files(&self, include_hidden: bool) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self
             .manifest
             .live_entries()
+            .filter(|e| include_hidden || e.flags & FLAG_HIDDEN == 0)
             .map(|e| e.path.clone())
             .collect();
         v.sort();
@@ -192,7 +202,11 @@ impl Index {
             .map_or(false, |e| e.flags & FLAG_DEAD == 0)
     }
 
-    pub fn candidates(&self, plan: &Plan, case_insensitive: bool) -> Vec<PathBuf> {
+    /// `include_hidden = false` (the default, matching rg) drops candidates
+    /// flagged `FLAG_HIDDEN` after narrowing by plan, so both the `All` and
+    /// `Groups` arms (trigram postings carry no hidden bit of their own)
+    /// are covered by one filter rather than two.
+    pub fn candidates(&self, plan: &Plan, case_insensitive: bool, include_hidden: bool) -> Vec<PathBuf> {
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
                 .manifest
@@ -230,6 +244,9 @@ impl Index {
             }
         };
         ids.retain(|&id| self.is_live(id));
+        if !include_hidden {
+            ids.retain(|&id| self.manifest.entries[id as usize].flags & FLAG_HIDDEN == 0);
+        }
         let mut paths: Vec<PathBuf> = ids
             .iter()
             .map(|&id| self.manifest.entries[id as usize].path.clone())
@@ -329,8 +346,11 @@ impl Index {
         }
         for meta in &fresh {
             let id = self.manifest.add(meta);
-            self.manifest.entries[id as usize].flags =
-                index_file(&self.root, meta, id, max_filesize, &mut map);
+            let mut flags = index_file(&self.root, meta, id, max_filesize, &mut map);
+            if meta.hidden {
+                flags |= FLAG_HIDDEN;
+            }
+            self.manifest.entries[id as usize].flags = flags;
         }
         for ids in map.values_mut() {
             ids.sort_unstable();
@@ -400,7 +420,7 @@ mod tests {
         assert_eq!(by_path("a.txt").flags, 0);
         assert_eq!(by_path("bin.dat").flags, manifest::FLAG_SKIP_BINARY);
         assert_eq!(by_path("big.txt").flags, manifest::FLAG_SKIP_TOO_LARGE);
-        let files = idx.live_files();
+        let files = idx.live_files(false);
         assert_eq!(files.len(), 4);
     }
 
@@ -410,7 +430,7 @@ mod tests {
         Index::build(dir.path(), 1_048_576).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert!(!idx.read_only);
-        assert_eq!(idx.live_files().len(), 4);
+        assert_eq!(idx.live_files(false).len(), 4);
     }
 
     #[test]
@@ -419,7 +439,7 @@ mod tests {
         Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::write(dir.path().join(".glep/postings.bin"), b"garbage").unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
-        assert_eq!(idx.live_files().len(), 4);
+        assert_eq!(idx.live_files(false).len(), 4);
     }
 
     #[test]
@@ -432,7 +452,7 @@ mod tests {
         man.generation ^= 0xdead_beef;
         man.save(&mpath).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
-        assert_eq!(idx.live_files().len(), 4);
+        assert_eq!(idx.live_files(false).len(), 4);
         let man2 = manifest::Manifest::load(&mpath).unwrap();
         let post = postings::Postings::open(&dir.path().join(".glep/postings.bin")).unwrap();
         assert_eq!(man2.generation, post.generation());
@@ -449,7 +469,7 @@ mod tests {
         postings::write(&dir.path().join(".glep/delta.bin"), &map, 12345).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert!(!idx.has_delta());
-        assert_eq!(idx.live_files().len(), 4);
+        assert_eq!(idx.live_files(false).len(), 4);
         drop(idx);
 
         // Matching generation: delta must attach.
@@ -464,7 +484,7 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false);
+        let c = idx.candidates(&plan, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -473,8 +493,8 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("HELLO", true, false);
-        assert!(idx.candidates(&plan, false).is_empty());
-        let c = idx.candidates(&plan, true);
+        assert!(idx.candidates(&plan, false, false).is_empty());
+        let c = idx.candidates(&plan, true, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -483,7 +503,7 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false);
+        let c = idx.candidates(&plan, false, false);
         assert!(c.contains(&std::path::PathBuf::from("a.txt")));
         assert!(c.contains(&std::path::PathBuf::from("big.txt")));
         assert!(!c.contains(&std::path::PathBuf::from("bin.dat")));
@@ -493,7 +513,7 @@ mod tests {
     fn candidates_all_returns_live_non_binary() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let c = idx.candidates(&crate::plan::Plan::All, false);
+        let c = idx.candidates(&crate::plan::Plan::All, false, false);
         assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
     }
 
@@ -507,12 +527,12 @@ mod tests {
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("freshneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan, false),
+            idx.candidates(&plan, false, false),
             vec![std::path::PathBuf::from("new.txt")]
         );
         let plan2 = crate::plan::build("changedneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan2, false),
+            idx.candidates(&plan2, false, false),
             vec![std::path::PathBuf::from("a.txt")]
         );
     }
@@ -524,7 +544,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        assert!(idx.candidates(&plan, false).is_empty());
+        assert!(idx.candidates(&plan, false, false).is_empty());
     }
 
     #[test]
@@ -534,9 +554,9 @@ mod tests {
         std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
         idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
         let plan = crate::plan::build("ttlneedle", true, false);
-        assert!(idx.candidates(&plan, false).is_empty());
+        assert!(idx.candidates(&plan, false, false).is_empty());
         idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
-        assert_eq!(idx.candidates(&plan, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
     }
 
     #[test]
@@ -549,7 +569,7 @@ mod tests {
         }
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("persistneedle", true, false);
-        assert_eq!(idx.candidates(&plan, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
     }
 
     #[test]
@@ -570,7 +590,7 @@ mod tests {
         );
         let plan = crate::plan::build("uniqtoken1999", true, false);
         assert_eq!(
-            idx.candidates(&plan, false),
+            idx.candidates(&plan, false, false),
             vec![std::path::PathBuf::from("bulk.txt")]
         );
     }
@@ -599,5 +619,55 @@ mod tests {
         let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
         assert_eq!(manifest_before, manifest_after, "read-only update must not write");
         assert!(!dir.path().join(".glep/delta.bin").exists());
+    }
+
+    #[test]
+    fn hidden_files_flagged_and_filtered_by_default() {
+        let dir = corpus();
+        std::fs::write(dir.path().join(".secret.txt"), "hiddenneedle here").unwrap();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+
+        let by_path = |p: &str| {
+            idx.manifest
+                .entries
+                .iter()
+                .find(|e| e.path.to_string_lossy() == p)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_path(".secret.txt").flags & manifest::FLAG_HIDDEN, manifest::FLAG_HIDDEN);
+        assert_eq!(by_path("a.txt").flags & manifest::FLAG_HIDDEN, 0);
+
+        let plan = crate::plan::build("hiddenneedle", true, false);
+        assert!(
+            idx.candidates(&plan, false, false).is_empty(),
+            "hidden file must not surface by default"
+        );
+        assert_eq!(
+            idx.candidates(&plan, false, true),
+            vec![std::path::PathBuf::from(".secret.txt")]
+        );
+
+        assert!(!idx.live_files(false).contains(&std::path::PathBuf::from(".secret.txt")));
+        assert!(idx.live_files(true).contains(&std::path::PathBuf::from(".secret.txt")));
+    }
+
+    #[test]
+    fn update_self_heals_hidden_files_into_index() {
+        let dir = corpus();
+        // Built before the hidden file exists: exercises the same
+        // add-new-file path a pre-FLAG_HIDDEN index takes on its first
+        // sweep after upgrade, since a hidden file it had never seen
+        // before looks identical to any other brand new file.
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join(".newhidden.txt"), "healneedle appears").unwrap();
+        idx.update(1_048_576, 0).unwrap();
+
+        let plan = crate::plan::build("healneedle", true, false);
+        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert_eq!(
+            idx.candidates(&plan, false, true),
+            vec![std::path::PathBuf::from(".newhidden.txt")]
+        );
     }
 }

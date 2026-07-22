@@ -1,6 +1,6 @@
 use crate::index::Index;
 use crate::timing::Timings;
-use crate::{plan, search};
+use crate::{plan, search, walk};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -42,6 +42,10 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Include hidden (dot-prefixed) files and directories, rg semantics.
+    /// .git is always excluded regardless of this flag.
+    #[arg(long)]
+    pub hidden: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -143,10 +147,18 @@ pub fn run() -> anyhow::Result<i32> {
     let mut timings = Timings::new();
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
-    let extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
+    let mut extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
+    // `extra` is the read-only-mode live-scan fallback: files discovered by
+    // this sweep that couldn't be written into the index because another
+    // process holds the lock. They carry no FLAG_HIDDEN of their own (no
+    // manifest entry yet), so apply the same rg-matching default here too:
+    // hidden unless --hidden was passed.
+    if !args.hidden {
+        extra.retain(|p| !walk::path_is_hidden(p));
+    }
 
     if args.files {
-        let mut files = idx.live_files();
+        let mut files = idx.live_files(args.hidden);
         files.extend(extra);
         files.sort();
         files.dedup();
@@ -170,7 +182,7 @@ pub fn run() -> anyhow::Result<i32> {
     };
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     timings.stage("plan");
-    let mut files = idx.candidates(&query_plan, args.ignore_case);
+    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     files.extend(extra);
     files.sort();
     files.dedup();

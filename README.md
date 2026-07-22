@@ -20,6 +20,8 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 | Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep lacks: replacements, PCRE2, compressed files |
 | Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
 
+`--hidden` includes dotfiles; `.git` itself is always excluded.
+
 ## Numbers
 
 Linux kernel 6.12 checkout: 86,605 files, ~1.5 GB. Apple Silicon macOS, hyperfine medians, warm filesystem cache, rg and fd at their default parallelism.
@@ -50,6 +52,7 @@ glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
 glep -g '*.rs' -t rust ...      # glob and type filters
+glep --hidden 'TODO'            # include dotfiles (.git is always excluded)
 glep --ttl 5 ...                # skip the freshness sweep within a read burst
 glep --max-filesize 2000000 ... # raise the 1MB index cap
 glep index                      # explicit (re)build; lazy on first query
