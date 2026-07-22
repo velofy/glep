@@ -189,7 +189,7 @@ pub fn run() -> anyhow::Result<i32> {
     normalize_path_filters(&mut args.paths, &root);
 
     // Subcommand-style words in the pattern slot.
-    if args.regexp.is_none() && !args.files {
+    if args.regexp.is_none() && !args.files && !args.no_ignore {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;

@@ -400,3 +400,36 @@ fn no_ignore_never_touches_the_index() {
         "--no-ignore run must not create a delta"
     );
 }
+
+#[test]
+fn no_ignore_treats_subcommand_words_as_patterns() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("idx2.txt"), "the index word\n").unwrap();
+    glep(dir.path())
+        .args(["--no-ignore", "index"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("idx2.txt"));
+    assert!(
+        !dir.path().join(".glep").exists(),
+        "--no-ignore must not create an index"
+    );
+}
+
+#[test]
+fn no_ignore_composes_with_glob_filters() {
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+    std::fs::write(dir.path().join("vendor/dep.js"), "hello vendored\n").unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "vendor/\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--no-ignore", "-g", "*.js", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("dep.js"));
+    assert!(!s.contains("notes.txt"));
+}
