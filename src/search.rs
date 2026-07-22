@@ -2,6 +2,7 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub struct SearchOpts {
     pub case_insensitive: bool,
@@ -12,6 +13,88 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+}
+
+// --- rg-compatible --json closing `summary` event -------------------------
+//
+// rg's `--json` stream ends with one extra line after all begin/match/
+// context/end events: a `summary` event carrying `elapsed_total` (wall time
+// for the whole invocation) and a `stats` object (aggregate counters).
+// Captured from real ripgrep (`rg --json <pattern>`, ripgrep 15.1.0) as
+// ground truth for field names and nesting:
+//
+//   {"data":{"elapsed_total":{"human":"0.011150s","nanos":11150209,"secs":0},
+//    "stats":{"bytes_printed":643,"bytes_searched":73,
+//    "elapsed":{"human":"0.001123s","nanos":1122750,"secs":0},
+//    "matched_lines":3,"matches":3,"searches":3,"searches_with_match":2}},
+//    "type":"summary"}
+//
+// Key order does not matter (JSON object equality is key-based, not
+// positional); only the field *names* and nesting need to match.
+//
+// `grep_printer::Stats` (the per-file "end" event's own `stats` object)
+// already derives a `Serialize` impl with exactly these field names, so we
+// reuse that type directly for the `stats` sub-object instead of redefining
+// it. `grep_printer::JSONBuilder` (grep-printer 0.2.x) has no `.stats(bool)`
+// toggle to enable/disable stats collection like `StandardBuilder`/
+// `SummaryBuilder` do; the JSON sink always tracks `Stats` internally, and
+// `JSONSink::stats()` is unconditionally available after a search. So step
+// 1's ".stats(true) on the JSON printer builder" doesn't apply here: nothing
+// to opt into, we just harvest `sink.stats()` per file below.
+//
+// `NiceDuration` (the `{secs,nanos,human}` shape used for both `elapsed` and
+// `elapsed_total`) is `pub(crate)` inside grep-printer, so it can't be
+// reused from here; this local copy reproduces its exact Serialize output,
+// including the "%.6f\"s\"" human format (e.g. "1.234567s").
+#[derive(serde::Serialize)]
+struct NiceDuration {
+    secs: u64,
+    nanos: u32,
+    human: String,
+}
+
+impl From<Duration> for NiceDuration {
+    fn from(d: Duration) -> NiceDuration {
+        NiceDuration {
+            secs: d.as_secs(),
+            nanos: d.subsec_nanos(),
+            human: format!("{:.6}s", d.as_secs_f64()),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SummaryData {
+    elapsed_total: NiceDuration,
+    stats: grep_printer::Stats,
+}
+
+#[derive(serde::Serialize)]
+struct SummaryEvent {
+    data: SummaryData,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// Fold `other`'s counters into `total`, deliberately skipping `elapsed`.
+///
+/// IMPORTANT SEMANTIC NOTE: `searches` and `bytes_searched` (and the other
+/// per-file counters folded here) legitimately DIFFER from rg's own summary
+/// for the same query. glep's index narrows candidates before any file is
+/// opened, so `files` (the slice `run` is called with) already excludes
+/// files rg would have opened and searched itself; `searches` /
+/// `searches_with_match` / `bytes_searched` below report glep's own honest
+/// count of files it actually searched, not rg's. `matches`, `matched_lines`
+/// and `bytes_printed` are computed from the same grep-searcher/grep-printer
+/// machinery rg uses and are expected to match rg exactly for identical
+/// queries (see tests/json_parity.rs). See also README's Interface section.
+fn merge_stats(total: &mut grep_printer::Stats, other: &grep_printer::Stats) {
+    total.add_searches(other.searches());
+    total.add_searches_with_match(other.searches_with_match());
+    total.add_bytes_searched(other.bytes_searched());
+    total.add_bytes_printed(other.bytes_printed());
+    total.add_matched_lines(other.matched_lines());
+    total.add_matches(other.matches());
 }
 
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
@@ -83,7 +166,7 @@ fn search_one(
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
-) -> anyhow::Result<(Vec<u8>, bool)> {
+) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     let mut searcher = SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
@@ -103,22 +186,25 @@ fn search_one(
             return Ok((
                 format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
                 true,
+                None,
             ));
         }
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), false, None));
     }
     if opts.files_with_matches {
         let mut sink = FoundSink(false);
         searcher.search_path(matcher, &full, &mut sink)?;
-        return Ok((Vec::new(), sink.0));
+        return Ok((Vec::new(), sink.0, None));
     }
     let mut buf = Vec::new();
     let matched;
+    let mut stats = None;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
+        stats = Some(sink.stats().clone());
     } else {
         let mut printer = grep_printer::StandardBuilder::new()
             .heading(false)
@@ -127,7 +213,7 @@ fn search_one(
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     }
-    Ok((buf, matched))
+    Ok((buf, matched, stats))
 }
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
@@ -139,6 +225,9 @@ pub fn run(
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
+    // Times the whole run, used for the --json summary event's
+    // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
+    let start = Instant::now();
     // Build the matcher once up front; shared by reference across the rayon
     // closure (grep_regex::RegexMatcher is Sync). This also validates the
     // pattern before I/O, matching prior behavior.
@@ -148,20 +237,24 @@ pub fn run(
         (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
     let mut printed_any = false;
     let mut base = 0usize;
+    let mut total_stats = grep_printer::Stats::new();
     for chunk in files.chunks(128) {
-        let mut results: Vec<(usize, Vec<u8>, bool)> = chunk
+        let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
             .enumerate()
             .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
-                Ok((buf, matched)) => (i, buf, matched),
+                Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
-                    (i, Vec::new(), false)
+                    (i, Vec::new(), false, None)
                 }
             })
             .collect();
-        results.sort_by_key(|(i, _, _)| *i);
-        for (i, buf, matched) in results {
+        results.sort_by_key(|(i, _, _, _)| *i);
+        for (i, buf, matched, stats) in results {
+            if let Some(s) = &stats {
+                merge_stats(&mut total_stats, s);
+            }
             if matched {
                 found = true;
                 let global_i = base + i;
@@ -177,6 +270,26 @@ pub fn run(
             }
         }
         base += chunk.len();
+    }
+    if opts.json {
+        // Per design: both `elapsed_total` and `stats.elapsed` are filled
+        // from this single measured wall-clock duration for the whole run,
+        // rather than trying to reproduce rg's internal split between
+        // "time summing individual per-file searches" (its `stats.elapsed`)
+        // and "total process wall time" (its `elapsed_total`). Both fields
+        // are masked out of tests/json_parity.rs's comparison, so this
+        // simplification is safe; `merge_stats` above deliberately never
+        // touches `elapsed`, so this is the only place it's set.
+        let elapsed = start.elapsed();
+        total_stats.add_elapsed(elapsed);
+        let event = SummaryEvent {
+            kind: "summary",
+            data: SummaryData {
+                elapsed_total: NiceDuration::from(elapsed),
+                stats: total_stats,
+            },
+        };
+        writeln!(out, "{}", serde_json::to_string(&event)?)?;
     }
     Ok(found)
 }

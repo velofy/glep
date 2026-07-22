@@ -47,7 +47,7 @@ Default glep pays the self-healing freshness sweep (a stat of every file) on eac
 ```bash
 glep 'fn parse_intent' src/     # content search (Grep replacement)
 glep --files '**/*.py'          # glob listing (Glob replacement)
-glep --json 'pattern'           # machine-readable output for agents
+glep --json 'pattern'           # machine-readable output for agents (includes rg's closing summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides

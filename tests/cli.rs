@@ -433,3 +433,44 @@ fn no_ignore_composes_with_glob_filters() {
     assert!(s.contains("dep.js"));
     assert!(!s.contains("notes.txt"));
 }
+
+#[test]
+fn json_mode_emits_rg_summary_event() {
+    let dir = corpus();
+
+    // Match: exits 0, last stdout line parses as JSON with type "summary"
+    // and stats.matches >= 1.
+    let out = glep(dir.path())
+        .args(["--json", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let last = stdout.lines().last().expect("--json produced no output");
+    let summary: serde_json::Value = serde_json::from_str(last).expect("last line is valid JSON");
+    assert_eq!(summary["type"], "summary");
+    assert!(
+        summary["data"]["stats"]["matches"].as_u64().unwrap_or(0) >= 1,
+        "expected stats.matches >= 1, got {summary}"
+    );
+
+    // No match: rg still emits a summary event even when nothing matched
+    // (verified against real rg 15.1.0 before writing this test), and glep
+    // still exits 1, same as its existing no-match convention.
+    let out = glep(dir.path())
+        .args(["--json", "zzz_absent_zz"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let last = stdout
+        .lines()
+        .last()
+        .expect("--json produced no output on no-match");
+    let summary: serde_json::Value = serde_json::from_str(last).expect("last line is valid JSON");
+    assert_eq!(summary["type"], "summary");
+}
