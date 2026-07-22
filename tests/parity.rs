@@ -114,6 +114,20 @@ fn parity_with_ripgrep() {
         // README (.git always excluded from glep, not from rg --hidden) is
         // a deliberate one this corpus does not exercise.
         &["--hidden", "hiddentoken"],
+        // --no-ignore: skipme.log (gitignored) and skipme2.txt (.ignore'd)
+        // both carry "hello", invisible by default (see the plain "hello"
+        // case above, which the corpus fixture comment confirms excludes
+        // them) and visible once ignore sources are bypassed. Still hidden
+        // by default: no dotfile in the corpus contains "hello", so this
+        // case alone wouldn't catch a hidden-gating regression, but the
+        // dedicated tests/cli.rs cases do.
+        &["--no-ignore", "hello"],
+        &["--no-ignore", "-l", "hello"],
+        // --files listing under --no-ignore: rg ignores -n/--no-heading/
+        // --color for --files (verified manually against real rg), and
+        // --sort path still applies, so the harness's fixed rg flag set
+        // composes cleanly with --files --no-ignore for both tools.
+        &["--no-ignore", "--files"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);
