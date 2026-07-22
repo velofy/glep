@@ -284,3 +284,15 @@ fn dot_slash_and_absolute_path_filters_work() {
     assert!(s2.contains("lib.rs"));
     assert!(!s2.contains("notes.txt"));
 }
+
+#[test]
+fn status_skipped_count_ignores_hidden_flag() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".hidden.txt"), "h").unwrap();
+    glep(dir.path()).arg("index").assert().success();
+    glep(dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("skipped (binary/oversized): 0"));
+}

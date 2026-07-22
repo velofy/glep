@@ -4,7 +4,7 @@
 
 <p align="center"><strong>Indexed grep + glob for AI agents.</strong></p>
 
-Ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21-298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s (21 ms in --ttl burst mode), with text output byte-compatible with ripgrep's, enforced by a 22-case differential harness in CI. No daemon.
+Ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21-298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s (21 ms in --ttl burst mode), with text output byte-compatible with ripgrep's, enforced by a 21-case differential harness in CI. No daemon.
 
 ## Why
 

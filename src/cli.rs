@@ -1,4 +1,5 @@
 use crate::index::Index;
+use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
 use crate::timing::Timings;
 use crate::{plan, search, walk};
 use clap::Parser;
@@ -133,7 +134,9 @@ pub fn run() -> anyhow::Result<i32> {
                 let skipped = idx
                     .manifest
                     .live_entries()
-                    .filter(|e| e.flags != 0)
+                    .filter(|e| {
+                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0
+                    })
                     .count();
                 println!("files: {live}");
                 println!("skipped (binary/oversized): {skipped}");
