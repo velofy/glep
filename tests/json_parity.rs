@@ -132,6 +132,9 @@ fn json_summary_matches_rg_structurally() {
             .iter()
             .map(|l| event_key(l))
             .collect();
+        if pattern != "zz_totally_absent_zz" {
+            assert!(r_events.len() >= 3, "match pattern must produce events");
+        }
         assert_eq!(
             g_events, r_events,
             "begin/match/end sequence diverged for {pattern:?}"

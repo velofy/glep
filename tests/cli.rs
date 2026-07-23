@@ -474,3 +474,9 @@ fn json_mode_emits_rg_summary_event() {
     let summary: serde_json::Value = serde_json::from_str(last).expect("last line is valid JSON");
     assert_eq!(summary["type"], "summary");
 }
+
+#[test]
+fn files_with_matches_conflicts_with_json() {
+    let dir = corpus();
+    glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
+}

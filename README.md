@@ -60,6 +60,8 @@ glep index                      # explicit (re)build; lazy on first query
 glep status                     # index stats
 ```
 
+With an explicit path argument, bytes_printed in the summary can differ from rg's (rg prints ./-prefixed paths; glep prints them bare).
+
 Ships with a Claude Code skill and a PreToolUse hook that routes built-in Grep/Glob calls through glep automatically.
 
 ## Install

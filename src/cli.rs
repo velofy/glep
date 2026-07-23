@@ -22,7 +22,7 @@ pub struct Args {
     pub ignore_case: bool,
     #[arg(short = 'F', long)]
     pub fixed_strings: bool,
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, conflicts_with = "json")]
     pub files_with_matches: bool,
     #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
     pub count: bool,
