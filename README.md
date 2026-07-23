@@ -74,6 +74,8 @@ cargo install glep
 
 Claude Code integration (skill + hook): `claude/install.sh`.
 
+Cursor integration (hook): `cursor/install.sh`.
+
 ## Status
 
 Spec: [docs/superpowers/specs/2026-07-14-glep-design.md](https://github.com/anishfyi/glep/blob/main/docs/superpowers/specs/2026-07-14-glep-design.md).
