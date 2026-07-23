@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 pub const FLAG_SKIP_BINARY: u8 = 1;
 pub const FLAG_SKIP_TOO_LARGE: u8 = 2;
 pub const FLAG_DEAD: u8 = 4;
+/// Set on entries whose `path` has any component starting with '.'
+/// (`FileMeta::hidden`, see walk.rs). Existing indexes self-heal: a hidden
+/// file that predates this flag was never swept before (the old default
+/// skipped dot-prefixed entries), so it appears as a brand new file on the
+/// next sweep after upgrade and picks up the flag through the normal
+/// add-new-file path, no format bump required.
+pub const FLAG_HIDDEN: u8 = 8;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
@@ -59,7 +66,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn meta(p: &str) -> FileMeta {
-        FileMeta { path: PathBuf::from(p), mtime_ns: 42, size: 7 }
+        FileMeta { path: PathBuf::from(p), mtime_ns: 42, size: 7, hidden: false }
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use crate::index::Index;
+use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
 use crate::timing::Timings;
-use crate::{plan, search};
+use crate::{plan, search, walk};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "glep", version, about = "Indexed grep + glob for AI agents")]
@@ -21,7 +22,7 @@ pub struct Args {
     pub ignore_case: bool,
     #[arg(short = 'F', long)]
     pub fixed_strings: bool,
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, conflicts_with = "json")]
     pub files_with_matches: bool,
     #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
     pub count: bool,
@@ -42,6 +43,17 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Include hidden (dot-prefixed) files and directories, rg semantics.
+    /// .git is always excluded regardless of this flag.
+    #[arg(long)]
+    pub hidden: bool,
+    /// Search ignored files too (gitignore/.ignore/global excludes all
+    /// bypassed), rg semantics. Implemented as a live scan that never
+    /// opens, updates, or writes the index: ignored trees (node_modules,
+    /// target, ...) must never enter the index, so this trades speed for
+    /// that guarantee. .git/.glep are still always excluded.
+    #[arg(long)]
+    pub no_ignore: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -101,6 +113,68 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--no-ignore`: content mode and `--files` mode both bypass the index
+/// entirely (no open, no update, no write, not even a read-only fallback
+/// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
+/// walks with every ignore source disabled. This is the escape hatch's
+/// whole point: ignored trees must never enter the index, so the only
+/// sound way to search them is to never touch the index at all for this
+/// run. Slower than the indexed path (full walk + full scan every time,
+/// same cost as `rg --no-ignore` itself), but that trade is deliberate.
+///
+/// `args.hidden` gates hidden files exactly as it does on the indexed
+/// path; `sweep_unfiltered` does that gating itself (see its doc comment
+/// in walk.rs), so the result is not re-filtered by hidden here. The
+/// existing positional-path/glob/type filters (`apply_filters`, already
+/// normalized by the caller) and exit-code conventions are unchanged.
+fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
+    let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_unfiltered");
+
+    if args.files {
+        // With --files the pattern slot is the glob.
+        if let Some(g) = args.pattern.as_deref() {
+            let glob = build_glob(g)?;
+            files.retain(|f| glob.is_match(f));
+        }
+        apply_filters(&mut files, args)?;
+        for f in &files {
+            println!("{}", f.display());
+        }
+        timings.finish();
+        return Ok(if files.is_empty() { 1 } else { 0 });
+    }
+
+    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
+        Some(p) => p,
+        None => anyhow::bail!("a pattern is required (or --files)"),
+    };
+    apply_filters(&mut files, args)?;
+    timings.stage("candidates");
+
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
+    let opts = search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before,
+        after,
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+    };
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    timings.stage("search");
+    timings.finish();
+    Ok(if found { 0 } else { 1 })
+}
+
 pub fn run() -> anyhow::Result<i32> {
     let mut args = Args::parse();
 
@@ -115,7 +189,7 @@ pub fn run() -> anyhow::Result<i32> {
     normalize_path_filters(&mut args.paths, &root);
 
     // Subcommand-style words in the pattern slot.
-    if args.regexp.is_none() && !args.files {
+    if args.regexp.is_none() && !args.files && !args.no_ignore {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;
@@ -129,7 +203,9 @@ pub fn run() -> anyhow::Result<i32> {
                 let skipped = idx
                     .manifest
                     .live_entries()
-                    .filter(|e| e.flags != 0)
+                    .filter(|e| {
+                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0
+                    })
                     .count();
                 println!("files: {live}");
                 println!("skipped (binary/oversized): {skipped}");
@@ -141,12 +217,25 @@ pub fn run() -> anyhow::Result<i32> {
     }
 
     let mut timings = Timings::new();
+
+    if args.no_ignore {
+        return run_no_ignore(&root, &args, &mut timings);
+    }
+
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
-    let extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
+    let mut extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
+    // `extra` is the read-only-mode live-scan fallback: files discovered by
+    // this sweep that couldn't be written into the index because another
+    // process holds the lock. They carry no FLAG_HIDDEN of their own (no
+    // manifest entry yet), so apply the same rg-matching default here too:
+    // hidden unless --hidden was passed.
+    if !args.hidden {
+        extra.retain(|p| !walk::path_is_hidden(p));
+    }
 
     if args.files {
-        let mut files = idx.live_files();
+        let mut files = idx.live_files(args.hidden);
         files.extend(extra);
         files.sort();
         files.dedup();
@@ -170,7 +259,7 @@ pub fn run() -> anyhow::Result<i32> {
     };
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     timings.stage("plan");
-    let mut files = idx.candidates(&query_plan, args.ignore_case);
+    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     files.extend(extra);
     files.sort();
     files.dedup();

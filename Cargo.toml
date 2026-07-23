@@ -1,6 +1,6 @@
 [package]
 name = "glep"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Indexed grep + glob for AI agents"
 license = "MIT"
@@ -23,6 +23,7 @@ memmap2 = "0.9"
 rayon = "1"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 termcolor = "1"
 
 [dev-dependencies]

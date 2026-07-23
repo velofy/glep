@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::path::Path;
 
 fn glep(dir: &Path) -> Command {
@@ -283,4 +284,199 @@ fn dot_slash_and_absolute_path_filters_work() {
     let s2 = String::from_utf8(out2).unwrap();
     assert!(s2.contains("lib.rs"));
     assert!(!s2.contains("notes.txt"));
+}
+
+#[test]
+fn status_skipped_count_ignores_hidden_flag() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".hidden.txt"), "h").unwrap();
+    glep(dir.path()).arg("index").assert().success();
+    glep(dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("skipped (binary/oversized): 0"));
+}
+
+/// The whole point of --no-ignore: a plain query never sees a gitignored
+/// file (indexed path, rg semantics preserved), and --no-ignore does, via
+/// the live-scan bypass.
+#[test]
+fn default_query_does_not_find_gitignored_needle() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".gitignore"), "ignored.secret\n").unwrap();
+    std::fs::write(dir.path().join("ignored.secret"), "needle_gitignored\n").unwrap();
+    glep(dir.path()).arg("needle_gitignored").assert().code(1);
+}
+
+#[test]
+fn no_ignore_finds_gitignored_needle() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".gitignore"), "ignored.secret\n").unwrap();
+    std::fs::write(dir.path().join("ignored.secret"), "needle_gitignored\n").unwrap();
+    glep(dir.path())
+        .args(["--no-ignore", "needle_gitignored"])
+        .assert()
+        .success()
+        .stdout(p("ignored.secret:1:needle_gitignored\n"));
+}
+
+#[test]
+fn no_ignore_files_lists_the_ignored_file() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".gitignore"), "ignored.secret\n").unwrap();
+    std::fs::write(dir.path().join("ignored.secret"), "x\n").unwrap();
+    glep(dir.path())
+        .args(["--no-ignore", "--files"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ignored.secret"));
+    // The default, indexed --files listing must NOT show it.
+    glep(dir.path())
+        .arg("--files")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("ignored.secret").not());
+}
+
+/// .git/.glep are hard-excluded at sweep time regardless of ignore rules
+/// or the hidden flag (see walk.rs's is_hard_excluded_component); this
+/// must hold even under the live-scan --no-ignore path combined with
+/// --hidden, the most permissive combination glep supports.
+#[test]
+fn no_ignore_hidden_never_shows_dot_glep() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success(); // creates .glep/
+    let out = glep(dir.path())
+        .args(["--no-ignore", "--hidden", "--files"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(
+        !s.contains(".glep"),
+        ".glep must never appear even under --no-ignore --hidden: {s}"
+    );
+    assert!(
+        !s.lines().any(|l| l.split('/').any(|c| c == ".git")),
+        ".git must never appear even under --no-ignore --hidden: {s}"
+    );
+}
+
+/// Mirrors index/mod.rs's `read_only_update_writes_nothing_and_returns_
+/// fresh_paths` in spirit: a --no-ignore run must never open, update, or
+/// write the index at all, so the on-disk manifest and postings must be
+/// bit-identical before and after, and no delta.bin may appear.
+#[test]
+fn no_ignore_never_touches_the_index() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    let manifest_before = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+    let postings_before = std::fs::read(dir.path().join(".glep/postings.bin")).unwrap();
+
+    std::fs::write(dir.path().join(".gitignore"), "ignored.secret\n").unwrap();
+    std::fs::write(dir.path().join("ignored.secret"), "needle_no_ignore\n").unwrap();
+
+    glep(dir.path())
+        .args(["--no-ignore", "needle_no_ignore"])
+        .assert()
+        .success();
+    glep(dir.path()).args(["--no-ignore", "--files"]).assert().success();
+
+    let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
+    let postings_after = std::fs::read(dir.path().join(".glep/postings.bin")).unwrap();
+    assert_eq!(
+        manifest_before, manifest_after,
+        "--no-ignore run must not touch the manifest bytes"
+    );
+    assert_eq!(
+        postings_before, postings_after,
+        "--no-ignore run must not touch the postings bytes"
+    );
+    assert!(
+        !dir.path().join(".glep/delta.bin").exists(),
+        "--no-ignore run must not create a delta"
+    );
+}
+
+#[test]
+fn no_ignore_treats_subcommand_words_as_patterns() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("idx2.txt"), "the index word\n").unwrap();
+    glep(dir.path())
+        .args(["--no-ignore", "index"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("idx2.txt"));
+    assert!(
+        !dir.path().join(".glep").exists(),
+        "--no-ignore must not create an index"
+    );
+}
+
+#[test]
+fn no_ignore_composes_with_glob_filters() {
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+    std::fs::write(dir.path().join("vendor/dep.js"), "hello vendored\n").unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "vendor/\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--no-ignore", "-g", "*.js", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("dep.js"));
+    assert!(!s.contains("notes.txt"));
+}
+
+#[test]
+fn json_mode_emits_rg_summary_event() {
+    let dir = corpus();
+
+    // Match: exits 0, last stdout line parses as JSON with type "summary"
+    // and stats.matches >= 1.
+    let out = glep(dir.path())
+        .args(["--json", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let last = stdout.lines().last().expect("--json produced no output");
+    let summary: serde_json::Value = serde_json::from_str(last).expect("last line is valid JSON");
+    assert_eq!(summary["type"], "summary");
+    assert!(
+        summary["data"]["stats"]["matches"].as_u64().unwrap_or(0) >= 1,
+        "expected stats.matches >= 1, got {summary}"
+    );
+
+    // No match: rg still emits a summary event even when nothing matched
+    // (verified against real rg 15.1.0 before writing this test), and glep
+    // still exits 1, same as its existing no-match convention.
+    let out = glep(dir.path())
+        .args(["--json", "zzz_absent_zz"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    let last = stdout
+        .lines()
+        .last()
+        .expect("--json produced no output on no-match");
+    let summary: serde_json::Value = serde_json::from_str(last).expect("last line is valid JSON");
+    assert_eq!(summary["type"], "summary");
+}
+
+#[test]
+fn files_with_matches_conflicts_with_json() {
+    let dir = corpus();
+    glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
 }

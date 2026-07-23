@@ -41,6 +41,15 @@ fn corpus() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(dir.path().join("adjacent.txt"), "aXb\ncXd\naXb\ncXd\n").unwrap();
+    // Hidden-files fixture for --hidden: a .github-style nested hidden
+    // directory (ci.yml itself is not dot-prefixed, only its .github
+    // ancestor is) plus a plain top-level dotfile. Both carry a token that
+    // appears nowhere else in the corpus, so a --hidden search for it is
+    // unambiguous, and neither is matched by the .gitignore/.ignore rules
+    // above, so their visibility is governed purely by the hidden default.
+    std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: hiddentoken_ci\n").unwrap();
+    std::fs::write(dir.path().join(".hidden.txt"), "hiddentoken plain dotfile\n").unwrap();
     dir
 }
 
@@ -97,6 +106,28 @@ fn parity_with_ripgrep() {
         &["-c", "-C", "1", "hello"],
         &["-U", "goodbye\\nfoo"],
         &["-U", "-c", "a.b\\nc.d"],
+        // Hidden files invisible by default in both tools.
+        &["hiddentoken"],
+        // --hidden reveals them. The corpus has no .git dir, so plain
+        // `rg --hidden` (the rg_out helper's flags, no special-casing)
+        // matches glep's semantics exactly here; the divergence noted in
+        // README (.git always excluded from glep, not from rg --hidden) is
+        // a deliberate one this corpus does not exercise.
+        &["--hidden", "hiddentoken"],
+        // --no-ignore: skipme.log (gitignored) and skipme2.txt (.ignore'd)
+        // both carry "hello", invisible by default (see the plain "hello"
+        // case above, which the corpus fixture comment confirms excludes
+        // them) and visible once ignore sources are bypassed. Still hidden
+        // by default: no dotfile in the corpus contains "hello", so this
+        // case alone wouldn't catch a hidden-gating regression, but the
+        // dedicated tests/cli.rs cases do.
+        &["--no-ignore", "hello"],
+        &["--no-ignore", "-l", "hello"],
+        // --files listing under --no-ignore: rg ignores -n/--no-heading/
+        // --color for --files (verified manually against real rg), and
+        // --sort path still applies, so the harness's fixed rg flag set
+        // composes cleanly with --files --no-ignore for both tools.
+        &["--no-ignore", "--files"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

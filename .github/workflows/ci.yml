@@ -21,6 +21,7 @@ jobs:
         run: |
           cargo build
           PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
+          PATH="$PWD/target/debug:$PATH" cursor/hooks/test_hook.sh
       - name: em-dash ban
         shell: bash
         run: |

@@ -4,7 +4,7 @@
 
 <p align="center"><strong>Indexed grep + glob for AI agents.</strong></p>
 
-Ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21-298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s (21 ms in --ttl burst mode), with text output byte-compatible with ripgrep's, enforced by a 22-case differential harness in CI. No daemon.
+Ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21-298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s (21 ms in --ttl burst mode), with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
 
 ## Why
 
@@ -19,6 +19,8 @@ Coding agents call Grep and Glob dozens of times per session. On monorepo-scale 
 | Repeated glob listings: `glep --files` reads the manifest, no re-walk past the freshness sweep | Ephemeral CI runners where the index never persists between runs |
 | Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep lacks: replacements, PCRE2, compressed files |
 | Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
+
+`--hidden` includes dotfiles; `.git` itself is always excluded. `--no-ignore` always pays a full scan: it bypasses the index entirely (gitignore'd/.ignore'd trees must never enter the index), so it costs the same as `rg --no-ignore`, every time.
 
 ## Numbers
 
@@ -45,16 +47,20 @@ Default glep pays the self-healing freshness sweep (a stat of every file) on eac
 ```bash
 glep 'fn parse_intent' src/     # content search (Grep replacement)
 glep --files '**/*.py'          # glob listing (Glob replacement)
-glep --json 'pattern'           # machine-readable output for agents
+glep --json 'pattern'           # machine-readable output for agents (includes rg's closing summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
 glep -g '*.rs' -t rust ...      # glob and type filters
+glep --hidden 'TODO'            # include dotfiles (.git is always excluded)
+glep --no-ignore ...            # search ignored files too (live scan, index untouched)
 glep --ttl 5 ...                # skip the freshness sweep within a read burst
 glep --max-filesize 2000000 ... # raise the 1MB index cap
 glep index                      # explicit (re)build; lazy on first query
 glep status                     # index stats
 ```
+
+With an explicit path argument, bytes_printed in the summary can differ from rg's (rg prints ./-prefixed paths; glep prints them bare).
 
 Ships with a Claude Code skill and a PreToolUse hook that routes built-in Grep/Glob calls through glep automatically.
 
@@ -67,6 +73,8 @@ cargo install glep
 ```
 
 Claude Code integration (skill + hook): `claude/install.sh`.
+
+Cursor integration (hook): `cursor/install.sh`.
 
 ## Status
 

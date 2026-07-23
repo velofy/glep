@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "glep"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -288,6 +288,7 @@ dependencies = [
  "rayon",
  "regex-syntax",
  "serde",
+ "serde_json",
  "tempfile",
  "termcolor",
 ]
