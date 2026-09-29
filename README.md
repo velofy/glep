@@ -61,6 +61,8 @@ glep status                     # index stats
 
 With an explicit path argument, `bytes_printed` in the JSON summary can differ from rg's (rg prints `./`-prefixed paths; glep prints them bare).
 
+Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`). The index lives in `.glep/` in the directory you run glep from, so run it from the project root.
+
 ## When to use it
 
 Use glep for:
