@@ -1,53 +1,50 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/anishfyi/glep/main/assets/logo.svg" width="400" alt="glep">
-</p>
+![glep: indexed grep and glob](https://raw.githubusercontent.com/velofy/glep/main/assets/logo.svg)
 
-<p align="center"><strong>Indexed grep + glob for AI agents.</strong></p>
+**Indexed grep + glob for AI coding agents.**
 
-Ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21-298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s (21 ms in --ttl burst mode), with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
+[![PyPI](https://img.shields.io/pypi/v/glep)](https://pypi.org/project/glep/)
+[![crates.io](https://img.shields.io/crates/v/glep)](https://crates.io/crates/glep)
+[![CI](https://github.com/velofy/glep/actions/workflows/ci.yml/badge.svg)](https://github.com/velofy/glep/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/velofy/glep/blob/main/LICENSE)
 
-## Why
+Documentation: **https://velofy.co/glep/**
 
-Coding agents call Grep and Glob dozens of times per session. On monorepo-scale projects each call costs seconds. glep replaces both with index-backed equivalents built on ripgrep's own crates (`ignore`, `grep-searcher`, `regex-syntax`), so correctness is inherited, not reimplemented.
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21 to 298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s, with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
 
-## When to use it
+## Install
 
-| Use glep | Stick with rg / fd |
-|---|---|
-| Agent sessions firing dozens of searches over one repo (the bundled hook reroutes Grep/Glob) | One-off searches in a tree you will never search again |
-| Monorepos where rg takes 100ms+ per query; glep measured 21-298 ms at kernel scale | Small repos where rg already answers in under ~50ms |
-| Repeated glob listings: `glep --files` reads the manifest, no re-walk past the freshness sweep | Ephemeral CI runners where the index never persists between runs |
-| Read-heavy bursts with `--ttl 5` to amortize the freshness sweep | rg features glep lacks: replacements, PCRE2, compressed files |
-| Correctness-critical work: self-healing index, sound full-scan fallback | Corpora dominated by binaries or files over the 1MB cap (live-scanned anyway) |
+```bash
+pip install glep          # binary wheel, no Rust toolchain needed
+# or
+cargo install glep
+```
 
-`--hidden` includes dotfiles; `.git` itself is always excluded. `--no-ignore` always pays a full scan: it bypasses the index entirely (gitignore'd/.ignore'd trees must never enter the index), so it costs the same as `rg --no-ignore`, every time.
+`pipx install glep` and `uv tool install glep` also work. crates.io currently has 0.2.3; PyPI has 0.3.0. See [Installation](https://velofy.co/glep/installation/) for platforms and other routes.
 
-## Numbers
+## Example
 
-Linux kernel 6.12 checkout: 86,605 files, ~1.5 GB. Apple Silicon macOS, hyperfine medians, warm filesystem cache, rg and fd at their default parallelism.
+```bash
+cd your-project
+glep index                      # one-time build; lazy on first query anyway
+glep 'fn parse_intent' src/     # content search (Grep replacement)
+glep --files '**/*.py'          # glob listing (Glob replacement)
+```
 
-| Scenario | glep | glep --ttl 5 | ripgrep | fd |
-|---|---|---|---|---|
-| Rare pattern | 173 ms | 21 ms | 1.42 s | |
-| Common pattern (~10k matches) | 298 ms | 90 ms | 1.54 s | |
-| List all .c files (--files) | 242 ms | 44 ms | | 92 ms |
-| Index build (one-time) | 24 s | | | |
+## Features
 
-Default glep pays the self-healing freshness sweep (a stat of every file) on each query; `--ttl` amortizes it across read bursts. Index size: 154 MB, about 10% of the corpus. The parity harness pins byte-equality with rg's output; speed differs, bytes do not.
-
-## How it works
-
-- A file-level trigram inverted index (the Russ Cox / csearch model) lives in `.glep/`, memory-mapped, about 10% of corpus size measured on the kernel tree.
-- Every query self-heals: a fast parallel mtime sweep incrementally reindexes only what changed, then answers. No watcher, no background process.
-- The regex becomes a trigram plan, postings intersection yields a handful of candidate files, and ripgrep's searcher runs over just those.
-- Patterns trigrams can't narrow fall back to a full parallel scan: never a wrong answer, worst case is rg-speed.
+- **Trigram index** in `.glep/`, memory-mapped, about 10% of corpus size on the kernel tree.
+- **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
+- **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
+- **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
+- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore`.
+- **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface
 
 ```bash
 glep 'fn parse_intent' src/     # content search (Grep replacement)
 glep --files '**/*.py'          # glob listing (Glob replacement)
-glep --json 'pattern'           # machine-readable output for agents (includes rg's closing summary event)
+glep --json 'pattern'           # machine-readable output (includes rg's summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
@@ -60,22 +57,67 @@ glep index                      # explicit (re)build; lazy on first query
 glep status                     # index stats
 ```
 
-With an explicit path argument, bytes_printed in the summary can differ from rg's (rg prints ./-prefixed paths; glep prints them bare).
+`--no-ignore` always pays a full scan: it bypasses the index entirely, so gitignored trees never enter it. It costs the same as `rg --no-ignore`, every time.
 
-Ships with a Claude Code skill and a PreToolUse hook that routes built-in Grep/Glob calls through glep automatically.
+With an explicit path argument, `bytes_printed` in the JSON summary can differ from rg's (rg prints `./`-prefixed paths; glep prints them bare).
 
-## Install
+Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`). The index lives in `.glep/` in the directory you run glep from, so run it from the project root.
+
+## When to use it
+
+Use glep for:
+
+- Agent sessions firing dozens of searches over one repo (the bundled hooks reroute Grep/Glob).
+- Monorepos where rg takes 100 ms or more per query.
+- Repeated glob listings: `glep --files` reads the manifest, no re-walk past the freshness sweep.
+- Read-heavy bursts with `--ttl 5` to amortize the freshness sweep.
+- Correctness-critical work: self-healing index, sound full-scan fallback.
+
+Stick with rg / fd for:
+
+- One-off searches in a tree you will never search again.
+- Small repos where rg already answers in under about 50 ms.
+- Ephemeral CI runners where the index never persists between runs.
+- rg features glep lacks: replacements, PCRE2, compressed files.
+- Corpora dominated by binaries or files over the 1 MB cap (live-scanned anyway).
+
+## Numbers
+
+Linux kernel 6.12 checkout: 86,605 files, about 1.5 GB. Apple Silicon macOS, hyperfine medians, warm filesystem cache, rg and fd at their default parallelism.
+
+| Scenario | glep (glep --ttl 5) | rg / fd |
+|---|---|---|
+| Rare pattern | 173 ms (21 ms) | rg 1.42 s |
+| Common pattern, ~10k matches | 298 ms (90 ms) | rg 1.54 s |
+| List all .c files | 242 ms (44 ms) | fd 92 ms |
+
+Index build (one-time): 24 s. Index size: 154 MB. Default glep pays the freshness sweep (a stat of every file) on each query; `--ttl` amortizes it across read bursts. Details: [Benchmarks](https://velofy.co/glep/benchmarks/).
+
+## Documentation
+
+- [Overview](https://velofy.co/glep/)
+- [Installation](https://velofy.co/glep/installation/) and [Quickstart](https://velofy.co/glep/quickstart/)
+- [Indexing and freshness](https://velofy.co/glep/indexing/)
+- [Searching file contents](https://velofy.co/glep/content-search/) and [Listing files by name](https://velofy.co/glep/file-search/)
+- [Claude Code](https://velofy.co/glep/claude-code/) and [Cursor](https://velofy.co/glep/cursor/) integrations
+- [CLI reference](https://velofy.co/glep/cli-reference/) and [Output formats](https://velofy.co/glep/output-formats/)
+- [Changelog](https://velofy.co/glep/changelog/)
+
+Design spec: [docs/superpowers/specs/2026-07-14-glep-design.md](https://github.com/velofy/glep/blob/main/docs/superpowers/specs/2026-07-14-glep-design.md).
+
+## Contributing
+
+Issues and pull requests are welcome at https://github.com/velofy/glep. CI runs on Linux, macOS, and Windows:
 
 ```bash
-pip install glep          # binary wheel, no Rust toolchain needed
-# or
-cargo install glep
+cargo test --all                                  # parity tests need rg on PATH
+cargo build
+PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
+PATH="$PWD/target/debug:$PATH" cursor/hooks/test_hook.sh
 ```
 
-Claude Code integration (skill + hook): `claude/install.sh`.
+CI also rejects em dash and en dash characters anywhere in the repository.
 
-Cursor integration (hook): `cursor/install.sh`.
+## License
 
-## Status
-
-Spec: [docs/superpowers/specs/2026-07-14-glep-design.md](https://github.com/anishfyi/glep/blob/main/docs/superpowers/specs/2026-07-14-glep-design.md).
+MIT. See [LICENSE](https://github.com/velofy/glep/blob/main/LICENSE).
