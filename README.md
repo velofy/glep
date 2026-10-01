@@ -1,4 +1,9 @@
-![glep: indexed grep and glob](https://raw.githubusercontent.com/velofy/glep/main/assets/logo.svg)
+<p align="center">
+  <a href="https://velofy.co/glep/"><picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/velofy/glep/main/assets/tile-dark.svg">
+    <img alt="glep" src="https://raw.githubusercontent.com/velofy/glep/main/assets/tile-light.svg" width="360">
+  </picture></a>
+</p>
 
 **Indexed grep + glob for AI coding agents.**
 
