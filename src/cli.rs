@@ -3,6 +3,7 @@ use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
 use crate::timing::Timings;
 use crate::{plan, search, walk};
 use clap::Parser;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -113,6 +114,18 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_file_list(files: &[PathBuf]) -> anyhow::Result<i32> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    for f in files {
+        writeln!(out, "{}", f.display())?;
+    }
+    // Deferred write errors (e.g. closed pipe) must reach main, not vanish
+    // in BufWriter's Drop.
+    out.flush()?;
+    Ok(if files.is_empty() { 1 } else { 0 })
+}
+
 /// `--no-ignore`: content mode and `--files` mode both bypass the index
 /// entirely (no open, no update, no write, not even a read-only fallback
 /// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
@@ -141,11 +154,9 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
             files.retain(|f| glob.is_match(f));
         }
         apply_filters(&mut files, args)?;
-        for f in &files {
-            println!("{}", f.display());
-        }
+        let code = write_file_list(&files)?;
         timings.finish();
-        return Ok(if files.is_empty() { 1 } else { 0 });
+        return Ok(code);
     }
 
     let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
@@ -168,8 +179,9 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         multiline: args.multiline,
     };
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    let found = search::run(&pattern, root, &files, &opts, &mut out)?;
+    out.flush()?;
     timings.stage("search");
     timings.finish();
     Ok(if found { 0 } else { 1 })
@@ -246,11 +258,9 @@ pub fn run() -> anyhow::Result<i32> {
         }
         let args2 = Args { pattern: None, ..args };
         apply_filters(&mut files, &args2)?;
-        for f in &files {
-            println!("{}", f.display());
-        }
+        let code = write_file_list(&files)?;
         timings.finish();
-        return Ok(if files.is_empty() { 1 } else { 0 });
+        return Ok(code);
     }
 
     let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
@@ -279,8 +289,9 @@ pub fn run() -> anyhow::Result<i32> {
         multiline: args.multiline,
     };
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    let found = search::run(&pattern, &root, &files, &opts, &mut out)?;
+    out.flush()?;
     timings.stage("search");
     timings.finish();
     Ok(if found { 0 } else { 1 })

@@ -480,3 +480,44 @@ fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
 }
+
+/// `glep needle | head -1`: the reader closing the pipe mid-stream turns
+/// our next write into EPIPE; rg treats that as a clean exit (0, silent)
+/// and so must glep. The corpus file is ~3 MB, far past any OS pipe
+/// buffer, so the write side is guaranteed to still have pending output
+/// when the read end is dropped.
+#[test]
+fn broken_pipe_exits_zero_silently() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut contents = String::new();
+    for i in 1..=200_000 {
+        contents.push_str(&format!("needle line {i}\n"));
+    }
+    std::fs::write(dir.path().join("big.txt"), contents).unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("glep"))
+        .current_dir(dir.path())
+        .arg("needle")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "big.txt:1:needle line 1\n");
+    drop(stdout);
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "stderr was: {stderr}");
+    assert!(stderr.is_empty(), "expected silent exit, got: {stderr}");
+}
