@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"GLEPPOST";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER: usize = 24; // magic 8 + version 4 + count 4 + generation 8
 const ENTRY: usize = 16; // trigram 4 + offset 8 + len 4
 

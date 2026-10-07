@@ -50,6 +50,17 @@ fn corpus() -> tempfile::TempDir {
     std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
     std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: hiddentoken_ci\n").unwrap();
     std::fs::write(dir.path().join(".hidden.txt"), "hiddentoken plain dotfile\n").unwrap();
+    // UTF-16LE with BOM: rg auto-transcodes and searches it, so glep must
+    // too (its NUL-heavy raw bytes must not mark it binary). bin.dat is
+    // NUL-heavy with no BOM: binary in both tools, invisible by default.
+    // "utf16token" appears nowhere else, giving it a unique needle.
+    let mut u16le = vec![0xFF, 0xFE];
+    for b in "hello utf16token\n".bytes() {
+        u16le.push(b);
+        u16le.push(0);
+    }
+    std::fs::write(dir.path().join("utf16le.txt"), &u16le).unwrap();
+    std::fs::write(dir.path().join("bin.dat"), b"hello\x00\x01\x02bin\n").unwrap();
     dir
 }
 
@@ -104,6 +115,12 @@ fn parity_with_ripgrep() {
         &["-c", "hello"],
         &["-c", "-i", "HELLO"],
         &["-c", "-C", "1", "hello"],
+        // utf16token lives only in utf16le.txt (UTF-16LE + BOM): rg
+        // transcodes and finds it; bin.dat contains "hello" but is binary
+        // and stays invisible, which the "hello" cases above also pin.
+        &["utf16token"],
+        &["-c", "utf16token"],
+        &["-l", "utf16token"],
         &["-U", "goodbye\\nfoo"],
         &["-U", "-c", "a.b\\nc.d"],
         // Hidden files invisible by default in both tools.

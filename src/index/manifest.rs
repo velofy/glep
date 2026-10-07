@@ -12,6 +12,11 @@ pub const FLAG_DEAD: u8 = 4;
 /// next sweep after upgrade and picks up the flag through the normal
 /// add-new-file path, no format bump required.
 pub const FLAG_HIDDEN: u8 = 8;
+/// UTF-16 BOM file: NUL-heavy raw bytes, but the searcher transcodes it on
+/// scan (rg semantics), so it is never indexed and always a live-scan
+/// candidate. Bumping postings VERSION to 3 forces a rebuild because
+/// pre-v3 indexes marked these FLAG_SKIP_BINARY and hid them entirely.
+pub const FLAG_TRANSCODE: u8 = 16;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
