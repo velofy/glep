@@ -229,9 +229,11 @@ pub fn run() -> anyhow::Result<i32> {
     // this sweep that couldn't be written into the index because another
     // process holds the lock. They carry no FLAG_HIDDEN of their own (no
     // manifest entry yet), so apply the same rg-matching default here too:
-    // hidden unless --hidden was passed.
+    // hidden unless --hidden was passed, with the same whitelist rescue
+    // the indexed path uses.
     if !args.hidden {
-        extra.retain(|p| !walk::path_is_hidden(p));
+        let mut wl = walk::WhitelistChecker::new();
+        extra.retain(|p| !wl.is_hidden(&root, p));
     }
 
     if args.files {

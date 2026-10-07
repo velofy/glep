@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkState};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,9 +42,16 @@ fn component_is_hidden(name: &std::ffi::OsStr) -> bool {
 /// True when any component of a sweep-relative path starts with '.', e.g.
 /// both `.env` and `.github/workflows/ci.yml` (the second via its `.github`
 /// ancestor, even though `ci.yml` itself is not dot-prefixed). This is the
-/// rule `FileMeta::hidden` is computed from, and it is also used to filter
-/// paths that bypass the index entirely (the read-only live-scan fallback
-/// in `Index::update`), so the two stay consistent.
+/// name-only half of the hidden rule; the second half — whether a `!`
+/// whitelist rule in an ignore file rescues a dot component, in which
+/// case the path isn't hidden at all — is `WhitelistChecker` below. The
+/// `ignore` crate applies its own leaf-name hidden check only when the
+/// ignore matchers return no verdict for a path, so a whitelisted
+/// `.clang-format` is an ordinary file; likewise a whitelisted `.github/`
+/// dir is descended into and its children judged by their own names. To
+/// mirror that on our flat yield-everything sweep, a path stays hidden
+/// only if EVERY dot-prefixed prefix of it fails to earn a whitelist
+/// verdict.
 pub fn path_is_hidden(rel: &Path) -> bool {
     rel.components().any(|c| match c {
         std::path::Component::Normal(s) => component_is_hidden(s),
@@ -50,10 +59,147 @@ pub fn path_is_hidden(rel: &Path) -> bool {
     })
 }
 
+/// Per-directory matcher set for whitelist checks, lazily built on first
+/// use so the loading cost attaches only to directories that actually
+/// contain dot-prefixed entries.
+#[derive(Default)]
+struct DirMatchers {
+    ignore: Option<Gitignore>,
+    gitignore: Option<Gitignore>,
+    git_exclude: Option<Gitignore>,
+}
+
+/// Whitelist rescue check for hidden candidates. One instance per sweep
+/// worker; also usable standalone (cli's extra-file path) since
+/// construction is free and every matcher load is lazily cached.
+pub struct WhitelistChecker {
+    /// Keyed by the directory's path relative to the sweep root ("" is the
+    /// root itself).
+    dirs: HashMap<PathBuf, DirMatchers>,
+    global_loaded: bool,
+    global: Option<Gitignore>,
+}
+
+impl Default for WhitelistChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WhitelistChecker {
+    pub fn new() -> Self {
+        WhitelistChecker {
+            dirs: HashMap::new(),
+            global_loaded: false,
+            global: None,
+        }
+    }
+
+    fn dir_matchers(&mut self, root: &Path, dir_rel: &Path) -> &DirMatchers {
+        self.dirs.entry(dir_rel.to_path_buf()).or_insert_with(|| {
+            let dir_abs = root.join(dir_rel);
+            let load = |name: &str| -> Option<Gitignore> {
+                let file = dir_abs.join(name);
+                if !file.is_file() {
+                    return None;
+                }
+                let mut b = GitignoreBuilder::new(dir_rel);
+                if b.add(file).is_some() {
+                    return None; // unreadable/invalid file: contributes nothing
+                }
+                b.build().ok()
+            };
+            let git_exclude = if dir_abs.join(".git").exists() {
+                load(".git/info/exclude")
+            } else {
+                None
+            };
+            DirMatchers {
+                ignore: load(".ignore"),
+                gitignore: load(".gitignore"),
+                git_exclude,
+            }
+        })
+    }
+
+    /// The ignore chain's verdict for `rel` (a root-relative path) as the
+    /// `ignore` crate would compute it: per-source, the deepest directory
+    /// level with a non-None verdict wins; then .ignore beats .gitignore
+    /// beats git-exclude beats global excludes. Matchers are rooted at
+    /// their own directory, and `matched` strips the dir prefix itself.
+    fn verdict(&mut self, root: &Path, rel: &Path, is_dir: bool) -> ignore::Match<()> {
+        let mut m_ignore = ignore::Match::None;
+        let mut m_gi = ignore::Match::None;
+        let mut m_excl = ignore::Match::None;
+        // Enclosing dirs of `rel`, deepest first ("" = the sweep root).
+        let mut dir = rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        loop {
+            let dm = self.dir_matchers(root, &dir);
+            if m_ignore.is_none() {
+                if let Some(g) = &dm.ignore {
+                    m_ignore = g.matched(rel, is_dir).map(|_| ());
+                }
+            }
+            if m_gi.is_none() {
+                if let Some(g) = &dm.gitignore {
+                    m_gi = g.matched(rel, is_dir).map(|_| ());
+                }
+            }
+            if m_excl.is_none() {
+                if let Some(g) = &dm.git_exclude {
+                    m_excl = g.matched(rel, is_dir).map(|_| ());
+                }
+            }
+            if dir.as_os_str().is_empty()
+                || (!m_ignore.is_none() && !m_gi.is_none() && !m_excl.is_none())
+            {
+                break;
+            }
+            dir = dir.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        }
+        if !self.global_loaded {
+            self.global_loaded = true;
+            self.global = Some(Gitignore::global().0);
+        }
+        let m_global = self
+            .global
+            .as_ref()
+            .map(|g| g.matched(rel, is_dir).map(|_| ()))
+            .unwrap_or(ignore::Match::None);
+        m_ignore.or(m_gi).or(m_excl).or(m_global)
+    }
+
+    /// Effective hiddenness for a yielded path, rg semantics: hidden iff
+    /// some dot-prefixed prefix of `rel` is not rescued by a whitelist.
+    /// `.clang-format` with `!.clang-format` is visible; children of a
+    /// whitelisted `.github/` are visible; `.github/.env` (a second dot
+    /// component of its own) still needs its own rescue.
+    pub fn is_hidden(&mut self, root: &Path, rel: &Path) -> bool {
+        if !path_is_hidden(rel) {
+            return false;
+        }
+        let mut p = rel;
+        loop {
+            if p.file_name().is_some_and(|n| component_is_hidden(n))
+                && !self.verdict(root, p, p != rel).is_whitelist()
+            {
+                return true;
+            }
+            match p.parent() {
+                Some(parent) => p = parent,
+                None => return false,
+            }
+        }
+    }
+}
+
 /// Builds one `Collector` per worker thread, each with its own local buffer.
 struct CollectorBuilder<'a> {
     root: &'a Path,
     global: &'a Mutex<Vec<FileMeta>>,
+    /// False on the --no-ignore sweep: with ignore rules disabled there is
+    /// no whitelist to consult, and hidden-ness is purely name-based.
+    whitelists: bool,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for CollectorBuilder<'s> {
@@ -62,6 +208,8 @@ impl<'s> ParallelVisitorBuilder<'s> for CollectorBuilder<'s> {
             root: self.root,
             local: Vec::new(),
             global: self.global,
+            whitelists: self.whitelists,
+            whitelist: WhitelistChecker::new(),
         })
     }
 }
@@ -72,6 +220,8 @@ struct Collector<'a> {
     root: &'a Path,
     local: Vec<FileMeta>,
     global: &'a Mutex<Vec<FileMeta>>,
+    whitelists: bool,
+    whitelist: WhitelistChecker,
 }
 
 impl ParallelVisitor for Collector<'_> {
@@ -91,7 +241,11 @@ impl ParallelVisitor for Collector<'_> {
                             .strip_prefix(self.root)
                             .unwrap_or(e.path())
                             .to_path_buf();
-                        let hidden = path_is_hidden(&rel);
+                        let hidden = if self.whitelists {
+                            self.whitelist.is_hidden(self.root, &rel)
+                        } else {
+                            path_is_hidden(&rel)
+                        };
                         self.local.push(FileMeta {
                             path: rel,
                             mtime_ns,
@@ -168,6 +322,7 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: true,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -218,6 +373,7 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: false,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -688,5 +844,19 @@ mod tests {
                 ]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wl_debug {
+    #[test]
+    fn dbg_whitelist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x\n").unwrap();
+        let mut wl = super::WhitelistChecker::new();
+        eprintln!("gitignore hidden={}", wl.is_hidden(dir.path(), std::path::Path::new(".gitignore")));
+        eprintln!("b hidden={}", wl.is_hidden(dir.path(), std::path::Path::new("b.txt")));
+        eprintln!("verdict={:?}", wl.verdict(dir.path(), std::path::Path::new(".gitignore"), false));
     }
 }
