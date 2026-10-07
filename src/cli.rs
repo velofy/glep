@@ -18,7 +18,7 @@ pub struct Args {
     /// List files matching a glob instead of searching content
     #[arg(long)]
     pub files: bool,
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long, overrides_with = "smart_case")]
     pub ignore_case: bool,
     #[arg(short = 'F', long)]
     pub fixed_strings: bool,
@@ -54,6 +54,40 @@ pub struct Args {
     /// that guarantee. .git/.glep are still always excluded.
     #[arg(long)]
     pub no_ignore: bool,
+    /// Match only whole words
+    #[arg(short = 'w', long = "word-regexp", overrides_with = "line_regexp")]
+    pub word_regexp: bool,
+    /// Match only whole lines
+    #[arg(short = 'x', long = "line-regexp", overrides_with = "word_regexp")]
+    pub line_regexp: bool,
+    /// Case-insensitive only when the pattern has no uppercase chars
+    #[arg(short = 'S', long = "smart-case", overrides_with = "ignore_case")]
+    pub smart_case: bool,
+    /// Match lines that do NOT match the pattern
+    #[arg(short = 'v', long = "invert-match")]
+    pub invert_match: bool,
+    /// Stop after NUM matching lines per file
+    #[arg(short = 'm', long = "max-count", value_name = "NUM")]
+    pub max_count: Option<u64>,
+    /// Replace lines longer than NUM bytes with an omission note
+    #[arg(short = 'M', long = "max-columns", value_name = "NUM")]
+    pub max_columns: Option<u64>,
+    /// Print only the matched part of each matching line
+    #[arg(short = 'o', long = "only-matching")]
+    pub only_matching: bool,
+    /// Show line numbers (already the default; accepted for rg parity)
+    #[arg(short = 'n', long = "line-number", overrides_with = "no_line_number")]
+    pub line_number: bool,
+    /// Suppress line numbers
+    #[arg(short = 'N', long = "no-line-number", overrides_with = "line_number")]
+    pub no_line_number: bool,
+    /// Print each file's path on its own line above its matches
+    #[arg(long)]
+    pub heading: bool,
+    /// Suppress all output; the exit code alone reports whether a match
+    /// exists (--json still emits the closing summary event, like rg)
+    #[arg(short = 'q', long = "quiet")]
+    pub quiet: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -113,6 +147,32 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn search_opts(args: &Args) -> search::SearchOpts {
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
+    search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before,
+        after,
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+        word: args.word_regexp,
+        line_regexp: args.line_regexp,
+        smart_case: args.smart_case,
+        invert: args.invert_match,
+        max_count: args.max_count,
+        // -M0 means no limit in rg.
+        max_columns: args.max_columns.filter(|&n| n > 0),
+        line_number: !args.no_line_number,
+        heading: args.heading,
+        only_matching: args.only_matching,
+        quiet: args.quiet,
+    }
+}
+
 /// `--no-ignore`: content mode and `--files` mode both bypass the index
 /// entirely (no open, no update, no write, not even a read-only fallback
 /// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
@@ -155,18 +215,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
     apply_filters(&mut files, args)?;
     timings.stage("candidates");
 
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
-    let opts = search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
-        files_with_matches: args.files_with_matches,
-        before,
-        after,
-        json: args.json,
-        count: args.count,
-        multiline: args.multiline,
-    };
+    let opts = search_opts(&args);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
@@ -257,27 +306,26 @@ pub fn run() -> anyhow::Result<i32> {
         Some(p) => p,
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
-    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    // -S resolves case per-pattern at match time (an inline (?i) wins), so
+    // for narrowing it is treated as case-insensitive unconditionally: the
+    // case-variant union is a superset of whatever the matcher resolves to.
+    let plan_ic = args.ignore_case || args.smart_case;
+    // Under -v even a file with zero occurrences of the literals has all of
+    // its lines "match", so trigram narrowing is unsound; scan everything.
+    let query_plan = if args.invert_match {
+        plan::Plan::All
+    } else {
+        plan::build(&pattern, args.fixed_strings, plan_ic)
+    };
     timings.stage("plan");
-    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
+    let mut files = idx.candidates(&query_plan, plan_ic, args.hidden);
     files.extend(extra);
     files.sort();
     files.dedup();
     apply_filters(&mut files, &args)?;
     timings.stage("candidates");
 
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
-    let opts = search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
-        files_with_matches: args.files_with_matches,
-        before,
-        after,
-        json: args.json,
-        count: args.count,
-        multiline: args.multiline,
-    };
+    let opts = search_opts(&args);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
