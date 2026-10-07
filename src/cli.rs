@@ -1,5 +1,5 @@
 use crate::index::Index;
-use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
 use crate::timing::Timings;
 use crate::{plan, search, walk};
 use clap::Parser;
@@ -204,11 +204,11 @@ pub fn run() -> anyhow::Result<i32> {
                     .manifest
                     .live_entries()
                     .filter(|e| {
-                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0
+                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE | FLAG_TRANSCODE) != 0
                     })
                     .count();
                 println!("files: {live}");
-                println!("skipped (binary/oversized): {skipped}");
+                println!("skipped (binary/oversized/utf16): {skipped}");
                 println!("last sweep epoch: {}", idx.manifest.last_sweep_epoch);
                 return Ok(0);
             }

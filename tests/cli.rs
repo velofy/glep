@@ -295,7 +295,7 @@ fn status_skipped_count_ignores_hidden_flag() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("skipped (binary/oversized): 0"));
+        .stdout(predicates::str::contains("skipped (binary/oversized/utf16): 0"));
 }
 
 /// The whole point of --no-ignore: a plain query never sees a gitignored

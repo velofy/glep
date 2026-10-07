@@ -6,7 +6,9 @@ use crate::timing::Timings;
 use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
-use manifest::{Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use manifest::{
+    Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE,
+};
 use postings::Postings;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +53,11 @@ fn index_file(
         Ok(c) => c,
         Err(_) => return FLAG_SKIP_TOO_LARGE, // unreadable: treat as live-scan-only
     };
+    // A UTF-16 BOM precedes any NUL, so this check must come before the
+    // binary sniff: raw UTF-16 bytes are NUL-heavy but the file is text.
+    if content.starts_with(&[0xFF, 0xFE]) || content.starts_with(&[0xFE, 0xFF]) {
+        return FLAG_TRANSCODE;
+    }
     let sniff = &content[..content.len().min(8192)];
     if sniff.contains(&0) {
         return FLAG_SKIP_BINARY;
@@ -235,7 +242,7 @@ impl Index {
                 union.extend(
                     self.manifest
                         .live_entries()
-                        .filter(|e| e.flags & FLAG_SKIP_TOO_LARGE != 0)
+                        .filter(|e| e.flags & (FLAG_SKIP_TOO_LARGE | FLAG_TRANSCODE) != 0)
                         .map(|e| e.id),
                 );
                 union.sort_unstable();
@@ -535,6 +542,63 @@ mod tests {
             idx.candidates(&plan2, false, false),
             vec![std::path::PathBuf::from("a.txt")]
         );
+    }
+
+    /// UTF-16 BOM files are live-scan-only: raw bytes are NUL-heavy so a
+    /// binary flag would hide them, but postings would pollute the index.
+    #[test]
+    fn utf16_bom_files_are_transcode_flagged_and_always_candidates() {
+        let dir = corpus();
+        let mut u16le = vec![0xFF, 0xFE];
+        for b in "needle utf16\n".bytes() {
+            u16le.push(b);
+            u16le.push(0);
+        }
+        std::fs::write(dir.path().join("u16.txt"), &u16le).unwrap();
+        let mut u16be = vec![0xFE, 0xFF];
+        for b in "needle utf16\n".bytes() {
+            u16be.push(0);
+            u16be.push(b);
+        }
+        std::fs::write(dir.path().join("u16be.txt"), &u16be).unwrap();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let by_path = |p: &str| {
+            idx.manifest
+                .entries
+                .iter()
+                .find(|e| e.path.to_string_lossy() == p)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_path("u16.txt").flags, manifest::FLAG_TRANSCODE);
+        assert_eq!(by_path("u16be.txt").flags, manifest::FLAG_TRANSCODE);
+        let plan = crate::plan::build("needle", true, false);
+        let c = idx.candidates(&plan, false, false);
+        assert!(c.contains(&std::path::PathBuf::from("u16.txt")));
+        assert!(c.contains(&std::path::PathBuf::from("u16be.txt")));
+        let c = idx.candidates(&crate::plan::Plan::All, false, false);
+        assert!(c.contains(&std::path::PathBuf::from("u16.txt")));
+        // The searcher transcodes on scan, so a candidate is a real match.
+        let opts = crate::search::SearchOpts {
+            case_insensitive: false,
+            fixed: false,
+            files_with_matches: false,
+            before: 0,
+            after: 0,
+            json: false,
+            count: false,
+            multiline: false,
+        };
+        let mut out = Vec::new();
+        assert!(crate::search::run(
+            "needle",
+            dir.path(),
+            &[std::path::PathBuf::from("u16.txt")],
+            &opts,
+            &mut out
+        )
+        .unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), "u16.txt:1:needle utf16\n");
     }
 
     #[test]
