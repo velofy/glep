@@ -50,6 +50,12 @@ fn corpus() -> tempfile::TempDir {
     std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
     std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: hiddentoken_ci\n").unwrap();
     std::fs::write(dir.path().join(".hidden.txt"), "hiddentoken plain dotfile\n").unwrap();
+    // Binary fixtures: `binnul.bin` has a NUL before the pattern token, so
+    // under quit detection the file reports nothing while -a prints raw
+    // lines and --binary prints the binary-matches notice. `binpre.bin`
+    // carries a match BEFORE the NUL to cover the suppression case.
+    std::fs::write(dir.path().join("binnul.bin"), b"all\x00binary\x00here\n").unwrap();
+    std::fs::write(dir.path().join("binpre.bin"), b"match before\nnul\x00after\n").unwrap();
     dir
 }
 
@@ -123,6 +129,22 @@ fn parity_with_ripgrep() {
         // dedicated tests/cli.rs cases do.
         &["--no-ignore", "hello"],
         &["--no-ignore", "-l", "hello"],
+        // Binary files: default quit detection suppresses them entirely
+        // (even a match before the NUL); --binary reports the notice;
+        // -a prints raw bytes. -c/-l under --binary report real results.
+        &["binary"],
+        &["--binary", "binary"],
+        &["--binary", "-l", "binary"],
+        &["--binary", "-c", "binary"],
+        &["-a", "binary"],
+        &["-a", "-c", "binary"],
+        &["-a", "-l", "binary"],
+        &["match"],
+        &["--binary", "match"],
+        &["-a", "match"],
+        // Last-wins pair: -a --binary behaves as --binary.
+        &["-a", "--binary", "binary"],
+        &["--binary", "-a", "binary"],
         // --files listing under --no-ignore: rg ignores -n/--no-heading/
         // --color for --files (verified manually against real rg), and
         // --sort path still applies, so the harness's fixed rg flag set
