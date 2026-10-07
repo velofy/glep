@@ -35,6 +35,30 @@ fn new_generation() -> u64 {
         .unwrap_or(1)
 }
 
+/// Intersect two sorted, deduped id lists, keeping the result in `acc`.
+/// Per-element binary search when `acc` is much smaller than `next`;
+/// otherwise a linear merge pass writes survivors in place.
+fn intersect_sorted(acc: &mut Vec<u32>, next: &[u32]) {
+    if acc.len() * 8 < next.len() {
+        acc.retain(|id| next.binary_search(id).is_ok());
+        return;
+    }
+    let (mut i, mut j, mut w) = (0usize, 0usize, 0usize);
+    while i < acc.len() && j < next.len() {
+        match acc[i].cmp(&next[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                acc[w] = acc[i];
+                w += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    acc.truncate(w);
+}
+
 /// Read content and record trigrams unless the file is skip-flagged.
 /// Returns the flags to store for this entry.
 fn index_file(
@@ -195,6 +219,23 @@ impl Index {
         ids
     }
 
+    /// Total stored blob bytes for a trigram across case variants (when
+    /// `ci`) and main+delta, without decoding any postings.
+    fn postings_len(&self, tri: u32, ci: bool) -> usize {
+        let tris = if ci {
+            trigram::case_variants(tri)
+        } else {
+            vec![tri]
+        };
+        let mut len = 0;
+        for t in tris {
+            for seg in [self.main.as_ref(), self.delta.as_ref()].into_iter().flatten() {
+                len += seg.blob_len(t);
+            }
+        }
+        len
+    }
+
     fn is_live(&self, id: u32) -> bool {
         self.manifest
             .entries
@@ -217,17 +258,25 @@ impl Index {
             Plan::Groups(groups) => {
                 let mut union: Vec<u32> = Vec::new();
                 for group in groups {
-                    let mut iter = group.iter();
-                    let mut acc = match iter.next() {
-                        Some(&t) => self.postings_for(t, case_insensitive),
-                        None => continue,
-                    };
-                    for &t in iter {
+                    // Intersect rarest-first: sorting by stored blob length
+                    // starts from the narrowest list and skips decoding a
+                    // group entirely when some trigram is absent.
+                    let mut keyed: Vec<(u32, usize)> = group
+                        .iter()
+                        .map(|&t| (t, self.postings_len(t, case_insensitive)))
+                        .collect();
+                    keyed.sort_by_key(|&(_, len)| len);
+                    if keyed.first().map_or(true, |&(_, len)| len == 0) {
+                        continue;
+                    }
+                    let mut iter = keyed.iter().map(|&(t, _)| t);
+                    let mut acc = self.postings_for(iter.next().unwrap(), case_insensitive);
+                    for t in iter {
                         if acc.is_empty() {
                             break;
                         }
                         let next = self.postings_for(t, case_insensitive);
-                        acc.retain(|id| next.binary_search(id).is_ok());
+                        intersect_sorted(&mut acc, &next);
                     }
                     union.extend(acc);
                 }
@@ -286,30 +335,28 @@ impl Index {
         if let Some(t) = &mut timings {
             t.stage("sweep_walk");
         }
-        let id_by_path: std::collections::HashMap<&Path, u32> = self
-            .manifest
-            .live_entries()
-            .map(|e| (e.path.as_path(), e.id))
-            .collect();
-        let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
-            .manifest
-            .live_entries()
-            .map(|e| (e.path.as_path(), e))
-            .collect();
+        let mut by_path: std::collections::HashMap<&std::ffi::OsStr, &manifest::FileEntry> =
+            std::collections::HashMap::with_capacity(self.manifest.live_entries().count());
+        by_path.extend(
+            self.manifest
+                .live_entries()
+                .map(|e| (e.path.as_os_str(), e)),
+        );
 
         let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed
+        let mut changed_old_ids: Vec<u32> = Vec::new();
         for meta in &swept {
-            match by_path.remove(meta.path.as_path()) {
+            match by_path.remove(meta.path.as_os_str()) {
                 Some(e) if e.mtime_ns == meta.mtime_ns && e.size == meta.size => {}
-                _ => fresh.push(meta.clone()),
+                Some(e) => {
+                    fresh.push(meta.clone());
+                    changed_old_ids.push(e.id);
+                }
+                None => fresh.push(meta.clone()),
             }
         }
         // whatever remains in by_path was deleted from disk
         let dead_ids: Vec<u32> = by_path.values().map(|e| e.id).collect();
-        let changed_old_ids: Vec<u32> = fresh
-            .iter()
-            .filter_map(|m| id_by_path.get(m.path.as_path()).copied())
-            .collect();
         if let Some(t) = &mut timings {
             t.stage("sweep_diff");
         }
@@ -515,6 +562,38 @@ mod tests {
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let c = idx.candidates(&crate::plan::Plan::All, false, false);
         assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
+    }
+
+    #[test]
+    fn intersect_sorted_linear_merge_on_similar_sizes() {
+        let mut acc = vec![1, 3, 5, 7, 9];
+        intersect_sorted(&mut acc, &[1, 2, 3, 8, 9]);
+        assert_eq!(acc, vec![1, 3, 9]);
+        // equal sizes take the merge branch; identical lists keep all
+        let mut acc = vec![1, 2, 3];
+        intersect_sorted(&mut acc, &[1, 2, 3]);
+        assert_eq!(acc, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn intersect_sorted_gallops_when_next_dwarfs_acc() {
+        let next: Vec<u32> = (0..1000).collect();
+        let mut acc = vec![3, 500, 999, 2000];
+        intersect_sorted(&mut acc, &next);
+        assert_eq!(acc, vec![3, 500, 999]);
+    }
+
+    #[test]
+    fn intersect_sorted_empty_and_disjoint() {
+        let mut acc: Vec<u32> = Vec::new();
+        intersect_sorted(&mut acc, &[1, 2, 3]);
+        assert!(acc.is_empty());
+        let mut acc = vec![1, 2, 3];
+        intersect_sorted(&mut acc, &[]);
+        assert!(acc.is_empty());
+        let mut acc = vec![1, 2, 3];
+        intersect_sorted(&mut acc, &[10, 20]);
+        assert!(acc.is_empty());
     }
 
     #[test]

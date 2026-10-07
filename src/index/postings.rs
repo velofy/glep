@@ -120,7 +120,9 @@ impl Postings {
         (tri, off, len)
     }
 
-    pub fn lookup(&self, trigram: u32) -> Option<Vec<u32>> {
+    /// Position of a trigram's blob as (offset, length) in the blob
+    /// region, or None if the table has no entry for it.
+    fn find(&self, trigram: u32) -> Option<(usize, usize)> {
         let (mut lo, mut hi) = (0usize, self.n);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -137,6 +139,17 @@ impl Postings {
         if tri != trigram {
             return None;
         }
+        Some((off, len))
+    }
+
+    /// Stored byte length of a trigram's posting blob (0 if absent),
+    /// without decoding it.
+    pub fn blob_len(&self, trigram: u32) -> usize {
+        self.find(trigram).map_or(0, |(_, len)| len)
+    }
+
+    pub fn lookup(&self, trigram: u32) -> Option<Vec<u32>> {
+        let (off, len) = self.find(trigram)?;
         let blob_start = HEADER + self.n * ENTRY;
         let mut slice = &self.mmap[blob_start + off..blob_start + off + len];
         let mut ids = Vec::new();
