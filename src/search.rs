@@ -161,19 +161,23 @@ impl grep_searcher::Sink for CountSink<'_> {
     }
 }
 
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
-    root: &Path,
-    rel: &Path,
-    opts: &SearchOpts,
-) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = SearcherBuilder::new()
+fn build_searcher(opts: &SearchOpts) -> grep_searcher::Searcher {
+    SearcherBuilder::new()
         .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
         .multi_line(opts.multiline)
-        .build();
+        .build()
+}
+
+fn search_one(
+    searcher: &mut grep_searcher::Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    root: &Path,
+    rel: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     let full = root.join(rel);
     if opts.count {
         let mut sink = CountSink {
@@ -236,30 +240,30 @@ pub fn run(
     let separate =
         (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
     let mut printed_any = false;
-    let mut base = 0usize;
     let mut total_stats = grep_printer::Stats::new();
     for chunk in files.chunks(128) {
-        let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
+        // Indexed parallel iterators collect in input order.
+        let results: Vec<(Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
-            .enumerate()
-            .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
-                Ok((buf, matched, stats)) => (i, buf, matched, stats),
-                Err(e) => {
-                    eprintln!("glep: {}: {}", rel.display(), e);
-                    (i, Vec::new(), false, None)
-                }
-            })
+            .map_init(
+                || build_searcher(opts),
+                |searcher, rel| match search_one(searcher, &matcher, root, rel, opts) {
+                    Ok((buf, matched, stats)) => (buf, matched, stats),
+                    Err(e) => {
+                        eprintln!("glep: {}: {}", rel.display(), e);
+                        (Vec::new(), false, None)
+                    }
+                },
+            )
             .collect();
-        results.sort_by_key(|(i, _, _, _)| *i);
-        for (i, buf, matched, stats) in results {
+        for (rel, (buf, matched, stats)) in chunk.iter().zip(results) {
             if let Some(s) = &stats {
                 merge_stats(&mut total_stats, s);
             }
             if matched {
                 found = true;
-                let global_i = base + i;
                 if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
+                    writeln!(out, "{}", rel.display())?;
                 } else {
                     if separate && printed_any {
                         writeln!(out, "--")?;
@@ -269,7 +273,6 @@ pub fn run(
                 }
             }
         }
-        base += chunk.len();
     }
     if opts.json {
         // Per design: both `elapsed_total` and `stats.elapsed` are filled

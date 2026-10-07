@@ -236,9 +236,12 @@ pub fn run() -> anyhow::Result<i32> {
 
     if args.files {
         let mut files = idx.live_files(args.hidden);
+        let has_extra = !extra.is_empty();
         files.extend(extra);
-        files.sort();
-        files.dedup();
+        if has_extra {
+            files.sort();
+            files.dedup();
+        }
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
             let glob = build_glob(g)?;
@@ -260,9 +263,12 @@ pub fn run() -> anyhow::Result<i32> {
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     timings.stage("plan");
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
+    let has_extra = !extra.is_empty();
     files.extend(extra);
-    files.sort();
-    files.dedup();
+    if has_extra {
+        files.sort();
+        files.dedup();
+    }
     apply_filters(&mut files, &args)?;
     timings.stage("candidates");
 
