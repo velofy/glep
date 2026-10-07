@@ -14,7 +14,7 @@
 
 Documentation: **https://velofy.co/glep/**
 
-ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21 to 298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s, with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 21 to 298 ms on a Linux-kernel-sized tree where ripgrep takes 1.4 s, with text output byte-compatible with ripgrep's, enforced by a 58-case differential harness in CI. No daemon.
 
 ## Install
 
@@ -41,7 +41,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 - **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
-- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore`.
+- **Familiar flags:** `-i -S -F -w -x -v -l -c -o -U -e -g -t -C -A -B -m -M -n -N -q --json --heading --hidden --no-ignore`.
 - **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface
@@ -52,6 +52,9 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 glep --json 'pattern'           # machine-readable output (includes rg's summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
+glep -w -x -S -v 'pattern'      # word, whole-line, smart-case, invert match
+glep -o -m 5 -M 120 -N ...      # only-matching, max count, max columns, no line numbers
+glep --heading -q 'pattern'     # grouped headings, or quiet exit-code-only
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
 glep -g '*.rs' -t rust ...      # glob and type filters
 glep --hidden 'TODO'            # include dotfiles (.git is always excluded)

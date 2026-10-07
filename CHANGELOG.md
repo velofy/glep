@@ -4,7 +4,12 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 
 ## Unreleased
 
+- Output is buffered through a 64 KiB writer and a broken pipe exits 0 silently, like rg (pipes to `head` no longer error).
+- Per-query overhead: the freshness diff hashes `OsStr` keys once (34 ms -> 6 ms on a Linux 6.12 tree), trigram groups intersect rarest-first via posting-blob lengths, and the grep `Searcher` is reused per rayon worker.
 - UTF-16 BOM files are now searched (live-scanned like oversized files) instead of being treated as binary; index format bumped to v3.
+- New flags with ripgrep semantics: `-w/--word-regexp`, `-x/--line-regexp`, `-S/--smart-case`, `-v/--invert-match`, `-m/--max-count`, `-M/--max-columns`, `-o/--only-matching`, `-n/--line-number` (no-op alias, already the default), `-N/--no-line-number`, `--heading`, and `-q/--quiet`.
+- `-w`/`-x` and `-i`/`-S` are last-wins flag pairs, matching rg. `--json -q` still emits the closing summary event, like rg.
+- `-v` correctly disables trigram index narrowing (a file with zero occurrences matches every line under inversion); `-S` always narrows case-insensitively as a safe superset.
 
 ## 0.3.1 (2026-09-30)
 
