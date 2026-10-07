@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New flags `-a/--text` and `--binary` (last-wins pair): binary files are searched as raw text under `-a`, and reported via a "binary file matches" notice under `--binary`. Binary-flagged files join live-scan candidates only under these flags; default quit detection still suppresses them entirely, matching rg's output and exit codes.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

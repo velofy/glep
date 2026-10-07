@@ -13,6 +13,10 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// quit: stop at the first NUL byte (default, rg). convert: NULs become
+    /// line terminators and a match yields the printer's binary notice
+    /// (rg --binary). none: binary files are plain text (rg -a).
+    pub binary: BinaryDetection,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -168,7 +172,7 @@ fn search_one(
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     let mut searcher = SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(0))
+        .binary_detection(opts.binary.clone())
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
@@ -316,6 +320,7 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            binary: BinaryDetection::quit(0),
         }
     }
 

@@ -54,6 +54,13 @@ pub struct Args {
     /// that guarantee. .git/.glep are still always excluded.
     #[arg(long)]
     pub no_ignore: bool,
+    /// Search binary files as if they were text (rg -a/--text)
+    #[arg(short = 'a', long, overrides_with = "binary")]
+    pub text: bool,
+    /// Search binary files but report matches as a notice instead of
+    /// printing matched lines (rg --binary)
+    #[arg(long, overrides_with = "text")]
+    pub binary: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -166,6 +173,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        binary: binary_detection(args),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -173,6 +181,21 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
     timings.stage("search");
     timings.finish();
     Ok(if found { 0 } else { 1 })
+}
+
+/// Binary-detection mode for the searcher: `-a` searches binary files as
+/// raw text, `--binary` searches them but reports a notice instead of the
+/// matched lines, and the default quits a file at the first NUL byte.
+/// `-a`/`--binary` are a last-wins pair, like rg.
+fn binary_detection(args: &Args) -> grep_searcher::BinaryDetection {
+    use grep_searcher::BinaryDetection;
+    if args.text {
+        BinaryDetection::none()
+    } else if args.binary {
+        BinaryDetection::convert(0)
+    } else {
+        BinaryDetection::quit(0)
+    }
 }
 
 pub fn run() -> anyhow::Result<i32> {
@@ -259,7 +282,11 @@ pub fn run() -> anyhow::Result<i32> {
     };
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     timings.stage("plan");
-    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
+    // Binary-flagged files are candidates only under -a/--binary: the
+    // default quit detection can never emit them, so including them would
+    // be pure IO cost (matches rg's observed behavior either way).
+    let search_binary = args.text || args.binary;
+    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, search_binary);
     files.extend(extra);
     files.sort();
     files.dedup();
@@ -277,6 +304,7 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        binary: binary_detection(&args),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

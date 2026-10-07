@@ -480,3 +480,32 @@ fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
 }
+
+/// Binary files are listed by --files and searched under -a/--binary, but
+/// the default quit detection suppresses them entirely.
+#[test]
+fn binary_files_suppressed_by_default() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("blob.bin"), b"aa\x00hello-bin\x00zz\n").unwrap();
+    // Default: no output, exit 1 even though "hello" precedes... no wait,
+    // "hello-bin" follows the NUL here; either way binary data suppresses.
+    glep(dir.path()).args(["hello-bin"]).assert().code(1);
+    // -a searches it as text and prints the raw line.
+    glep(dir.path())
+        .args(["-a", "hello-bin"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("blob.bin:1:aa"));
+    // --binary prints the notice rather than the matched line.
+    glep(dir.path())
+        .args(["--binary", "hello-bin"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("binary file matches"));
+    // --files already lists it (indexing and searching are distinct).
+    glep(dir.path())
+        .args(["--files"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("blob.bin"));
+}
