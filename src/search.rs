@@ -13,6 +13,24 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// First-match column per line (rg --column); implied by --vimgrep.
+    pub column: bool,
+    /// Byte offset of each printed line (rg -b).
+    pub byte_offset: bool,
+    /// One output line per match (rg --vimgrep = column + per_match +
+    /// per_match_one_line + forced filename).
+    pub vimgrep: bool,
+    /// Strip leading whitespace on matched lines (rg --trim).
+    pub trim: bool,
+    /// Replaces the `:` between path and line fields (rg -0/--null).
+    pub path_terminator: Option<u8>,
+    /// Replaces `/` inside printed paths (rg --path-separator).
+    pub path_separator: Option<u8>,
+    /// With count, emit `path:0` for searched-but-unmatched files
+    /// (rg --include-zero).
+    pub include_zero: bool,
+    /// Print the path field; rg suppresses it for a single file operand.
+    pub with_filename: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -182,12 +200,17 @@ fn search_one(
             count: 0,
         };
         searcher.search_path(matcher, &full, &mut sink)?;
-        if sink.count > 0 {
-            return Ok((
-                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
-                true,
-                None,
-            ));
+        if sink.count > 0 || opts.include_zero {
+            // `path` + path terminator (`:` normally, NUL under --null) +
+            // count; bare `N` when the path is suppressed.
+            let mut line = Vec::new();
+            if opts.with_filename {
+                write_path(&mut line, rel, opts.path_separator)?;
+                line.push(opts.path_terminator.unwrap_or(b':'));
+            }
+            line.extend_from_slice(sink.count.to_string().as_bytes());
+            line.push(b'\n');
+            return Ok((line, sink.count > 0, None));
         }
         return Ok((Vec::new(), false, None));
     }
@@ -208,12 +231,39 @@ fn search_one(
     } else {
         let mut printer = grep_printer::StandardBuilder::new()
             .heading(false)
+            .path(opts.with_filename)
+            .column(opts.column || opts.vimgrep)
+            .byte_offset(opts.byte_offset)
+            .trim_ascii(opts.trim)
+            .per_match(opts.vimgrep)
+            .per_match_one_line(true)
+            .path_terminator(opts.path_terminator)
+            .separator_path(opts.path_separator)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     }
     Ok((buf, matched, stats))
+}
+
+/// Write `rel` honoring --path-separator (components rejoined by the
+/// custom byte).
+fn write_path<W: std::io::Write + ?Sized>(out: &mut W, rel: &Path, sep: Option<u8>) -> std::io::Result<()> {
+    match sep {
+        None => out.write_all(rel.as_os_str().as_encoded_bytes()),
+        Some(sep) => {
+            let mut first = true;
+            for c in rel.components() {
+                if !first {
+                    out.write_all(&[sep])?;
+                }
+                first = false;
+                out.write_all(c.as_os_str().as_encoded_bytes())?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
@@ -257,17 +307,25 @@ pub fn run(
             }
             if matched {
                 found = true;
-                let global_i = base + i;
-                if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
-                } else {
-                    if separate && printed_any {
-                        writeln!(out, "--")?;
-                    }
-                    out.write_all(&buf)?;
-                    printed_any = true;
-                }
             }
+            if opts.files_with_matches {
+                if matched {
+                    let global_i = base + i;
+                    write_path(out, &files[global_i], opts.path_separator)?;
+                    out.write_all(&[opts.path_terminator.unwrap_or(b'\n')])?;
+                }
+                continue;
+            }
+            // Non-empty buffers print even when the file didn't match:
+            // --include-zero -c emits `path:0` lines for searched files.
+            if buf.is_empty() {
+                continue;
+            }
+            if separate && printed_any {
+                writeln!(out, "--")?;
+            }
+            out.write_all(&buf)?;
+            printed_any = true;
         }
         base += chunk.len();
     }
@@ -316,6 +374,14 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            column: false,
+            byte_offset: false,
+            vimgrep: false,
+            trim: false,
+            path_terminator: None,
+            path_separator: None,
+            include_zero: false,
+            with_filename: true,
         }
     }
 
