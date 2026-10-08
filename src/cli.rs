@@ -802,6 +802,78 @@ fn run_one_fs(
         .collect();
     timings.stage("sweep_one_fs");
     run_live_files(root, cwd_rel, args, timings, files, had_error)
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
+    let opts = search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before,
+        after,
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+        null_data: args.null_data,
+        dfa_size_limit: args.dfa_size_limit,
+        regex_size_limit: args.regex_size_limit,
+    };
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    timings.stage("search");
+    timings.finish();
+    Ok(if found { 0 } else { 1 })
+}
+
+/// `--one-file-system`: live-scan escape hatch in the same shape as
+/// `--no-ignore` — mount-point subtrees must not enter the index, so the
+/// flag routes through `walk::sweep_one_fs` (ignores ON, same-st_dev
+/// descent) instead of ever consulting the index.
+fn run_one_fs(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
+    let mut files: Vec<PathBuf> = walk::sweep_one_fs(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_one_fs");
+
+    if args.files {
+        if let Some(g) = args.pattern.as_deref() {
+            let glob = build_glob(g)?;
+            files.retain(|f| glob.is_match(f));
+        }
+        apply_filters(&mut files, args)?;
+        for f in &files {
+            println!("{}", f.display());
+        }
+        timings.finish();
+        return Ok(if files.is_empty() { 1 } else { 0 });
+    }
+
+    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
+        Some(p) => p,
+        None => anyhow::bail!("a pattern is required (or --files)"),
+    };
+    apply_filters(&mut files, args)?;
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
+    let opts = search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before,
+        after,
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+        null_data: args.null_data,
+        dfa_size_limit: args.dfa_size_limit,
+        regex_size_limit: args.regex_size_limit,
+    };
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    timings.finish();
+    Ok(if found { 0 } else { 1 })
 }
 
 pub fn run() -> anyhow::Result<i32> {
@@ -907,6 +979,9 @@ pub fn run() -> anyhow::Result<i32> {
         timings.stage("sweep");
         return run_live_files(&root, &cwd_rel, &args, &mut timings, files, had_error);
     }
+    if args.one_file_system {
+        return run_one_fs(&root, &args, &mut timings);
+    }
 
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
@@ -994,6 +1069,8 @@ pub fn run() -> anyhow::Result<i32> {
         files.extend(idx.zip_candidates(args.hidden));
     }
     files.extend(extra.iter().cloned());
+    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, args.null_data);
+    files.extend(extra);
     files.sort();
     files.dedup();
     apply_filters(&mut files, &args)?;
@@ -1034,6 +1111,21 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
+    let before = args.before_context.or(args.context).unwrap_or(0);
+    let after = args.after_context.or(args.context).unwrap_or(0);
+    let opts = search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before,
+        after,
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+        null_data: args.null_data,
+        dfa_size_limit: args.dfa_size_limit,
+        regex_size_limit: args.regex_size_limit,
+    };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, universe.as_deref(), &opts, &mut lock)?;

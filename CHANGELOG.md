@@ -28,6 +28,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags with ripgrep semantics: `-w/--word-regexp`, `-x/--line-regexp`, `-S/--smart-case`, `-v/--invert-match`, `-m/--max-count`, `-M/--max-columns`, `-o/--only-matching`, `-n/--line-number` (no-op alias, already the default), `-N/--no-line-number`, `--heading`, and `-q/--quiet`.
 - `-w`/`-x` and `-i`/`-S` are last-wins flag pairs, matching rg. `--json -q` still emits the closing summary event, like rg.
 - `-v` correctly disables trigram index narrowing (a file with zero occurrences matches every line under inversion); `-S` always narrows case-insensitively as a safe superset.
+- New flags: `--null-data` (NUL is the record separator — matcher + searcher line terminators switch to NUL, binary detection turns off, and binary-flagged files join the candidates since NULs are data there), `--dfa-size-limit`, `--regex-size-limit`, `--one-file-system` (live scan that stays on the root's filesystem; mount-point subtrees never enter the index).
 
 ## 0.3.1 (2026-09-30)
 

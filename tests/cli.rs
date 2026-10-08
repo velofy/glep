@@ -679,6 +679,9 @@ fn unrestricted_count_maps_to_flags() {
 fn null_data_searches_binaryish_files() {
     let dir = tempfile::tempdir().unwrap();
     // NUL-separated records: 'needle' on NUL-records 2 and 4
+fn null_data_searches_binaryish_files() {
+    let dir = tempfile::tempdir().unwrap();
+    // NUL-separated records: 'needle' on NUL-records 1 and 3
     std::fs::write(dir.path().join("data.bin"), "aa\x00needle\x00bb\x00needle x\x00").unwrap();
     let out = glep(dir.path())
         .args(["--null-data", "needle"])
