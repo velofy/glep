@@ -213,6 +213,10 @@ impl Index {
     /// detection a binary file can never emit output, so excluding it is
     /// a pure win. (rg walks the file and quits at the first NUL instead;
     /// observably identical: no output, exit unaffected.)
+    /// `search_binary` (true when -a/--binary or -c --include-zero needs
+    /// them) adds binary-flagged files to the live-scan candidate set.
+    /// Under the default quit detection they can never emit output, so
+    /// excluding them is otherwise a pure win.
     pub fn candidates(&self, plan: &Plan, case_insensitive: bool, include_hidden: bool, search_binary: bool) -> Vec<PathBuf> {
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
@@ -240,6 +244,7 @@ impl Index {
                 }
                 // Skip-flagged text files were never indexed; always scan
                 // them. Binary files too, when the mode can surface them.
+                // them. Binary files too, when the caller can surface them.
                 union.extend(
                     self.manifest
                         .live_entries()

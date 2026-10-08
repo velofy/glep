@@ -43,6 +43,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
 - **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B -a --binary --json --hidden --no-ignore`.
 - **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore --no-index`.
+- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B -b -H -I -0 -j --column --vimgrep --trim --null --path-separator --include-zero --max-depth --json --hidden --no-ignore`.
 - **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface

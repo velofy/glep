@@ -66,11 +66,61 @@ pub struct Args {
     /// trees or to sanity-check index freshness.
     #[arg(long)]
     pub no_index: bool,
+    /// Show the column number of the first match per line (rg --column)
+    #[arg(long)]
+    pub column: bool,
+    /// Show the byte offset of each printed line (rg -b/--byte-offset)
+    #[arg(short = 'b', long)]
+    pub byte_offset: bool,
+    /// One line per match in path:line:column:text form (rg --vimgrep)
+    #[arg(long)]
+    pub vimgrep: bool,
+    /// Trim leading whitespace from matched lines (rg --trim)
+    #[arg(long)]
+    pub trim: bool,
+    /// Terminate printed paths with NUL instead of a separator (rg -0)
+    #[arg(short = '0', long = "null")]
+    pub null: bool,
+    /// Replace the OS path separator in output paths; exactly one byte
+    /// (rg --path-separator)
+    #[arg(long, value_parser = parse_path_separator)]
+    pub path_separator: Option<u8>,
+    /// With -c, print `path:0` lines for searched files with no matches
+    /// (rg --include-zero). Needs the full walked set, so the index plan
+    /// degenerates to All when combined with -c.
+    #[arg(long)]
+    pub include_zero: bool,
+    /// Only search files at most N levels below each path operand
+    /// (rg --max-depth; a file operand itself is depth 0)
+    #[arg(long, visible_alias = "maxdepth")]
+    pub max_depth: Option<usize>,
+    /// Worker thread count, 0 for auto (rg -j/--threads)
+    #[arg(short = 'j', long = "threads")]
+    pub threads: Option<usize>,
+    /// Always print the file path with matches; the default unless a
+    /// single file operand was given (rg -H/--with-filename)
+    #[arg(short = 'H', long, overrides_with = "no_filename")]
+    pub with_filename: bool,
+    /// Never print the file path with matches (rg -I/--no-filename)
+    #[arg(short = 'I', long, overrides_with = "with_filename")]
+    pub no_filename: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
     #[arg(long, default_value_t = 1_048_576)]
     pub max_filesize: u64,
+}
+
+fn parse_path_separator(s: &str) -> Result<u8, String> {
+    if s.len() == 1 {
+        Ok(s.as_bytes()[0])
+    } else {
+        Err(format!(
+            "A path separator must be exactly one byte, but the given separator is {} bytes: {}",
+            s.len(),
+            s
+        ))
+    }
 }
 
 fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
@@ -214,7 +264,47 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         let types = tb.build()?;
         files.retain(|f| types.matched(f, false).is_whitelist());
     }
+    if let Some(maxd) = args.max_depth {
+        // Depth is operand-relative: a file's depth is its component count
+        // minus the containing operand's. With no operands the implicit
+        // root is the operand, so depth is the whole component count.
+        files.retain(|f| {
+            let depth = f.components().count();
+            if args.paths.is_empty() {
+                depth <= maxd
+            } else {
+                args.paths.iter().any(|p| {
+                    f.starts_with(p)
+                        && depth.saturating_sub(p.components().count()) <= maxd
+                })
+            }
+        });
+    }
     Ok(())
+}
+
+/// Write a path honoring --path-separator (components rejoined by the
+/// custom byte) followed by the path terminator: NUL under --null,
+/// newline otherwise.
+fn write_terminated_path(
+    out: &mut dyn std::io::Write,
+    rel: &Path,
+    sep: Option<u8>,
+    term: u8,
+) -> std::io::Result<()> {
+    if let Some(sep) = sep {
+        let mut first = true;
+        for c in rel.components() {
+            if !first {
+                out.write_all(&[sep])?;
+            }
+            first = false;
+            out.write_all(c.as_os_str().as_encoded_bytes())?;
+        }
+    } else {
+        write!(out, "{}", rel.display())?;
+    }
+    out.write_all(&[term])
 }
 
 /// `--no-ignore`: content mode and `--files` mode both bypass the index
@@ -251,8 +341,12 @@ fn run_no_ignore(
             files.retain(|f| glob.is_match(f));
         }
         apply_filters(&mut files, args)?;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let term = if args.null { 0 } else { b'\n' };
         for f in &files {
             println!("{}", display_path(f, cwd_rel).display());
+            write_terminated_path(&mut lock, f, args.path_separator, term)?;
         }
         timings.finish();
         return Ok(if had_error {
@@ -285,6 +379,7 @@ fn run_no_ignore(
         binary: binary_detection(args),
         display_prefix: cwd_rel.to_path_buf(),
     };
+    let opts = search_opts(args, root);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
@@ -314,8 +409,50 @@ fn binary_detection(args: &Args) -> grep_searcher::BinaryDetection {
     }
 }
 
+/// Resolved path-prefixing: explicit -H/-I win (last-wins pair); else on
+/// for --vimgrep, or whenever the operand isn't exactly one file.
+fn with_filename(args: &Args, root: &Path) -> bool {
+    if args.no_filename {
+        return false;
+    }
+    if args.with_filename {
+        return true;
+    }
+    let single_file =
+        args.paths.len() == 1 && root.join(&args.paths[0]).is_file();
+    args.vimgrep || !single_file
+}
+
+fn search_opts(args: &Args, root: &Path) -> search::SearchOpts {
+    search::SearchOpts {
+        case_insensitive: args.ignore_case,
+        fixed: args.fixed_strings,
+        files_with_matches: args.files_with_matches,
+        before: args.before_context.or(args.context).unwrap_or(0),
+        after: args.after_context.or(args.context).unwrap_or(0),
+        json: args.json,
+        count: args.count,
+        multiline: args.multiline,
+        column: args.column || args.vimgrep,
+        byte_offset: args.byte_offset,
+        vimgrep: args.vimgrep,
+        trim: args.trim,
+        path_terminator: args.null.then_some(0u8),
+        path_separator: args.path_separator,
+        include_zero: args.include_zero,
+        with_filename: with_filename(args, root),
+    }
+}
+
 pub fn run() -> anyhow::Result<i32> {
     let mut args = Args::parse();
+    if let Some(n) = args.threads {
+        // Global rayon pool; .ok() because a second init simply keeps the
+        // first (only ever happens under unit tests calling run() twice).
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    }
 
     // With -e/--regexp the positional pattern slot is free; a bare
     // positional there is a path (e.g. `glep -e foo src`).
@@ -452,8 +589,12 @@ pub fn run() -> anyhow::Result<i32> {
         }
         let args2 = Args { pattern: None, ..args };
         apply_filters(&mut files, &args2)?;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let term = if args.null { 0 } else { b'\n' };
         for f in &files {
             println!("{}", display_path(f, &cwd_rel).display());
+            write_terminated_path(&mut lock, f, args.path_separator, term)?;
         }
         timings.finish();
         return Ok(if had_error {
@@ -469,7 +610,15 @@ pub fn run() -> anyhow::Result<i32> {
         Some(p) => p,
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
-    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    // -c --include-zero must emit `:0` for every walked file, so trigram
+    // narrowing is unsound: degenerate to the full candidate set. Binary
+    // files join too — under quit detection they simply count as 0.
+    let include_binary = args.count && args.include_zero;
+    let query_plan = if include_binary {
+        crate::plan::Plan::All
+    } else {
+        plan::build(&pattern, args.fixed_strings, args.ignore_case)
+    };
     timings.stage("plan");
     // Binary-flagged files are candidates only under -a/--binary: the
     // default quit detection can never emit them, so including them would
@@ -477,6 +626,13 @@ pub fn run() -> anyhow::Result<i32> {
     let search_binary = args.text || args.binary;
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, search_binary);
     files.extend(extra);
+    let mut files = idx.candidates(
+        &query_plan,
+        args.ignore_case,
+        args.hidden,
+        include_binary,
+    );
+    files.extend(extra.iter().cloned());
     files.sort();
     files.dedup();
     apply_filters(&mut files, &args)?;
@@ -496,12 +652,31 @@ pub fn run() -> anyhow::Result<i32> {
         binary: binary_detection(&args),
         display_prefix: cwd_rel.to_path_buf(),
     };
+    // rg's nothing-searched heuristic: with the implicit path scope, an
+    // empty walked pool (ignore rules or filters ate everything) warns on
+    // stderr and exits 2. An empty set produced by trigram narrowing is a
+    // plain no-match (exit 1) — the pool was still searched.
+    let mut nothing_searched = false;
+    if files.is_empty() && args.paths.is_empty() {
+        let mut pool = idx.live_files(args.hidden);
+        pool.extend(extra.iter().cloned());
+        apply_filters(&mut pool, &args)?;
+        if pool.is_empty() {
+            nothing_searched = true;
+            eprintln!(
+                "glep: No files were searched, which means glep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped."
+            );
+        }
+    }
+
+    let opts = search_opts(&args, &root);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
     Ok(if had_error {
+    Ok(if nothing_searched {
         2
     } else if found {
         0

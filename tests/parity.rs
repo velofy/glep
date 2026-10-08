@@ -72,6 +72,10 @@ fn corpus() -> tempfile::TempDir {
     std::fs::write(dir.path().join("dotkit/.nope"), "nopetoken still hidden\n").unwrap();
     std::fs::write(dir.path().join("dotkit/.wdir/in.txt"), "wdirtoken under whitelisted dir\n").unwrap();
     std::fs::write(dir.path().join("dotkit/plain.txt"), "plaintoken normal file\n").unwrap();
+    // Leading-whitespace fixture for --trim and a multi-match line for
+    // --vimgrep's one-line-per-match output.
+    std::fs::write(dir.path().join("pad.txt"), "   padded hello   \n").unwrap();
+    std::fs::write(dir.path().join("mm.txt"), "aa bb aa\nplain\n").unwrap();
     dir
 }
 
@@ -174,6 +178,29 @@ fn parity_with_ripgrep() {
         &["nopetoken"],
         &["--hidden", "nopetoken"],
         &["-l", "keeptoken"],
+        // Output plumbing: column/byte-offset/vimgrep/trim/null,
+        // path-separator, include-zero counts, depth limits, filename
+        // gating, and the single-file-operand heuristic.
+        &["--column", "hello"],
+        &["-b", "hello"],
+        &["--vimgrep", "aa"],
+        &["--vimgrep", "hello"],
+        &["--trim", "padded"],
+        &["--null", "hello"],
+        &["-0", "-l", "hello"],
+        &["--null", "--files"],
+        &["-c", "--include-zero", "hello"],
+        &["--include-zero", "-c", "zz_no_match_zz"],
+        &["-c", "--null", "hello"],
+        &["--path-separator", "%", "hello"],
+        &["--max-depth", "1", "hello"],
+        &["--max-depth", "0", "hello"],
+        &["-I", "hello"],
+        &["-j", "1", "hello"],
+        // Single-file operand: rg drops the path prefix by default.
+        &["hello", "README.md"],
+        &["-c", "hello", "README.md"],
+        &["-H", "hello", "README.md"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

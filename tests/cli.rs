@@ -584,4 +584,47 @@ fn subdir_dotdot_reaches_parent_tree() {
         .assert()
         .success()
         .stdout(predicates::str::contains("notes.txt:1:hello there"));
+/// A single file operand drops the path prefix (rg convention); -H
+/// restores it, -I forces it off, and the nothing-searched heuristic
+/// fires when a filter empties the implicit-scope pool.
+#[test]
+fn filename_and_depth_semantics() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["hello", "notes.txt"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1:hello there"))
+        .stdout(predicates::str::contains("notes.txt").not());
+    glep(dir.path())
+        .args(["-H", "hello", "notes.txt"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1:hello there"));
+    glep(dir.path())
+        .args(["-I", "hello"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("1:hello there"))
+        .stdout(predicates::str::contains("notes.txt").not());
+    // --max-depth 0 searches nothing under the implicit scope → warn + 2.
+    glep(dir.path())
+        .args(["--max-depth", "0", "hello"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("No files were searched"));
+    // …but a narrow *plan* (no candidates, pool non-empty) is exit 1.
+    glep(dir.path()).args(["zz_absent_zz"]).assert().code(1);
+}
+
+#[test]
+fn include_zero_counts_every_searched_file() {
+    let dir = corpus();
+    // "general" only matches notes.txt; src/lib.rs gets a :0 line.
+    glep(dir.path())
+        .args(["-c", "--include-zero", "general"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1"))
+        .stdout(predicates::str::contains("src/lib.rs:0"));
 }

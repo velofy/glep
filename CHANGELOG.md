@@ -9,6 +9,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - Ancestor index discovery: running glep in a subdirectory finds the nearest `.glep/` upward (or `GLEP_INDEX_PATH`, which points at an index dir directly), scopes the search to the cwd subtree, and prints paths relative to the cwd — no more duplicate per-subdirectory indexes.
 - Missing path filters now print `glep: <path>: No such file or directory (os error 2)` and exit 2 instead of silently exiting 1; valid paths still produce their matches.
 - New `--no-index` flag: live gitignore-aware walk + scan that never opens the index (and never leaves a `.glep` behind).
+- Output plumbing flags, all verified byte-identical: `--column`, `-b/--byte-offset`, `--vimgrep` (one line per match, `path:line:col:text`), `--trim` (leading whitespace), `-0/--null` (NUL path terminator, also honored by `-l` and `--files`), `--path-separator` (single byte), `--include-zero` (`-c` prints `path:0` for searched files — forces the full walked set), `--max-depth`/`--maxdepth` (operand-relative depth), `-j/--threads`, `-H/--with-filename`, `-I/--no-filename`. A single file operand now drops the path prefix unless `-H`; `-I` forces it off. Implicit-scope runs whose filters empty the walked pool print rg's "No files were searched" warning and exit 2.
 
 ## 0.3.1 (2026-09-30)
 
