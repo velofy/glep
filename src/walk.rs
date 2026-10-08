@@ -368,6 +368,43 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     Ok(v)
 }
 
+/// Live, index-bypassing sweep for `-L/--follow`: identical filtering
+/// semantics to `sweep_walker` (gitignore/.ignore/global excludes apply,
+/// `.git`/`.glep` hard-excluded) but follows symlinks during traversal.
+/// Ignore rules are NOT bypassed here — `-L` only changes traversal.
+///
+/// Why this is a live-scan escape hatch and not an index mode: files
+/// reached THROUGH a symlinked directory are not in the manifest at all
+/// (the index sweep doesn't descend links), so index narrowing couldn't
+/// find them; scanning the followed tree is the only sound option.
+/// `include_hidden` gates hidden entries the same as `sweep_unfiltered`.
+///
+/// Portable walker only (like `sweep_unfiltered`): the macOS bulk path
+/// has no loop detection and no link handling, and `-L` is a deliberate
+/// full-scan path anyway.
+pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
+    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
+    let walker = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .hidden(!include_hidden)
+        .follow_links(true)
+        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
+        .build_parallel();
+    let mut builder = CollectorBuilder {
+        root,
+        global: &collected,
+    };
+    walker.visit(&mut builder);
+    let mut v = collected.into_inner().unwrap();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
 /// Live, index-bypassing sweep for `--no-ignore`: same shape as `sweep`
 /// (root.is_dir() ensure with identical error text, Err-entry warnings on
 /// stderr, output sorted by relative path, `.git`/`.glep` hard-excluded at
@@ -391,7 +428,7 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 /// fast path: an unfiltered scan is a deliberately slow escape hatch (full
 /// rg-speed cost, every time, by design), not the hot path that fast path
 /// exists to speed up.
-pub fn sweep_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+pub fn sweep_unfiltered(root: &Path, include_hidden: bool, follow: bool) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",
@@ -406,6 +443,7 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec
         .git_global(false)
         .git_exclude(false)
         .parents(false)
+        .follow_links(follow)
         .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
         .build_parallel();
     let mut builder = CollectorBuilder {
@@ -496,7 +534,7 @@ mod tests {
     fn sweep_unfiltered_missing_root_is_error_with_same_text() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does_not_exist");
-        let err = sweep_unfiltered(&missing, false).unwrap_err();
+        let err = sweep_unfiltered(&missing, false, false).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("{}: No such file or directory (os error 2)", missing.display())
@@ -516,7 +554,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".glep")).unwrap();
         std::fs::write(dir.path().join(".glep/manifest.bin"), "x").unwrap();
 
-        let metas = sweep_unfiltered(dir.path(), false).unwrap();
+        let metas = sweep_unfiltered(dir.path(), false, false).unwrap();
         let paths: Vec<String> =
             metas.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
         // Both the gitignore'd and the .ignore'd file must be present: this
@@ -539,7 +577,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".glep")).unwrap();
         std::fs::write(dir.path().join(".glep/manifest.bin"), "x").unwrap();
 
-        let without_hidden = sweep_unfiltered(dir.path(), false).unwrap();
+        let without_hidden = sweep_unfiltered(dir.path(), false, false).unwrap();
         let paths: Vec<String> =
             without_hidden.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
         assert_eq!(paths, vec!["plain.txt"]);
@@ -548,7 +586,7 @@ mod tests {
         // must not re-filter by FileMeta::hidden on top of this.
         assert!(without_hidden.iter().all(|m| !m.hidden));
 
-        let with_hidden = sweep_unfiltered(dir.path(), true).unwrap();
+        let with_hidden = sweep_unfiltered(dir.path(), true, false).unwrap();
         let mut paths2: Vec<String> =
             with_hidden.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
         paths2.sort();

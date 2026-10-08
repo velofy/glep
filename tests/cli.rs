@@ -541,6 +541,27 @@ fn multiple_e_patterns_union() {
         .assert()
         .failure()
         .code(2);
+#[cfg(unix)]
+fn follow_reaches_symlinked_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real_target.txt"), "linktok real\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+    std::fs::write(dir.path().join("realdir/inner.txt"), "linktok inner\n").unwrap();
+    std::os::unix::fs::symlink("realdir", dir.path().join("linkdir")).unwrap();
+    std::os::unix::fs::symlink("real_target.txt", dir.path().join("linkfile.txt")).unwrap();
+
+    // default: links are not descended
+    let out = glep(dir.path()).args(["-l", "linktok"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("realdir/inner.txt"));
+    assert!(s.contains("real_target.txt"));
+    assert!(!s.contains("linkdir"));
+
+    // -L: linkdir path produces results through the link
+    let out = glep(dir.path()).args(["-L", "-l", "linktok"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("linkdir/inner.txt"), "{s}");
+    assert!(s.contains("linkfile.txt"), "{s}");
 }
 
 #[test]
