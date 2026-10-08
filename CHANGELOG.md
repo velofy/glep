@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New `-P`/`--pcre2`: PCRE2 engine (lookaround, backrefs, atomic groups...) via grep-pcre2 with JIT. The search path is now generic over `Matcher` (one monomorphized copy per engine); PCRE2-only syntax simply degrades the index plan to a full scan — never a wrong answer.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
