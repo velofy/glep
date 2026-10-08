@@ -508,4 +508,80 @@ fn binary_files_suppressed_by_default() {
         .assert()
         .success()
         .stdout(predicates::str::contains("blob.bin"));
+/// A missing path filter is an error (exit 2), not a silent no-match;
+/// valid paths still produce their matches.
+#[test]
+fn missing_path_errors_exit_two() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["hello", "no_such_dir"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("no_such_dir"))
+        .stderr(predicates::str::contains("No such file or directory"));
+    // Mixed: the valid path still yields its matches, code stays 2.
+    glep(dir.path())
+        .args(["hello", "src", "no_such_dir"])
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains("src/lib.rs"))
+        .stderr(predicates::str::contains("no_such_dir"));
+    // --files uses the operation-error wording. (glep's first positional
+    // under --files is the glob; a path filter follows it.)
+    glep(dir.path())
+        .args(["--files", "*rs", "no_such_dir"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("IO error for operation on"));
+}
+
+/// Running from a subdirectory discovers the ancestor `.glep` index,
+/// scopes the search to the subtree, and prints cwd-relative paths.
+#[test]
+fn subdir_discovers_ancestor_index() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    let sub = dir.path().join("src");
+    glep(&sub)
+        .arg("hello")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("lib.rs:1:pub fn hello_world()"))
+        // root-level notes.txt is outside the cwd subtree
+        .stdout(predicates::str::contains("notes.txt").not());
+    // No second index was created inside src/.
+    assert!(!sub.join(".glep").exists());
+    // And --files shows the scoped listing.
+    let out = glep(&sub).args(["--files"]).assert().success().get_output().stdout.clone();
+    let listing = String::from_utf8(out).unwrap();
+    assert!(listing.contains("lib.rs"));
+    assert!(!listing.contains("notes.txt"));
+}
+
+/// GLEP_INDEX_PATH points at an index directory explicitly; results are
+/// printed index-root-relative when the cwd is outside the tree.
+#[test]
+fn index_path_env_override() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    let elsewhere = tempfile::tempdir().unwrap();
+    glep(elsewhere.path())
+        .arg("hello")
+        .env("GLEP_INDEX_PATH", dir.path().join(".glep"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1:hello there"));
+}
+
+/// With an ancestor index and an explicit path arg pointing back up, the
+/// whole tree is reachable again.
+#[test]
+fn subdir_dotdot_reaches_parent_tree() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    glep(&dir.path().join("src"))
+        .args(["hello", ".."])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1:hello there"));
 }
