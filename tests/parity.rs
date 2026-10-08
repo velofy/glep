@@ -212,6 +212,14 @@ fn parity_with_ripgrep() {
         &["-g", "*.rs", "-g", "!*main*", "-l", "fn main"],
         // --multiline-dotall + -U: . spans newlines
         &["-U", "--multiline-dotall", "a.b\nc.d"],
+        // -T type exclusion
+        &["-T", "rust", "-l", "hello"],
+        // --count-matches counts occurrences (single-file operand keeps
+        // ordering identical between the tools)
+        &["--count-matches", "Xb"],
+        // --sort/--sortr on the small corpus
+        &["--sort", "modified", "-l", "hello"],
+        &["--sortr", "path", "-l", "hello"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

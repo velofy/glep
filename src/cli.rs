@@ -35,6 +35,27 @@ pub struct Args {
     /// Filter candidate files by type from the ignore crate's defaults (repeatable)
     #[arg(short = 't', long = "type")]
     pub types: Vec<String>,
+    /// Exclude candidate files by type (repeatable), rg -T
+    #[arg(short = 'T', long = "type-not")]
+    pub types_not: Vec<String>,
+    /// Sort results by the given field (path, modified, accessed, created,
+    /// none), rg --sort
+    #[arg(long, value_name = "SORTBY")]
+    pub sort: Option<String>,
+    /// Reverse of --sort, rg --sortr
+    #[arg(long, value_name = "SORTBY")]
+    pub sortr: Option<String>,
+    /// Count match occurrences per file instead of matching lines
+    /// (rg --count-matches; differs from -c which counts lines)
+    #[arg(long, conflicts_with_all = ["files_with_matches", "json", "count"])]
+    pub count_matches: bool,
+    /// Accepted for script compat; glep reads no config file anyway
+    #[arg(long, hide = true)]
+    pub no_config: bool,
+    /// Regex engine; only "default"/"auto" is supported — pcre2 errors out
+    /// like the reference does for unknown engines.
+    #[arg(long, value_name = "ENGINE")]
+    pub engine: Option<String>,
     #[arg(short = 'C', long)]
     pub context: Option<usize>,
     #[arg(short = 'A', long = "after-context")]
@@ -319,14 +340,61 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         let overrides = ob.build()?;
         files.retain(|f| !overrides.matched(f, false).is_ignore());
     }
-    if !args.types.is_empty() {
+    if !args.types.is_empty() || !args.types_not.is_empty() {
         let mut tb = ignore::types::TypesBuilder::new();
         tb.add_defaults();
         for t in &args.types {
             tb.select(t);
         }
+        for t in &args.types_not {
+            tb.negate(t);
+        }
         let types = tb.build()?;
-        files.retain(|f| types.matched(f, false).is_whitelist());
+        files.retain(|f| {
+            let m = types.matched(f, false);
+            // -t present -> require whitelist; -T only -> keep unless
+            // explicitly ignored (same rule as globs' overrides).
+            !m.is_ignore() && (args.types.is_empty() || m.is_whitelist())
+        });
+    }
+    Ok(())
+}
+
+/// Sort the file list per --sort/--sortr. `modified` uses manifest mtimes
+/// via `mtime_of`; `accessed`/`created` stat each candidate (sets are
+/// usually small); `path` is the default order; `none` keeps sweep order.
+fn apply_sort(
+    files: &mut Vec<PathBuf>,
+    args: &Args,
+    idx: &Index,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let mode = args.sort.as_deref().or(args.sortr.as_deref());
+    let Some(mode) = mode else { return Ok(()) };
+    match mode {
+        "path" | "none" => {}
+        "modified" => {
+            let mtimes = idx.mtime_map();
+            files.sort_by_key(|f| (mtimes.get(f.as_path()).copied().unwrap_or(0), f.clone()))
+        }
+        "accessed" | "created" => {
+            let key = |f: &PathBuf| -> u128 {
+                std::fs::metadata(root.join(f))
+                    .ok()
+                    .and_then(|m| {
+                        let t = if mode == "accessed" { m.accessed() } else { m.created() };
+                        t.ok()
+                    })
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            };
+            files.sort_by_key(|f| (key(f), f.clone()));
+        }
+        other => anyhow::bail!("{other}: unsupported sort field (path|modified|accessed|created|none)"),
+    }
+    if args.sortr.is_some() {
+        files.reverse();
     }
     if let Some(maxd) = args.max_depth {
         // Depth is operand-relative: a file's depth is its component count
@@ -462,6 +530,7 @@ fn run_live_files(
         after,
         json: args.json,
         count: args.count,
+        count_matches: args.count_matches,
         multiline: args.multiline,
         binary: binary_detection(args),
         display_prefix: cwd_rel.to_path_buf(),
@@ -657,6 +726,12 @@ pub fn run() -> anyhow::Result<i32> {
         return run_follow(&root, &args, &mut timings);
     }
 
+    if let Some(e) = &args.engine {
+        match e.as_str() {
+            "default" | "auto" => {}
+            other => anyhow::bail!("unrecognized regex engine '{other}'"),
+        }
+    }
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
     // Path filters scope the freshness sweep too: subtrees outside the
@@ -754,6 +829,7 @@ pub fn run() -> anyhow::Result<i32> {
     files.sort();
     files.dedup();
     apply_filters(&mut files, &args)?;
+    apply_sort(&mut files, &args, &idx, &root)?;
     timings.stage("candidates");
 
     let before = args.before_context.or(args.context).unwrap_or(0);
@@ -766,6 +842,7 @@ pub fn run() -> anyhow::Result<i32> {
         after,
         json: args.json,
         count: args.count,
+        count_matches: args.count_matches,
         multiline: args.multiline,
         binary: binary_detection(&args),
         display_prefix: cwd_rel.to_path_buf(),

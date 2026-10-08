@@ -165,6 +165,16 @@ impl Index {
     /// component. `.git`/`.glep` never reach the manifest at all (hard
     /// sweep-time exclusion, see walk.rs), so there is no flag for those to
     /// check here.
+    /// path -> manifest mtime (ns since epoch) for all live entries, for
+    /// --sort modified. Built once per query; files not in the manifest
+    /// (fresh `extra` hits) are absent and sort first.
+    pub fn mtime_map(&self) -> std::collections::HashMap<&Path, u128> {
+        self.manifest
+            .live_entries()
+            .map(|e| (e.path.as_path(), e.mtime_ns))
+            .collect()
+    }
+
     pub fn live_files(&self, include_hidden: bool) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self
             .manifest

@@ -562,6 +562,17 @@ fn follow_reaches_symlinked_dirs() {
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("linkdir/inner.txt"), "{s}");
     assert!(s.contains("linkfile.txt"), "{s}");
+fn engine_rejects_unknown() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["--engine", "default", "hello"])
+        .assert()
+        .success();
+    glep(dir.path())
+        .args(["--engine", "pcre2", "hello"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 #[test]

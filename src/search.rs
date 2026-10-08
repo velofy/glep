@@ -12,6 +12,8 @@ pub struct SearchOpts {
     pub after: usize,
     pub json: bool,
     pub count: bool,
+    /// rg --count-matches: count match occurrences, not lines.
+    pub count_matches: bool,
     pub multiline: bool,
     /// quit: stop at the first NUL byte (default, rg). convert: NULs become
     /// line terminators and a match yields the printer's binary notice
@@ -171,6 +173,9 @@ impl grep_searcher::Sink for FoundSink {
 struct CountSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     multiline: bool,
+    /// Count occurrences per line instead of lines (-U needs it always;
+    /// --count-matches needs it for output)
+    occurrences: bool,
     count: u64,
     /// Match occurrences (a line can hold several) — needed by --stats.
     occurrences: u64,
@@ -197,6 +202,19 @@ impl grep_searcher::Sink for CountSink<'_> {
         let n = n.max(1);
         self.occurrences += n;
         self.count += if self.multiline { n } else { 1 };
+        if self.multiline || self.occurrences {
+            use grep_matcher::Matcher;
+            let mut n = 0u64;
+            self.matcher
+                .find_iter(m.bytes(), |_| {
+                    n += 1;
+                    true
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            self.count += n.max(1);
+        } else {
+            self.count += 1;
+        }
         Ok(true)
     }
 }
@@ -230,9 +248,11 @@ fn search_one(
         rel.strip_prefix(&opts.display_prefix).unwrap_or(rel)
     };
     if opts.count {
+    if opts.count || opts.count_matches {
         let mut sink = CountSink {
             matcher,
             multiline: opts.multiline,
+            occurrences: opts.count_matches,
             count: 0,
             occurrences: 0,
         };
@@ -514,6 +534,7 @@ mod tests {
             multiline_dotall: false,
             encoding: None,
             line_buffered: false,
+            count_matches: false,
         }
     }
 

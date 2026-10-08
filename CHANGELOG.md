@@ -16,6 +16,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - `-e`/`--regexp` is now repeatable: multiple patterns OR together (each arm is wrapped non-capturing so anchors stay per-arm; under `-F` each arm is a literal). With any `-e` present positionals remain paths, as before.
 - New flags: `-E`/`--encoding` (transcode files before searching — non-UTF-8 encodings bypass index narrowing since trigrams index raw bytes), `--multiline-dotall` (`.` spans newlines), `--line-buffered` (flush per record). `-g`/`--glob`/`--iglob` now honors gitignore-style `!` negations with last-match-wins ordering instead of plain any-match.
 - New `-L`/`--follow`: follows symlinks during search. Implemented as a live-scan escape hatch (like `--no-ignore`): files reached through symlinked dirs aren't in the index, so index narrowing can't soundly narrow them — `-L` sweeps the followed tree (ignore rules still apply) and scans the result.
+- New flags: `--sort`/`--sortr` (path, modified via manifest mtimes, accessed/created via stat, none), `-T`/`--type-not`, `--count-matches` (occurrences vs `-c`'s lines), `--engine` (accepts `default`/`auto`, errors on others like the reference), `--no-config` no-op.
 
 ## 0.3.1 (2026-09-30)
 
