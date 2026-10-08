@@ -12,6 +12,8 @@ pub struct SearchOpts {
     pub after: usize,
     pub json: bool,
     pub count: bool,
+    /// rg --count-matches: count match occurrences, not lines.
+    pub count_matches: bool,
     pub multiline: bool,
 }
 
@@ -134,6 +136,9 @@ impl grep_searcher::Sink for FoundSink {
 struct CountSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     multiline: bool,
+    /// Count occurrences per line instead of lines (-U needs it always;
+    /// --count-matches needs it for output)
+    occurrences: bool,
     count: u64,
 }
 
@@ -144,7 +149,7 @@ impl grep_searcher::Sink for CountSink<'_> {
         _: &grep_searcher::Searcher,
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        if self.multiline {
+        if self.multiline || self.occurrences {
             use grep_matcher::Matcher;
             let mut n = 0u64;
             self.matcher
@@ -175,10 +180,11 @@ fn search_one(
         .multi_line(opts.multiline)
         .build();
     let full = root.join(rel);
-    if opts.count {
+    if opts.count || opts.count_matches {
         let mut sink = CountSink {
             matcher,
             multiline: opts.multiline,
+            occurrences: opts.count_matches,
             count: 0,
         };
         searcher.search_path(matcher, &full, &mut sink)?;
@@ -316,6 +322,7 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            count_matches: false,
         }
     }
 
