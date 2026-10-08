@@ -206,12 +206,24 @@ impl Index {
     /// flagged `FLAG_HIDDEN` after narrowing by plan, so both the `All` and
     /// `Groups` arms (trigram postings carry no hidden bit of their own)
     /// are covered by one filter rather than two.
-    pub fn candidates(&self, plan: &Plan, case_insensitive: bool, include_hidden: bool) -> Vec<PathBuf> {
+    pub fn candidates(
+        &self,
+        plan: &Plan,
+        case_insensitive: bool,
+        include_hidden: bool,
+        include_binary: bool,
+    ) -> Vec<PathBuf> {
+        // Binary-flagged files were never trigram-indexed; they only join
+        // when the mode can search them (e.g. --null-data treats NUL as a
+        // record separator rather than a binary signal).
+        let binary_ok = |e: &manifest::FileEntry| {
+            include_binary || e.flags & FLAG_SKIP_BINARY == 0
+        };
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
                 .manifest
                 .live_entries()
-                .filter(|e| e.flags & FLAG_SKIP_BINARY == 0)
+                .filter(|e| binary_ok(e))
                 .map(|e| e.id)
                 .collect(),
             Plan::Groups(groups) => {
@@ -235,7 +247,10 @@ impl Index {
                 union.extend(
                     self.manifest
                         .live_entries()
-                        .filter(|e| e.flags & FLAG_SKIP_TOO_LARGE != 0)
+                        .filter(|e| {
+                            e.flags & FLAG_SKIP_TOO_LARGE != 0
+                                || (include_binary && e.flags & FLAG_SKIP_BINARY != 0)
+                        })
                         .map(|e| e.id),
                 );
                 union.sort_unstable();
@@ -484,7 +499,7 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false, false);
+        let c = idx.candidates(&plan, false, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -493,8 +508,8 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("HELLO", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
-        let c = idx.candidates(&plan, true, false);
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
+        let c = idx.candidates(&plan, true, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -503,7 +518,7 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false, false);
+        let c = idx.candidates(&plan, false, false, false);
         assert!(c.contains(&std::path::PathBuf::from("a.txt")));
         assert!(c.contains(&std::path::PathBuf::from("big.txt")));
         assert!(!c.contains(&std::path::PathBuf::from("bin.dat")));
@@ -513,7 +528,7 @@ mod tests {
     fn candidates_all_returns_live_non_binary() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let c = idx.candidates(&crate::plan::Plan::All, false, false);
+        let c = idx.candidates(&crate::plan::Plan::All, false, false, false);
         assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
     }
 
@@ -527,12 +542,12 @@ mod tests {
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("freshneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan, false, false),
+            idx.candidates(&plan, false, false, false),
             vec![std::path::PathBuf::from("new.txt")]
         );
         let plan2 = crate::plan::build("changedneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan2, false, false),
+            idx.candidates(&plan2, false, false, false),
             vec![std::path::PathBuf::from("a.txt")]
         );
     }
@@ -544,7 +559,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
     }
 
     #[test]
@@ -554,9 +569,9 @@ mod tests {
         std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
         idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
         let plan = crate::plan::build("ttlneedle", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
         idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
-        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false, false).len(), 1);
     }
 
     #[test]
@@ -569,7 +584,7 @@ mod tests {
         }
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("persistneedle", true, false);
-        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false, false).len(), 1);
     }
 
     #[test]
@@ -590,7 +605,7 @@ mod tests {
         );
         let plan = crate::plan::build("uniqtoken1999", true, false);
         assert_eq!(
-            idx.candidates(&plan, false, false),
+            idx.candidates(&plan, false, false, false),
             vec![std::path::PathBuf::from("bulk.txt")]
         );
     }
@@ -640,11 +655,11 @@ mod tests {
 
         let plan = crate::plan::build("hiddenneedle", true, false);
         assert!(
-            idx.candidates(&plan, false, false).is_empty(),
+            idx.candidates(&plan, false, false, false).is_empty(),
             "hidden file must not surface by default"
         );
         assert_eq!(
-            idx.candidates(&plan, false, true),
+            idx.candidates(&plan, false, true, false),
             vec![std::path::PathBuf::from(".secret.txt")]
         );
 
@@ -664,9 +679,9 @@ mod tests {
         idx.update(1_048_576, 0).unwrap();
 
         let plan = crate::plan::build("healneedle", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
         assert_eq!(
-            idx.candidates(&plan, false, true),
+            idx.candidates(&plan, false, true, false),
             vec![std::path::PathBuf::from(".newhidden.txt")]
         );
     }

@@ -476,6 +476,20 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn null_data_searches_binaryish_files() {
+    let dir = tempfile::tempdir().unwrap();
+    // NUL-separated records: 'needle' on NUL-records 1 and 3
+    std::fs::write(dir.path().join("data.bin"), "aa\x00needle\x00bb\x00needle x\x00").unwrap();
+    let out = glep(dir.path())
+        .args(["--null-data", "needle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("data.bin:2:needle"), "{s}");
+    assert!(s.contains("data.bin:4:needle x"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
