@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- Output plumbing flags, all verified byte-identical: `--column`, `-b/--byte-offset`, `--vimgrep` (one line per match, `path:line:col:text`), `--trim` (leading whitespace), `-0/--null` (NUL path terminator, also honored by `-l` and `--files`), `--path-separator` (single byte), `--include-zero` (`-c` prints `path:0` for searched files — forces the full walked set), `--max-depth`/`--maxdepth` (operand-relative depth), `-j/--threads`, `-H/--with-filename`, `-I/--no-filename`. A single file operand now drops the path prefix unless `-H`; `-I` forces it off. Implicit-scope runs whose filters empty the walked pool print rg's "No files were searched" warning and exit 2.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
