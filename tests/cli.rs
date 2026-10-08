@@ -501,6 +501,31 @@ fn stats_block_appended() {
         .clone();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("notes.txt:2")); // hello + Kenobi
+fn multiple_e_patterns_union() {
+    let dir = corpus();
+    // notes.txt has "hello"+"Kenobi"; lib.rs has "hello" only.
+    glep(dir.path())
+        .args(["-e", "there", "-e", "kenobi", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\n");
+    glep(dir.path())
+        .args(["-e", "there", "-e", "hello_world", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\nsrc/lib.rs\n");
+    // -F with multiple -e: each arm is a literal, metachars don't parse.
+    glep(dir.path())
+        .args(["-F", "-e", "() {}", "-e", "kenobi", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\nsrc/lib.rs\n");
+    // -e makes positionals paths
+    glep(dir.path())
+        .args(["-e", "hello", "-l", "src"])
+        .assert()
+        .success()
+        .stdout("src/lib.rs\n");
 }
 
 #[test]

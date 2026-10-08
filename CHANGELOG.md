@@ -13,6 +13,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - Literal analysis rewritten as a recursive required-literal extractor over the parsed regex: adjacent literals fuse into longer substrings (better trigram narrowing), required literals survive unexpandable spans (`[0-9][0-9][0-9]-foo` now narrows on `-foo` instead of falling back to a full scan), literals on both sides of a wildcard are AND-required (`abc\w+def` requires both), and alternation products are bounded per-element instead of failing wholesale.
 - New `--stats` flag: prints the rg-style stats block after results (`N matches / matched lines / files contained matches / files searched / bytes printed / bytes searched / seconds`) — exact counters for content, `-c`, and `-l` modes (occurrences vs lines distinguished correctly under `-U` too).
 - Path filters now scope the freshness sweep: `glep pat src/` only walks `src/` for mtime checks instead of the whole tree (ancestor ignore files still apply). The global sweep epoch is only advanced by full sweeps so `--ttl` can never suppress a needed unscoped sweep; compaction is skipped for scoped deltas (bounded by the scope, compacted on the next full sweep).
+- `-e`/`--regexp` is now repeatable: multiple patterns OR together (each arm is wrapped non-capturing so anchors stay per-arm; under `-F` each arm is a literal). With any `-e` present positionals remain paths, as before.
 
 ## 0.3.1 (2026-09-30)
 

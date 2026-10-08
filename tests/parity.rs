@@ -201,6 +201,10 @@ fn parity_with_ripgrep() {
         &["hello", "README.md"],
         &["-c", "hello", "README.md"],
         &["-H", "hello", "README.md"],
+        // repeatable -e: union of patterns; positional still a path
+        &["-e", "hello", "-e", "answer", "-l"],
+        &["-e", "hello", "-l", "src"],
+        &["-F", "-e", "fn m", "-e", "answer", "-l"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

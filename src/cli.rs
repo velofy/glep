@@ -12,9 +12,11 @@ pub struct Args {
     pub pattern: Option<String>,
     /// Restrict results to these subtrees
     pub paths: Vec<PathBuf>,
-    /// Explicit pattern (use when the pattern is literally "index" or "status")
+    /// Explicit pattern (repeatable: multiple patterns are OR'd; use when
+    /// the pattern is literally "index" or "status"). When any -e is
+    /// present, all positionals are paths.
     #[arg(short = 'e', long = "regexp")]
-    pub regexp: Option<String>,
+    pub regexp: Vec<String>,
     /// List files matching a glob instead of searching content
     #[arg(long)]
     pub files: bool,
@@ -201,6 +203,42 @@ fn discover_index_root(cwd: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
 }
 
 fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel: &Path) {
+/// Combine `-e` patterns and the positional into one pattern string.
+/// Multiple patterns OR together (each wrapped in a non-capturing group
+/// so `^`/`$`/anchors keep their per-arm semantics). Under -F each arm is
+/// escaped individually and the result is a plain regex union — the
+/// matcher/planner must then treat it as regex, not literal, so callers
+/// use `effective_fixed` from this same helper.
+fn combine_patterns(args: &Args) -> anyhow::Result<(String, bool)> {
+    let pats: &[String] = if !args.regexp.is_empty() {
+        &args.regexp
+    } else {
+        match &args.pattern {
+            Some(p) => std::slice::from_ref(p),
+            None => &[],
+        }
+    };
+    if pats.is_empty() {
+        anyhow::bail!("a pattern is required (or --files)");
+    }
+    if pats.len() == 1 {
+        return Ok((pats[0].clone(), args.fixed_strings));
+    }
+    // Multiple patterns OR together; each arm wrapped in a
+    // non-capturing group so ^/$ stay arm-local. Under -F each arm is
+    // escaped individually and the matcher/planner treat the union as a
+    // regex (effective_fixed = false).
+    let fixed = args.fixed_strings;
+    let joined = pats
+        .iter()
+        .map(|p| if fixed { regex_syntax::escape(p) } else { p.clone() })
+        .map(|p| format!("(?:{p})"))
+        .collect::<Vec<_>>()
+        .join("|");
+    Ok((joined, false))
+}
+
+fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for p in paths.iter_mut() {
         if p.is_absolute() {
@@ -361,10 +399,7 @@ fn run_no_ignore(
         });
     }
 
-    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
-        Some(p) => p,
-        None => anyhow::bail!("a pattern is required (or --files)"),
-    };
+    let (pattern, effective_fixed) = combine_patterns(&args)?;
     apply_filters(&mut files, args)?;
     timings.stage("candidates");
 
@@ -372,7 +407,7 @@ fn run_no_ignore(
     let after = args.after_context.or(args.context).unwrap_or(0);
     let opts = search::SearchOpts {
         case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
+        fixed: effective_fixed,
         files_with_matches: args.files_with_matches,
         before,
         after,
@@ -460,7 +495,7 @@ pub fn run() -> anyhow::Result<i32> {
 
     // With -e/--regexp the positional pattern slot is free; a bare
     // positional there is a path (e.g. `glep -e foo src`).
-    if args.regexp.is_some() && !args.files {
+    if !args.regexp.is_empty() && !args.files {
         if let Some(p) = args.pattern.take() {
             args.paths.insert(0, PathBuf::from(p));
         }
@@ -478,7 +513,7 @@ pub fn run() -> anyhow::Result<i32> {
     }
 
     // Subcommand-style words in the pattern slot.
-    if args.regexp.is_none() && !args.files && !args.no_ignore {
+    if args.regexp.is_empty() && !args.files && !args.no_ignore {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;
@@ -629,6 +664,8 @@ pub fn run() -> anyhow::Result<i32> {
     } else {
         plan::build(&pattern, args.fixed_strings, args.ignore_case)
     };
+    let (pattern, effective_fixed) = combine_patterns(&args)?;
+    let query_plan = plan::build(&pattern, effective_fixed, args.ignore_case);
     timings.stage("plan");
     // Binary-flagged files are candidates only under -a/--binary: the
     // default quit detection can never emit them, so including them would
@@ -652,7 +689,7 @@ pub fn run() -> anyhow::Result<i32> {
     let after = args.after_context.or(args.context).unwrap_or(0);
     let opts = search::SearchOpts {
         case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
+        fixed: effective_fixed,
         files_with_matches: args.files_with_matches,
         before,
         after,
