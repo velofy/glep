@@ -13,6 +13,12 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// --field-match-separator (bytes between fields on match lines)
+    pub field_match_separator: Option<Vec<u8>>,
+    /// --field-context-separator (bytes between fields on context lines)
+    pub field_context_separator: Option<Vec<u8>>,
+    /// --context-separator ("" = none)
+    pub context_separator: Option<Vec<u8>>,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -206,9 +212,18 @@ fn search_one(
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else {
-        let mut printer = grep_printer::StandardBuilder::new()
-            .heading(false)
-            .build_no_color(&mut buf);
+        let mut b = grep_printer::StandardBuilder::new();
+        b.heading(false);
+        if let Some(s) = &opts.field_match_separator {
+            b.separator_field_match(s.clone());
+        }
+        if let Some(s) = &opts.field_context_separator {
+            b.separator_field_context(s.clone());
+        }
+        if let Some(s) = &opts.context_separator {
+            b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
+        }
+        let mut printer = b.build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
@@ -262,7 +277,15 @@ pub fn run(
                     writeln!(out, "{}", files[global_i].display())?;
                 } else {
                     if separate && printed_any {
-                        writeln!(out, "--")?;
+                        match &opts.context_separator {
+                            // "" disables the separator entirely
+                            Some(v) if v.is_empty() => {}
+                            Some(v) => {
+                                out.write_all(v)?;
+                                out.write_all(b"\n")?;
+                            }
+                            None => writeln!(out, "--")?,
+                        }
                     }
                     out.write_all(&buf)?;
                     printed_any = true;
@@ -316,6 +339,9 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            field_match_separator: None,
+            field_context_separator: None,
+            context_separator: None,
         }
     }
 
