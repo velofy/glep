@@ -128,6 +128,13 @@ fn parity_with_ripgrep() {
         // --sort path still applies, so the harness's fixed rg flag set
         // composes cleanly with --files --no-ignore for both tools.
         &["--no-ignore", "--files"],
+        // -g gitignore-style negation & last-wins
+        &["-g", "!*.log", "-l", "hello"],
+        &["--iglob", "!*.log", "-l", "hello"],
+        &["-g", "*.rs", "-l", "hello"],
+        &["-g", "*.rs", "-g", "!*main*", "-l", "fn main"],
+        // --multiline-dotall + -U: . spans newlines
+        &["-U", "--multiline-dotall", "a.b\nc.d"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

@@ -476,6 +476,30 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn encoding_flag_transcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lat.txt"), b"caf\xe9 test\n").unwrap();
+    std::fs::write(dir.path().join("a.txt"), "caf ascii\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-E", "latin1", "café"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("lat.txt:1:café test"));
+    // 'café' (decoded side) does not appear in a.txt's "caf ascii"
+    assert!(!s.contains("a.txt"));
+    // unknown label errors
+    glep(dir.path())
+        .args(["-E", "bogus-enc", "x"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
