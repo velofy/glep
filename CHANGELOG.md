@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- Literal analysis rewritten as a recursive required-literal extractor over the parsed regex: adjacent literals fuse into longer substrings (better trigram narrowing), required literals survive unexpandable spans (`[0-9][0-9][0-9]-foo` now narrows on `-foo` instead of falling back to a full scan), literals on both sides of a wildcard are AND-required (`abc\w+def` requires both), and alternation products are bounded per-element instead of failing wholesale.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
