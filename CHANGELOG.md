@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- Path filters now scope the freshness sweep: `glep pat src/` only walks `src/` for mtime checks instead of the whole tree (ancestor ignore files still apply). The global sweep epoch is only advanced by full sweeps so `--ttl` can never suppress a needed unscoped sweep; compaction is skipped for scoped deltas (bounded by the scope, compacted on the next full sweep).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

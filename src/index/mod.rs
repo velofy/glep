@@ -257,7 +257,7 @@ impl Index {
     }
 
     pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
-        self.update_impl(max_filesize, ttl_secs, None)
+        self.update_impl(max_filesize, ttl_secs, None, None)
     }
 
     /// Same as `update`, but records sweep_walk/sweep_diff/index_write
@@ -270,30 +270,68 @@ impl Index {
         ttl_secs: u64,
         timings: &mut Timings,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        self.update_impl(max_filesize, ttl_secs, Some(timings))
+        self.update_impl(max_filesize, ttl_secs, None, Some(timings))
+    }
+
+    /// Scoped update: like `update_timed` but sweeps only `scope`
+    /// subtrees (index-relative path filters). Manifest entries outside
+    /// the scope keep their existing data untouched — they can be stale,
+    /// but they are also never consulted by the scoped query. The global
+    /// sweep epoch is only bumped for unscoped (full) sweeps: a scoped
+    /// sweep must not suppress the freshness sweep a later unscoped
+    /// query needs (ttl correctness).
+    pub fn update_scoped(
+        &mut self,
+        max_filesize: u64,
+        ttl_secs: u64,
+        scope: &[PathBuf],
+        timings: &mut Timings,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        self.update_impl(max_filesize, ttl_secs, Some(scope), Some(timings))
     }
 
     fn update_impl(
         &mut self,
         max_filesize: u64,
         ttl_secs: u64,
+        scope: Option<&[PathBuf]>,
         mut timings: Option<&mut Timings>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
+        // The ttl only gates FULL sweeps: it marks "the whole tree was
+        // verified as of epoch". A scoped sweep leaves other subtrees
+        // unverified, so it neither honors nor sets the epoch.
+        let scoped = scope.map_or(false, |s| {
+            !s.is_empty() && !s.iter().any(|p| p.as_os_str().is_empty())
+        });
+        if !scoped
+            && ttl_secs > 0
+            && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs
+        {
             return Ok(Vec::new());
         }
-        let swept = walk::sweep(&self.root)?;
+        let swept = match scope.filter(|_| scoped) {
+            Some(s) => walk::sweep_scoped(&self.root, s)?,
+            None => walk::sweep(&self.root)?,
+        };
         if let Some(t) = &mut timings {
             t.stage("sweep_walk");
         }
+        // For a scoped sweep only manifest entries inside the scope are
+        // candidates for tombstoning or refresh; everything outside is
+        // untouched (it simply wasn't looked at).
+        let in_scope = |p: &Path| -> bool {
+            !scoped || scope.unwrap().iter().any(|s| p.starts_with(s))
+        };
         let id_by_path: std::collections::HashMap<&Path, u32> = self
             .manifest
             .live_entries()
+            .filter(|e| in_scope(&e.path))
             .map(|e| (e.path.as_path(), e.id))
             .collect();
         let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
             .manifest
             .live_entries()
+            .filter(|e| in_scope(&e.path))
             .map(|e| (e.path.as_path(), e))
             .collect();
 
@@ -321,13 +359,16 @@ impl Index {
             return Ok(fresh.into_iter().map(|m| m.path).collect());
         }
         if fresh.is_empty() && dead_ids.is_empty() {
-            self.manifest.last_sweep_epoch = now_epoch();
-            // The persisted epoch is consumed solely by ttl checks; skip the
-            // write when ttl is unused so a no-op query stays write-free. A
-            // later process may then see a slightly stale epoch, which can
-            // only cause an extra sweep, never a missed one.
-            if ttl_secs > 0 {
-                self.manifest.save(&self.dir.join("manifest.bin"))?;
+            // Only a full sweep may advance the freshness epoch.
+            if !scoped {
+                self.manifest.last_sweep_epoch = now_epoch();
+                // The persisted epoch is consumed solely by ttl checks; skip the
+                // write when ttl is unused so a no-op query stays write-free. A
+                // later process may then see a slightly stale epoch, which can
+                // only cause an extra sweep, never a missed one.
+                if ttl_secs > 0 {
+                    self.manifest.save(&self.dir.join("manifest.bin"))?;
+                }
             }
             if let Some(t) = &mut timings {
                 t.stage("index_write");
@@ -357,19 +398,24 @@ impl Index {
             ids.dedup();
         }
         postings::write(&self.dir.join("delta.bin"), &map, self.manifest.generation)?;
-        self.manifest.last_sweep_epoch = now_epoch();
+        if !scoped {
+            self.manifest.last_sweep_epoch = now_epoch();
+        }
         self.manifest.save(&self.dir.join("manifest.bin"))?;
         self.delta = Some(Postings::open(&self.dir.join("delta.bin"))?);
 
         // Compaction: delta grew past a tenth of main. Full rebuild is the
-        // simple, correct v1 compaction strategy.
+        // simple, correct v1 compaction strategy. Scoped updates skip the
+        // trigger: their delta contribution is bounded by the scope, and a
+        // rebuild would sweep the whole tree — defeating the point. The
+        // next full sweep still compacts.
         let main_size = std::fs::metadata(self.dir.join("postings.bin"))
             .map(|m| m.len())
             .unwrap_or(0);
         let delta_size = std::fs::metadata(self.dir.join("delta.bin"))
             .map(|m| m.len())
             .unwrap_or(0);
-        if main_size > 0 && delta_size > main_size / 10 {
+        if !scoped && main_size > 0 && delta_size > main_size / 10 {
             drop(self.lock.take()); // release before build re-acquires
             *self = Index::build(&self.root, max_filesize)?;
         }
@@ -477,6 +523,63 @@ mod tests {
         postings::write(&dir.path().join(".glep/delta.bin"), &map, man.generation).unwrap();
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert!(idx.has_delta());
+    }
+
+    #[test]
+    fn update_scoped_only_sweeps_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), "scopedneedle a").unwrap();
+        std::fs::write(other_dir.join("b.txt"), "scopedneedle b").unwrap();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+
+        // Change a file inside scope and outside scope.
+        std::fs::write(src_dir.join("a.txt"), "scopedneedle v2x a").unwrap();
+        std::fs::write(other_dir.join("b.txt"), "scopedneedle b v2x").unwrap();
+        std::fs::write(other_dir.join("c.txt"), "scopedneedle c new").unwrap();
+
+        let mut timings = Timings::new();
+        let scope = vec![std::path::PathBuf::from("src")];
+        idx.update_scoped(1_048_576, 0, &scope, &mut timings)
+            .unwrap();
+        // The in-scope change is now indexed (fresh files join the delta).
+        let plan = crate::plan::build("v2x a", true, false);
+        let c = idx.candidates(&plan, false, false);
+        assert_eq!(c, vec![std::path::PathBuf::from("src/a.txt")]);
+        // Out-of-scope changes were never looked at: b.txt's new
+        // contents are NOT a candidate (still stale — sound, since a
+        // scoped query never returns it anyway).
+        let plan2 = crate::plan::build("b v2x", true, false);
+        assert!(idx.candidates(&plan2, false, false).is_empty());
+    }
+
+    #[test]
+    fn update_scoped_respects_parent_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.ign\n").unwrap();
+        std::fs::write(src_dir.join("x.ign"), "no").unwrap();
+        std::fs::write(src_dir.join("x.txt"), "yes").unwrap();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let mut timings = Timings::new();
+        // A new ignored file inside scope must NOT appear (parent
+        // .gitignore still applies to the scoped subtree).
+        std::fs::write(src_dir.join("y.ign"), "new ignored").unwrap();
+        std::fs::write(src_dir.join("y.txt"), "new visible").unwrap();
+        idx.update_scoped(1_048_576, 0, &[std::path::PathBuf::from("src")], &mut timings)
+            .unwrap();
+        // y.txt is indexed; the ignored y.ign was never swept.
+        let plan = crate::plan::build("new visible", true, false);
+        assert_eq!(
+            idx.candidates(&plan, false, false),
+            vec![std::path::PathBuf::from("src/y.txt")]
+        );
+        let plan2 = crate::plan::build("new ignored", true, false);
+        assert!(idx.candidates(&plan2, false, false).is_empty());
     }
 
     #[test]

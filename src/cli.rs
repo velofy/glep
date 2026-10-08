@@ -224,7 +224,13 @@ pub fn run() -> anyhow::Result<i32> {
 
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
-    let mut extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
+    // Path filters scope the freshness sweep too: subtrees outside the
+    // filter can't produce results, so sweeping them is wasted work.
+    let mut extra = if args.paths.is_empty() {
+        idx.update_timed(args.max_filesize, args.ttl, &mut timings)?
+    } else {
+        idx.update_scoped(args.max_filesize, args.ttl, &args.paths, &mut timings)?
+    };
     // `extra` is the read-only-mode live-scan fallback: files discovered by
     // this sweep that couldn't be written into the index because another
     // process holds the lock. They carry no FLAG_HIDDEN of their own (no
