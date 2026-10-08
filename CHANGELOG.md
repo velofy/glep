@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New flags: `-f`/`--file` (patterns from file, one per line, OR'd with `-e`/positional; each arm non-capturing so anchors stay local; `-F` arms escape individually), `--files-without-match` (names of files with no match — exit 0 when any listed).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
