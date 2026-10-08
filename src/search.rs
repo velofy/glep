@@ -77,6 +77,16 @@ pub struct SearchOpts {
     pub pcre2: bool,
     /// -z: decompress .gz files via flate2 and search the decoded stream.
     pub search_zip: bool,
+    pub word: bool,
+    pub line_regexp: bool,
+    pub smart_case: bool,
+    pub invert: bool,
+    pub max_count: Option<u64>,
+    pub max_columns: Option<u64>,
+    pub line_number: bool,
+    pub heading: bool,
+    pub only_matching: bool,
+    pub quiet: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -178,7 +188,17 @@ fn build_pcre2_matcher(
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
+    // -S: case sensitivity is resolved by the matcher from the pattern AST
+    // (an inline (?i) beats everything), same as rg.
+    b.case_smart(opts.smart_case);
     b.fixed_strings(opts.fixed);
+    b.word(opts.word);
+    // -x maps to grep-regex's whole_line, the same knob rg uses for
+    // --line-regexp. It wraps the HIR in line anchors after -F literals and
+    // smart-case resolution are applied. rg treats -w/-x as last-wins
+    // (enforced via clap overrides_with in cli.rs); if both were ever set,
+    // whole_line would subsume word anyway.
+    b.whole_line(opts.line_regexp);
     // rg's -U maps to: searcher.multi_line(true) so matches may span lines,
     // plus a matcher built without a line-terminator restriction so a
     // literal \n in the pattern is allowed to compile and match. We never
@@ -230,6 +250,13 @@ struct CountSink<'a, M: grep_matcher::Matcher> {
     /// Count occurrences per line instead of lines (-U needs it always;
     /// --count-matches needs it for output)
     occurrences: bool,
+struct CountSink<'a> {
+    matcher: &'a grep_regex::RegexMatcher,
+    // rg semantics: under -o (and -U) -c counts individual matches, not
+    // matched lines. Under -v a reported "match" is a whole non-matching
+    // line the matcher doesn't match, so find_iter yields 0 and the line
+    // still counts once via n.max(1), matching rg -o -v -c.
+    count_matches: bool,
     count: u64,
     /// Match occurrences (a line can hold several) — needed by --stats.
     occurrences: u64,
@@ -257,6 +284,7 @@ impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
         self.occurrences += n;
         self.count += if self.multiline { n } else { 1 };
         if self.multiline || self.occurrences {
+        if self.count_matches {
             use grep_matcher::Matcher;
         if self.multiline {
             let mut n = 0u64;
@@ -279,16 +307,31 @@ fn search_one<M: grep_matcher::Matcher>(
 /// The compressed-body half of `search_one`: identical sink wiring,
 /// but the source is a decoded reader rather than a path.
 fn search_one_decoded<R: std::io::Read>(
+fn build_searcher(opts: &SearchOpts) -> grep_searcher::Searcher {
+    SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .line_number(opts.line_number)
+        .invert_match(opts.invert)
+        .max_matches(opts.max_count)
+        .before_context(opts.before)
+        .after_context(opts.after)
+        .multi_line(opts.multiline)
+        .build()
+}
+
+fn search_one(
     matcher: &grep_regex::RegexMatcher,
     mut reader: R,
     rel: &Path,
     opts: &SearchOpts,
     searcher: &mut grep_searcher::Searcher,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
+    let mut searcher = build_searcher(opts);
+    let full = root.join(rel);
     if opts.count {
         let mut sink = CountSink {
             matcher,
-            multiline: opts.multiline,
+            count_matches: opts.multiline || opts.only_matching,
             count: 0,
         };
         searcher.search_reader(matcher, &mut reader, &mut sink)?;
@@ -316,8 +359,12 @@ fn search_one_decoded<R: std::io::Read>(
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else {
+        // only_matching/max_columns have no JSON-builder knobs and rg
+        // itself ignores -o and -M under --json, so they stay standard-only.
         let mut printer = grep_printer::StandardBuilder::new()
-            .heading(false)
+            .heading(opts.heading)
+            .only_matching(opts.only_matching)
+            .max_columns(opts.max_columns)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_reader(matcher, &mut reader, &mut sink)?;
@@ -543,6 +590,97 @@ fn file_stats(full: &Path, matched_lines: u64, matches: u64) -> grep_printer::St
         s.add_bytes_searched(m.len() as u64);
     }
     s
+/// -q: nothing is written; the answer is carried purely by the exit code.
+/// The one exception is `--json -q`, where rg still emits the closing
+/// summary event (verified against rg 15.0.0), so for json each file is
+/// searched through the JSON sink into a scratch buffer to harvest real
+/// stats. Plain -q uses FoundSink with `.any()` short-circuit so the first
+/// matching file ends the run, and --json -q stops after the first chunk
+/// containing a match (so its stats reflect what was actually searched).
+fn run_quiet(
+    matcher: &grep_regex::RegexMatcher,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+    out: &mut dyn std::io::Write,
+    start: Instant,
+) -> anyhow::Result<bool> {
+    let quiet_one = |rel: &PathBuf| -> anyhow::Result<(bool, Option<grep_printer::Stats>)> {
+        let mut searcher = build_searcher(opts);
+        let full = root.join(rel);
+        if opts.json {
+            let mut scratch = Vec::new();
+            let mut printer = grep_printer::JSONBuilder::new().build(&mut scratch);
+            let mut sink = printer.sink_with_path(matcher, rel);
+            searcher.search_path(matcher, &full, &mut sink)?;
+            Ok((sink.has_match(), Some(sink.stats().clone())))
+        } else {
+            let mut sink = FoundSink(false);
+            searcher.search_path(matcher, &full, &mut sink)?;
+            Ok((sink.0, None))
+        }
+    };
+    if !opts.json {
+        let found = files
+            .par_iter()
+            .map(|rel| match quiet_one(rel) {
+                Ok((m, _)) => m,
+                Err(e) => {
+                    eprintln!("glep: {}: {}", rel.display(), e);
+                    false
+                }
+            })
+            .any(|m| m);
+        return Ok(found);
+    }
+    let mut found = false;
+    let mut total_stats = grep_printer::Stats::new();
+    for chunk in files.chunks(128) {
+        let results: Vec<(bool, Option<grep_printer::Stats>)> = chunk
+            .par_iter()
+            .map(|rel| match quiet_one(rel) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("glep: {}: {}", rel.display(), e);
+                    (false, None)
+                }
+            })
+            .collect();
+        for (matched, stats) in results {
+            if let Some(s) = &stats {
+                // bytes_printed stays 0: -q printed nothing (rg reports 0
+                // in its summary too).
+                total_stats.add_searches(s.searches());
+                total_stats.add_searches_with_match(s.searches_with_match());
+                total_stats.add_bytes_searched(s.bytes_searched());
+                total_stats.add_matched_lines(s.matched_lines());
+                total_stats.add_matches(s.matches());
+            }
+            found |= matched;
+        }
+        if found {
+            break;
+        }
+    }
+    write_summary(out, &mut total_stats, start.elapsed())?;
+    Ok(found)
+}
+
+fn write_summary(
+    out: &mut dyn std::io::Write,
+    total_stats: &mut grep_printer::Stats,
+    elapsed: Duration,
+) -> anyhow::Result<()> {
+    total_stats.add_elapsed(elapsed);
+    let event = SummaryEvent {
+        kind: "summary",
+        data: SummaryData {
+            elapsed_total: NiceDuration::from(elapsed),
+            stats: total_stats.clone(),
+        },
+    };
+    writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    Ok(())
 }
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
@@ -593,9 +731,17 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
         ),
         None => None,
     };
+    if opts.quiet {
+        return run_quiet(&matcher, root, files, opts, out, start);
+    }
     let mut found = false;
-    let separate =
-        (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
+    // Per-file groups are separated: a blank line under --heading (our
+    // fresh-per-file printers can't emit it, so run() inserts it), `--`
+    // under context mode. Both match rg's grouping bytes.
+    let separate = (opts.heading || opts.before > 0 || opts.after > 0)
+        && !opts.files_with_matches
+        && !opts.json
+        && !opts.count;
     let mut printed_any = false;
     let mut base = 0usize;
     let mut total_stats = grep_printer::Stats::new();
@@ -654,6 +800,7 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
                             }
                             None => writeln!(out, "--")?,
                         }
+                        writeln!(out, "{}", if opts.heading { "" } else { "--" })?;
                     }
                     out.write_all(&buf)?;
                     if opts.line_buffered {
@@ -711,6 +858,7 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
             },
         };
         writeln!(out, "{}", serde_json::to_string(&event)?)?;
+        write_summary(out, &mut total_stats, elapsed)?;
     }
     if opts.stats && !opts.json {
         // rg's stats block: a blank line then fixed-order counters.
@@ -783,6 +931,16 @@ mod tests {
             context_separator: None,
             pcre2: false,
             search_zip: false,
+            word: false,
+            line_regexp: false,
+            smart_case: false,
+            invert: false,
+            max_count: None,
+            max_columns: None,
+            line_number: true,
+            heading: false,
+            only_matching: false,
+            quiet: false,
         }
     }
 

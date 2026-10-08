@@ -864,4 +864,144 @@ fn include_zero_counts_every_searched_file() {
         .success()
         .stdout(predicates::str::contains("notes.txt:1"))
         .stdout(predicates::str::contains("src/lib.rs:0"));
+#[test]
+fn word_regexp_matches_whole_words_only() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("w.txt"), "aaafooaaa\nfoo bar\nxfooy\n").unwrap();
+    glep(dir.path())
+        .args(["-w", "foo"])
+        .assert()
+        .success()
+        .stdout("w.txt:2:foo bar\n");
+}
+
+#[test]
+fn line_regexp_matches_whole_lines_only() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("x.txt"), "foo\nxfoo\nfoo bar\n").unwrap();
+    glep(dir.path())
+        .args(["-x", "foo"])
+        .assert()
+        .success()
+        .stdout("x.txt:1:foo\n");
+}
+
+#[test]
+fn smart_case_resolves_from_pattern() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("c.txt"), "token\nTOKEN\nToken\n").unwrap();
+    glep(dir.path())
+        .args(["-S", "token"])
+        .assert()
+        .success()
+        .stdout("c.txt:1:token\nc.txt:2:TOKEN\nc.txt:3:Token\n");
+    glep(dir.path())
+        .args(["-S", "Token"])
+        .assert()
+        .success()
+        .stdout("c.txt:3:Token\n");
+}
+
+/// -v must print files that contain ZERO occurrences of the pattern:
+/// trigram narrowing would otherwise exclude them entirely (the index only
+/// knows which files contain a literal, and under inversion a file with no
+/// occurrences matches every line it has). This test guards that Plan::All
+/// fallback.
+#[test]
+fn invert_match_scans_files_without_the_literal() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-v", "hello"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:2:general kenobi"));
+    // Inversion composes with -c (count of non-matching lines).
+    glep(dir.path())
+        .args(["-v", "-c", "hello"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1"));
+}
+
+#[test]
+fn max_count_stops_per_file() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("m.txt"), "m1\nm2\nm3\n").unwrap();
+    glep(dir.path())
+        .args(["-m", "1", "m"])
+        .assert()
+        .success()
+        .stdout("m.txt:1:m1\n");
+    // -m0: no output at all, exit 1 (rg semantics).
+    glep(dir.path()).args(["-m", "0", "m"]).assert().code(1);
+}
+
+#[test]
+fn only_matching_prints_match_parts_and_counts_matches() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("o.txt"), "foofoo\nfoo bar\n").unwrap();
+    glep(dir.path())
+        .args(["-o", "foo"])
+        .assert()
+        .success()
+        .stdout("o.txt:1:foo\no.txt:1:foo\no.txt:2:foo\n");
+    // With -o, -c counts matches rather than matched lines.
+    glep(dir.path())
+        .args(["-o", "-c", "foo"])
+        .assert()
+        .success()
+        .stdout("o.txt:3\n");
+}
+
+#[test]
+fn no_line_number_keeps_path_prefix() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-N", "hello"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt:hello there\nsrc/lib.rs:pub fn hello_world() {}\n"));
+}
+
+#[test]
+fn heading_groups_matches_under_path_lines() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--heading", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s,
+        p("notes.txt\n1:hello there\n\nsrc/lib.rs\n1:pub fn hello_world() {}\n")
+    );
+}
+
+#[test]
+fn quiet_suppresses_output_but_keeps_exit_code() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["-q", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(out.is_empty(), "-q must print nothing");
+    glep(dir.path()).args(["-q", "zz_absent_zz"]).assert().code(1);
+    // rg still emits the --json summary event under -q.
+    let out = glep(dir.path())
+        .args(["--json", "-q", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(summary["type"], "summary");
 }

@@ -41,6 +41,28 @@ fn corpus() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(dir.path().join("adjacent.txt"), "aXb\ncXd\naXb\ncXd\n").unwrap();
+    // -w/-x fixtures: "foo" as substring, as a word, and as a whole line.
+    std::fs::write(
+        dir.path().join("words.txt"),
+        "aaafooaaa\nfoo bar\nxfooy\nfoo\n",
+    )
+    .unwrap();
+    // -wF/-xF fixtures: the literal "foo.bar" whole-word and whole-line.
+    std::fs::write(dir.path().join("dots.txt"), "foo.bar\nfooXbar\nafoo.bar\n").unwrap();
+    // -S fixture: all three case variants on separate lines so sensitive
+    // and insensitive resolutions print different line sets.
+    std::fs::write(dir.path().join("case.txt"), "foo\nFOO\nFoo\n").unwrap();
+    // -m + context fixture: the second match arrives after the limit as
+    // after-context (rg prints match1, ctx2, match2 for -m1 -A2).
+    std::fs::write(dir.path().join("ctx.txt"), "ctx1\nmatch1\nctx2\nmatch2\nctx3\n").unwrap();
+    // -M fixture: one line far over a small column limit plus a short
+    // matching line. Also gives --heading -C1 an intra-file `--` break.
+    std::fs::write(
+        dir.path().join("long.txt"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nfoo here\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("gap.txt"), "foo\nx1\nx2\nx3\nx4\nfoo\n").unwrap();
     // Hidden-files fixture for --hidden: a .github-style nested hidden
     // directory (ci.yml itself is not dot-prefixed, only its .github
     // ancestor is) plus a plain top-level dotfile. Both carry a token that
@@ -229,6 +251,65 @@ fn parity_with_ripgrep() {
         &["--passthru", "answer"],
         // --no-unicode: \w narrows to ASCII
         &["--no-unicode", "\\w+", "-l"],
+        // -w/-x: word and whole-line matching, plain and with -F. -xF
+        // exercises literal escaping inside the whole-line wrapper.
+        &["-w", "foo"],
+        &["-w", "-F", "foo.bar"],
+        &["-x", "foo"],
+        &["-x", "-F", "foo.bar"],
+        // -w/-x are a last-wins pair in rg: `-x -w` == `-w` alone, and
+        // `-w -x` == `-x` alone.
+        &["-x", "-w", "foo"],
+        &["-w", "-x", "foo"],
+        // -S: lowercase-only pattern resolves insensitive (case.txt's FOO
+        // and Foo lines must appear); a pattern with uppercase resolves
+        // sensitive; an inline (?i) beats the pattern's uppercase bytes and
+        // forces insensitive. The (?i) case is also a narrowing regression
+        // test: planning -S case-sensitively would drop files (README.md,
+        // case.txt) whose only "FOO" is lowercase.
+        &["-S", "foo"],
+        &["-S", "Foo"],
+        &["-S", "(?i)FOO"],
+        &["-S", "-F", "FOO"],
+        &["-i", "-S", "hello"],
+        // -v: inversion disables trigram narrowing (a file with zero
+        // occurrences still matches every line); util.rs, unicode.txt and
+        // friends carry no "foo"/"hello" literal, so this catches the
+        // unsound-narrowing regression.
+        &["-v", "foo"],
+        &["-v", "hello"],
+        &["-v", "-c", "foo"],
+        &["-v", "-l", "foo"],
+        &["-x", "-v", "foo"],
+        &["-U", "-v", "hello"],
+        // -m: per-file cap on matched lines; Some(0) prints nothing and
+        // exits 1; interacts with context (overflow matches arrive as
+        // after-context) and -l/-c.
+        &["-m", "1", "foo"],
+        &["-m", "0", "foo"],
+        &["-m", "1", "-l", "foo"],
+        &["-c", "-m", "1", "foo"],
+        &["-m", "1", "-A", "2", "match"],
+        // -o: print each match on its own line; under -c it counts matches
+        // not matched lines; under -v it prints whole non-matching lines.
+        &["-o", "foo"],
+        &["-o", "-c", "foo"],
+        &["-o", "-v", "hello"],
+        &["-o", "-m", "1", "foo"],
+        // -n is a no-op alias for the default; -N drops the number but
+        // keeps the path prefix.
+        &["-n", "hello"],
+        &["-N", "hello"],
+        // --heading: path on its own line, blank line between file groups;
+        // with context, intra-file gaps still get `--` (gap.txt).
+        &["--heading", "hello"],
+        &["--heading", "-C", "1", "foo"],
+        // -M: over-long lines are replaced by an omission note; 0 = no cap.
+        &["-M", "5", "a+"],
+        &["-M", "0", "a+"],
+        // -q: no output at all; only the exit code answers.
+        &["-q", "hello"],
+        &["-q", "zz_no_match_zz"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

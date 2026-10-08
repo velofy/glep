@@ -25,6 +25,9 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags: `--field-match-separator`, `--field-context-separator` (printer-level byte sequences), `--context-separator` (replaces the between-file `--`; empty disables it).
 - New `-P`/`--pcre2`: PCRE2 engine (lookaround, backrefs, atomic groups...) via grep-pcre2 with JIT. The search path is now generic over `Matcher` (one monomorphized copy per engine); PCRE2-only syntax simply degrades the index plan to a full scan — never a wrong answer.
 - New `-z`/`--search-zip`: `.gz` files are decompressed through flate2 and searched in-stream (a corrupt or mislabeled `.gz` warns per-file and the run continues). Non-gz extensions search raw, same as before.
+- New flags with ripgrep semantics: `-w/--word-regexp`, `-x/--line-regexp`, `-S/--smart-case`, `-v/--invert-match`, `-m/--max-count`, `-M/--max-columns`, `-o/--only-matching`, `-n/--line-number` (no-op alias, already the default), `-N/--no-line-number`, `--heading`, and `-q/--quiet`.
+- `-w`/`-x` and `-i`/`-S` are last-wins flag pairs, matching rg. `--json -q` still emits the closing summary event, like rg.
+- `-v` correctly disables trigram index narrowing (a file with zero occurrences matches every line under inversion); `-S` always narrows case-insensitively as a safe superset.
 
 ## 0.3.1 (2026-09-30)
 
