@@ -476,6 +476,24 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn custom_separators() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--field-match-separator", "|", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt|1|hello"), "{s}");
+    // --context-separator replaces the between-file '--'
+    let out = glep(dir.path())
+        .args(["--context-separator", "==", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\n==\n"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);

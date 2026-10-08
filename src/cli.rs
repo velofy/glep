@@ -43,6 +43,18 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Separator between match fields (path/line/content), single byte —
+    /// rg --field-match-separator
+    #[arg(long, value_name = "SEP")]
+    pub field_match_separator: Option<String>,
+    /// Separator between context fields, single byte —
+    /// rg --field-context-separator
+    #[arg(long, value_name = "SEP")]
+    pub field_context_separator: Option<String>,
+    /// Separator printed between match groups/files — rg --context-separator.
+    /// "" disables the separator entirely.
+    #[arg(long, value_name = "SEP")]
+    pub context_separator: Option<String>,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -166,6 +178,15 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        field_match_separator: args
+            .field_match_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        field_context_separator: args
+            .field_context_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -277,6 +298,15 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        field_match_separator: args
+            .field_match_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        field_context_separator: args
+            .field_context_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
