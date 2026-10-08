@@ -47,6 +47,10 @@ pub struct Args {
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
     pub hidden: bool,
+    /// Search inside gzip-compressed files by decompressing on the fly
+    /// (rg -z/--search-zip; gzip only for now — other formats search raw)
+    #[arg(short = 'z', long = "search-zip")]
+    pub search_zip: bool,
     /// Search ignored files too (gitignore/.ignore/global excludes all
     /// bypassed), rg semantics. Implemented as a live scan that never
     /// opens, updates, or writes the index: ignored trees (node_modules,
@@ -166,6 +170,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        search_zip: args.search_zip,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -260,6 +265,9 @@ pub fn run() -> anyhow::Result<i32> {
     let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
     timings.stage("plan");
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
+    if args.search_zip {
+        files.extend(idx.zip_candidates(args.hidden));
+    }
     files.extend(extra);
     files.sort();
     files.dedup();
@@ -277,6 +285,7 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        search_zip: args.search_zip,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

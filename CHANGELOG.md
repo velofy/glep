@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New `-z`/`--search-zip`: `.gz` files are decompressed through flate2 and searched in-stream (a corrupt or mislabeled `.gz` warns per-file and the run continues). Non-gz extensions search raw, same as before.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
