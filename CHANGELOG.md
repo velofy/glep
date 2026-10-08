@@ -10,6 +10,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - Missing path filters now print `glep: <path>: No such file or directory (os error 2)` and exit 2 instead of silently exiting 1; valid paths still produce their matches.
 - New `--no-index` flag: live gitignore-aware walk + scan that never opens the index (and never leaves a `.glep` behind).
 - Output plumbing flags, all verified byte-identical: `--column`, `-b/--byte-offset`, `--vimgrep` (one line per match, `path:line:col:text`), `--trim` (leading whitespace), `-0/--null` (NUL path terminator, also honored by `-l` and `--files`), `--path-separator` (single byte), `--include-zero` (`-c` prints `path:0` for searched files — forces the full walked set), `--max-depth`/`--maxdepth` (operand-relative depth), `-j/--threads`, `-H/--with-filename`, `-I/--no-filename`. A single file operand now drops the path prefix unless `-H`; `-I` forces it off. Implicit-scope runs whose filters empty the walked pool print rg's "No files were searched" warning and exit 2.
+- Literal analysis rewritten as a recursive required-literal extractor over the parsed regex: adjacent literals fuse into longer substrings (better trigram narrowing), required literals survive unexpandable spans (`[0-9][0-9][0-9]-foo` now narrows on `-foo` instead of falling back to a full scan), literals on both sides of a wildcard are AND-required (`abc\w+def` requires both), and alternation products are bounded per-element instead of failing wholesale.
 
 ## 0.3.1 (2026-09-30)
 
