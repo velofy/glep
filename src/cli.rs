@@ -88,6 +88,12 @@ pub struct Args {
     /// Additional color spec, e.g. --colors 'path:fg:magenta' (repeatable)
     #[arg(long = "colors", value_name = "COLOR_SPEC")]
     pub color_specs: Vec<String>,
+    /// Print every line (matches still marked), rg --passthru
+    #[arg(long)]
+    pub passthru: bool,
+    /// Disable unicode mode in the regex (rg --no-unicode)
+    #[arg(long)]
+    pub no_unicode: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -617,6 +623,8 @@ fn run_live_files(
         line_buffered: args.line_buffered,
         color: want_color(&args),
         color_specs: args.color_specs.clone(),
+        passthru: args.passthru,
+        unicode: !args.no_unicode,
     };
     let opts = search_opts(args, root);
     let stdout = std::io::stdout();
@@ -881,6 +889,10 @@ pub fn run() -> anyhow::Result<i32> {
     // files join too — under quit detection they simply count as 0.
     let include_binary = args.count && args.include_zero;
     let query_plan = if include_binary {
+    // --passthru prints every line of every *searched* file, so index
+    // narrowing would silently drop files whose lines must still appear:
+    // it forces a full scan.
+    let query_plan = if args.passthru {
         crate::plan::Plan::All
     } else {
         plan::build(&pattern, args.fixed_strings, args.ignore_case)
@@ -943,6 +955,8 @@ pub fn run() -> anyhow::Result<i32> {
         line_buffered: args.line_buffered,
         color: want_color(&args),
         color_specs: args.color_specs.clone(),
+        passthru: args.passthru,
+        unicode: !args.no_unicode,
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on

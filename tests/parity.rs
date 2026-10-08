@@ -225,6 +225,10 @@ fn parity_with_ripgrep() {
         &["--color", "always", "fn main"],
         // -u/-uu fold into --no-ignore/--hidden
         &["-u", "-l", "hello"],
+        // --passthru: all lines of all searched files print
+        &["--passthru", "answer"],
+        // --no-unicode: \w narrows to ASCII
+        &["--no-unicode", "\\w+", "-l"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

@@ -19,6 +19,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags: `--sort`/`--sortr` (path, modified via manifest mtimes, accessed/created via stat, none), `-T`/`--type-not`, `--count-matches` (occurrences vs `-c`'s lines), `--engine` (accepts `default`/`auto`, errors on others like the reference), `--no-config` no-op.
 - New flags: `--require-git` (git-derived ignore rules apply only inside a real repo; outside, `gitignored` files aren't indexed so a live scan covers them), `--ignore-file` (extra rules file, resolved relative to its dir — narrows candidates post-hoc).
 - New flags: `--color=always|auto|never` (rg's default spec set; `auto` colors only on a tty), `--colors` user spec overrides, `-u`/`-uu` unrestricted aliases (fold into `--no-ignore`/`--hidden`; `-uuu` reserved until `-a` lands).
+- New flags: `--passthru` (emit every line of every searched file — forces a full scan since non-matching lines must appear), `--no-unicode` (matcher unicode off).
 
 ## 0.3.1 (2026-09-30)
 

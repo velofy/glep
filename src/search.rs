@@ -55,6 +55,10 @@ pub struct SearchOpts {
     pub color: bool,
     /// Extra UserColorSpec strings from --colors, parsed in run().
     pub color_specs: Vec<String>,
+    /// --passthru: emit all lines, not just matches/context.
+    pub passthru: bool,
+    /// --no-unicode: matcher-level unicode off (\w, ., classes).
+    pub unicode: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -158,6 +162,8 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     }
     if opts.multiline_dotall {
         b.dot_matches_new_line(true);
+    if !opts.unicode {
+        b.unicode(false);
     }
     Ok(b.build(pattern)?)
 }
@@ -245,6 +251,9 @@ fn search_one(
         builder.encoding(Some(enc.clone()));
     }
     let mut searcher = builder.build();
+        .multi_line(opts.multiline)
+        .passthru(opts.passthru)
+        .build();
     let full = root.join(rel);
     // Paths print relative to the user's cwd, not the index root: strip
     // the scope prefix (no-op when the search ran at the root itself).
@@ -443,14 +452,22 @@ pub fn run(
             if let Some(s) = &stats {
                 merge_stats(&mut total_stats, s);
             }
-            if matched {
-                found = true;
+            // Write any produced output, not just matches: --passthru
+            // emits every line including non-matching ones, so a
+            // no-match file can still produce bytes.
+            if matched || !buf.is_empty() {
+                if matched {
+                    found = true;
+                }
                 let global_i = base + i;
                 if opts.files_with_matches {
                     let display = files[global_i]
                         .strip_prefix(&opts.display_prefix)
                         .unwrap_or(&files[global_i]);
                     writeln!(out, "{}", display.display())?;
+                    if matched {
+                        writeln!(out, "{}", files[global_i].display())?;
+                    }
                 } else {
                     if separate && printed_any {
                         writeln!(out, "--")?;
@@ -563,6 +580,8 @@ mod tests {
             count_matches: false,
             color: false,
             color_specs: Vec::new(),
+            passthru: false,
+            unicode: true,
         }
     }
 
