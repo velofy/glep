@@ -476,6 +476,39 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn ignore_file_filters_results() {
+    let dir = corpus();
+    let extra = dir.path().join("extra.ignore");
+    std::fs::write(&extra, "src/\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--ignore-file", extra.to_str().unwrap(), "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"));
+    assert!(!s.contains("lib.rs"), "{s}");
+}
+
+#[test]
+fn require_git_outside_repo_live_scans_gitignored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(dir.path().join("x.log"), "hello log\n").unwrap();
+    std::fs::write(dir.path().join("x.txt"), "hello txt\n").unwrap();
+    // no .git: gitignore is inert under --require-git -> x.log matches
+    let out = glep(dir.path())
+        .args(["--require-git", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("x.log"), "{s}");
+    // without the flag, .gitignore applies and x.log is skipped
+    let out = glep(dir.path()).args(["-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s.contains("x.log"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
