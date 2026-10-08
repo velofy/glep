@@ -141,6 +141,10 @@ pub struct Args {
     /// Regex compiled-size limit (rg --regex-size-limit)
     #[arg(long, value_name = "BYTES")]
     pub regex_size_limit: Option<usize>,
+    /// Search inside gzip-compressed files by decompressing on the fly
+    /// (rg -z/--search-zip; gzip only for now — other formats search raw)
+    #[arg(short = 'z', long = "search-zip")]
+    pub search_zip: bool,
     /// Search ignored files too (gitignore/.ignore/global excludes all
     /// bypassed), rg semantics. Implemented as a live scan that never
     /// opens, updates, or writes the index: ignored trees (node_modules,
@@ -810,6 +814,7 @@ fn run_one_fs(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result
             .map(|v| v.clone().into_bytes()),
         context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
         pcre2: args.pcre2,
+        search_zip: args.search_zip,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -1070,6 +1075,9 @@ pub fn run() -> anyhow::Result<i32> {
     }
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, args.null_data);
+    if args.search_zip {
+        files.extend(idx.zip_candidates(args.hidden));
+    }
     files.extend(extra);
     let mut files = idx.candidates(
         &query_plan,
@@ -1120,6 +1128,7 @@ pub fn run() -> anyhow::Result<i32> {
             .map(|v| v.clone().into_bytes()),
         context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
         pcre2: args.pcre2,
+        search_zip: args.search_zip,
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on

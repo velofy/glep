@@ -297,6 +297,21 @@ impl Index {
         paths
     }
 
+    /// Live entries whose names carry a compressed extension (`-z`).
+    /// Compressed files are always candidate-side (their indexed
+    /// trigrams are compressed bytes — useless for narrowing decoded
+    /// content), so all of them join the scan set when -z is active.
+    /// Currently only gzip is supported; other extensions get scanned
+    /// raw (binary-quit finds nothing — same as -z off).
+    pub fn zip_candidates(&self, include_hidden: bool) -> Vec<PathBuf> {
+        self.manifest
+            .live_entries()
+            .filter(|e| include_hidden || e.flags & FLAG_HIDDEN == 0)
+            .filter(|e| e.path.extension().map(|x| x == "gz").unwrap_or(false))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
     pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
         self.update_impl(max_filesize, ttl_secs, None, None)
     }

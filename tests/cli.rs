@@ -689,6 +689,27 @@ fn pcre2_lookaround_and_backref() {
     assert!(s.contains("b.txt"), "{s}");
     // invalid under -P surfaces an error (not a silent miss)
     glep(dir.path()).args(["-P", "("]).assert().failure();
+fn search_zip_decompresses_gz() {
+    let dir = tempfile::tempdir().unwrap();
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"zipneedle packed\n").unwrap();
+    std::fs::write(dir.path().join("pack.gz"), enc.finish().unwrap()).unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "zipneedle plain\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-z", "-l", "zipneedle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("pack.gz"), "{s}");
+    assert!(s.contains("plain.txt"), "{s}");
+    // without -z the compressed file's raw bytes don't match
+    let out = glep(dir.path()).args(["-l", "zipneedle"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s.contains("pack.gz"), "{s}");
 }
 
 #[test]

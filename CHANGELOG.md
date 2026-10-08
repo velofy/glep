@@ -24,6 +24,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags: `--null-data` (NUL is the record separator — matcher + searcher line terminators switch to NUL, binary detection turns off, and binary-flagged files join the candidates since NULs are data there), `--dfa-size-limit`, `--regex-size-limit`, `--one-file-system` (live scan that stays on the root's filesystem; mount-point subtrees never enter the index).
 - New flags: `--field-match-separator`, `--field-context-separator` (printer-level byte sequences), `--context-separator` (replaces the between-file `--`; empty disables it).
 - New `-P`/`--pcre2`: PCRE2 engine (lookaround, backrefs, atomic groups...) via grep-pcre2 with JIT. The search path is now generic over `Matcher` (one monomorphized copy per engine); PCRE2-only syntax simply degrades the index plan to a full scan — never a wrong answer.
+- New `-z`/`--search-zip`: `.gz` files are decompressed through flate2 and searched in-stream (a corrupt or mislabeled `.gz` warns per-file and the run continues). Non-gz extensions search raw, same as before.
 
 ## 0.3.1 (2026-09-30)
 

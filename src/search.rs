@@ -75,6 +75,8 @@ pub struct SearchOpts {
     pub context_separator: Option<Vec<u8>>,
     /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
     pub pcre2: bool,
+    /// -z: decompress .gz files via flate2 and search the decoded stream.
+    pub search_zip: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -274,6 +276,58 @@ impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
 
 fn search_one<M: grep_matcher::Matcher>(
     matcher: &M,
+/// The compressed-body half of `search_one`: identical sink wiring,
+/// but the source is a decoded reader rather than a path.
+fn search_one_decoded<R: std::io::Read>(
+    matcher: &grep_regex::RegexMatcher,
+    mut reader: R,
+    rel: &Path,
+    opts: &SearchOpts,
+    searcher: &mut grep_searcher::Searcher,
+) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
+    if opts.count {
+        let mut sink = CountSink {
+            matcher,
+            multiline: opts.multiline,
+            count: 0,
+        };
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        if sink.count > 0 {
+            return Ok((
+                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
+                true,
+                None,
+            ));
+        }
+        return Ok((Vec::new(), false, None));
+    }
+    if opts.files_with_matches {
+        let mut sink = FoundSink(false);
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        return Ok((Vec::new(), sink.0, None));
+    }
+    let mut buf = Vec::new();
+    let matched;
+    let mut stats = None;
+    if opts.json {
+        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, rel);
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        matched = sink.has_match();
+        stats = Some(sink.stats().clone());
+    } else {
+        let mut printer = grep_printer::StandardBuilder::new()
+            .heading(false)
+            .build_no_color(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, rel);
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        matched = sink.has_match();
+    }
+    Ok((buf, matched, stats))
+}
+
+fn search_one(
+    matcher: &grep_regex::RegexMatcher,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
@@ -315,6 +369,24 @@ fn search_one<M: grep_matcher::Matcher>(
     } else {
         rel.strip_prefix(&opts.display_prefix).unwrap_or(rel)
     };
+    // -z: compressed files search their decoded stream, never their raw
+    // bytes. Everything else (and unsupported formats) search normally.
+    let compressed = opts.search_zip
+        && rel.extension().map(|x| x == "gz").unwrap_or(false);
+    if compressed {
+        let file = std::fs::File::open(&full)?;
+        let mut dec = flate2::read::GzDecoder::new(file);
+        // A corrupt/mislabeled .gz yields an io error mid-decode; report
+        // it per-file and move on (the reference does the same: a bordered
+        // gzip warning to stderr, other files still searched).
+        return match search_one_decoded(matcher, &mut dec, rel, opts, &mut searcher) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                eprintln!("glep: {}: {e}", rel.display());
+                Ok((Vec::new(), false, None))
+            }
+        };
+    }
     if opts.count {
     if opts.count || opts.count_matches {
         let mut sink = CountSink {
@@ -710,6 +782,7 @@ mod tests {
             field_context_separator: None,
             context_separator: None,
             pcre2: false,
+            search_zip: false,
         }
     }
 
