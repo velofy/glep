@@ -603,6 +603,20 @@ fn require_git_outside_repo_live_scans_gitignored() {
     let out = glep(dir.path()).args(["-l", "hello"]).assert().success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(!s.contains("x.log"), "{s}");
+fn unrestricted_count_maps_to_flags() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".gitignore"), "x.log\n").unwrap();
+    std::fs::write(dir.path().join("x.log"), "hello log\n").unwrap();
+    std::fs::write(dir.path().join(".hid.txt"), "hello hid\n").unwrap();
+    // -u: no-ignore (log found, hidden not)
+    let out = glep(dir.path()).args(["-u", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("x.log"), "{s}");
+    assert!(!s.contains(".hid.txt"), "{s}");
+    // -uu: + hidden
+    let out = glep(dir.path()).args(["-uu", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains(".hid.txt"), "{s}");
 }
 
 #[test]

@@ -18,6 +18,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New `-L`/`--follow`: follows symlinks during search. Implemented as a live-scan escape hatch (like `--no-ignore`): files reached through symlinked dirs aren't in the index, so index narrowing can't soundly narrow them — `-L` sweeps the followed tree (ignore rules still apply) and scans the result.
 - New flags: `--sort`/`--sortr` (path, modified via manifest mtimes, accessed/created via stat, none), `-T`/`--type-not`, `--count-matches` (occurrences vs `-c`'s lines), `--engine` (accepts `default`/`auto`, errors on others like the reference), `--no-config` no-op.
 - New flags: `--require-git` (git-derived ignore rules apply only inside a real repo; outside, `gitignored` files aren't indexed so a live scan covers them), `--ignore-file` (extra rules file, resolved relative to its dir — narrows candidates post-hoc).
+- New flags: `--color=always|auto|never` (rg's default spec set; `auto` colors only on a tty), `--colors` user spec overrides, `-u`/`-uu` unrestricted aliases (fold into `--no-ignore`/`--hidden`; `-uuu` reserved until `-a` lands).
 
 ## 0.3.1 (2026-09-30)
 

@@ -220,6 +220,11 @@ fn parity_with_ripgrep() {
         // --sort/--sortr on the small corpus
         &["--sort", "modified", "-l", "hello"],
         &["--sortr", "path", "-l", "hello"],
+        // --color always: single-file match keeps order identical;
+        // ANSI sequences compared literally
+        &["--color", "always", "fn main"],
+        // -u/-uu fold into --no-ignore/--hidden
+        &["-u", "-l", "hello"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

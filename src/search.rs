@@ -49,6 +49,12 @@ pub struct SearchOpts {
     pub encoding: Option<String>,
     /// rg --line-buffered: flush after every record.
     pub line_buffered: bool,
+    /// --color always: emit ANSI colors (rg's default spec set +
+    /// any --colors overrides). auto/never resolve to false here —
+    /// tty detection happens in cli.
+    pub color: bool,
+    /// Extra UserColorSpec strings from --colors, parsed in run().
+    pub color_specs: Vec<String>,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -334,6 +340,26 @@ fn search_one(
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
         stats = sink.stats().cloned();
+        let mut b = grep_printer::StandardBuilder::new();
+        b.heading(false);
+        if opts.color {
+            let mut all = grep_printer::default_color_specs();
+            for s in &opts.color_specs {
+                if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
+                    all.push(spec);
+                }
+            }
+            b.color_specs(grep_printer::ColorSpecs::new(&all));
+            let mut printer = b.build(termcolor::Ansi::new(&mut buf));
+            let mut sink = printer.sink_with_path(matcher, rel);
+            searcher.search_path(matcher, &full, &mut sink)?;
+            matched = sink.has_match();
+        } else {
+            let mut printer = b.build_no_color(&mut buf);
+            let mut sink = printer.sink_with_path(matcher, rel);
+            searcher.search_path(matcher, &full, &mut sink)?;
+            matched = sink.has_match();
+        }
     }
     Ok((buf, matched, stats))
 }
@@ -535,6 +561,8 @@ mod tests {
             encoding: None,
             line_buffered: false,
             count_matches: false,
+            color: false,
+            color_specs: Vec::new(),
         }
     }
 

@@ -77,6 +77,17 @@ pub struct Args {
     /// rg --ignore-file). Rules resolve relative to the file's dir.
     #[arg(long, value_name = "PATH")]
     pub ignore_file: Vec<std::path::PathBuf>,
+    /// Unrestricted search: -u = --no-ignore, -uu = --no-ignore + --hidden.
+    /// (-uuu also implies -a/--text; reserved until binary text mode lands.)
+    #[arg(short = 'u', action = clap::ArgAction::Count)]
+    pub unrestricted: u8,
+    /// Color output: never (default), always, auto (when stdout is a tty).
+    /// --colors sets individual specs like the reference's --colors flag.
+    #[arg(long, value_name = "WHEN")]
+    pub color: Option<String>,
+    /// Additional color spec, e.g. --colors 'path:fg:magenta' (repeatable)
+    #[arg(long = "colors", value_name = "COLOR_SPEC")]
+    pub color_specs: Vec<String>,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -333,6 +344,18 @@ fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool
         }
     }
     missing
+/// --color WHEN resolution: `always` and `auto`+tty enable ANSI output;
+/// `never` and anything else disable it. `auto` on a piped stream is the
+/// common path (agents capture stdout), so it stays colorless there.
+fn want_color(args: &Args) -> bool {
+    match args.color.as_deref() {
+        Some("always") => true,
+        Some("auto") | None => {
+            use std::io::IsTerminal;
+            std::io::stdout().is_terminal()
+        }
+        _ => false,
+    }
 }
 
 fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
@@ -592,6 +615,8 @@ fn run_live_files(
         multiline_dotall: args.multiline_dotall,
         encoding: args.encoding.clone(),
         line_buffered: args.line_buffered,
+        color: want_color(&args),
+        color_specs: args.color_specs.clone(),
     };
     let opts = search_opts(args, root);
     let stdout = std::io::stdout();
@@ -686,6 +711,15 @@ pub fn run() -> anyhow::Result<i32> {
     if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
         args.paths.push(cwd_rel.clone());
     }
+    // -u/-uu/-uuu fold into their flag equivalents (rg semantics).
+    if args.unrestricted > 0 {
+        args.no_ignore = true;
+        if args.unrestricted >= 2 {
+            args.hidden = true;
+        }
+    }
+    let root = std::env::current_dir()?;
+    normalize_path_filters(&mut args.paths, &root);
 
     // Subcommand-style words in the pattern slot.
     if args.regexp.is_empty() && !args.files && !args.no_ignore {
@@ -907,6 +941,8 @@ pub fn run() -> anyhow::Result<i32> {
         multiline_dotall: args.multiline_dotall,
         encoding: args.encoding.clone(),
         line_buffered: args.line_buffered,
+        color: want_color(&args),
+        color_specs: args.color_specs.clone(),
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on
