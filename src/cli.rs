@@ -43,6 +43,17 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Unrestricted search: -u = --no-ignore, -uu = --no-ignore + --hidden.
+    /// (-uuu also implies -a/--text; reserved until binary text mode lands.)
+    #[arg(short = 'u', action = clap::ArgAction::Count)]
+    pub unrestricted: u8,
+    /// Color output: never (default), always, auto (when stdout is a tty).
+    /// --colors sets individual specs like the reference's --colors flag.
+    #[arg(long, value_name = "WHEN")]
+    pub color: Option<String>,
+    /// Additional color spec, e.g. --colors 'path:fg:magenta' (repeatable)
+    #[arg(long = "colors", value_name = "COLOR_SPEC")]
+    pub color_specs: Vec<String>,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -86,6 +97,20 @@ fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
         } else if let Ok(stripped) = p.strip_prefix(".") {
             *p = stripped.to_path_buf();
         }
+    }
+}
+
+/// --color WHEN resolution: `always` and `auto`+tty enable ANSI output;
+/// `never` and anything else disable it. `auto` on a piped stream is the
+/// common path (agents capture stdout), so it stays colorless there.
+fn want_color(args: &Args) -> bool {
+    match args.color.as_deref() {
+        Some("always") => true,
+        Some("auto") | None => {
+            use std::io::IsTerminal;
+            std::io::stdout().is_terminal()
+        }
+        _ => false,
     }
 }
 
@@ -166,6 +191,8 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        color: want_color(&args),
+        color_specs: args.color_specs.clone(),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -183,6 +210,13 @@ pub fn run() -> anyhow::Result<i32> {
     if args.regexp.is_some() && !args.files {
         if let Some(p) = args.pattern.take() {
             args.paths.insert(0, PathBuf::from(p));
+        }
+    }
+    // -u/-uu/-uuu fold into their flag equivalents (rg semantics).
+    if args.unrestricted > 0 {
+        args.no_ignore = true;
+        if args.unrestricted >= 2 {
+            args.hidden = true;
         }
     }
     let root = std::env::current_dir()?;
@@ -277,6 +311,8 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        color: want_color(&args),
+        color_specs: args.color_specs.clone(),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
