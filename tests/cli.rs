@@ -476,6 +476,30 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn search_zip_decompresses_gz() {
+    let dir = tempfile::tempdir().unwrap();
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"zipneedle packed\n").unwrap();
+    std::fs::write(dir.path().join("pack.gz"), enc.finish().unwrap()).unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "zipneedle plain\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-z", "-l", "zipneedle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("pack.gz"), "{s}");
+    assert!(s.contains("plain.txt"), "{s}");
+    // without -z the compressed file's raw bytes don't match
+    let out = glep(dir.path()).args(["-l", "zipneedle"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s.contains("pack.gz"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
