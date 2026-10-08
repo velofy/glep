@@ -814,6 +814,51 @@ fn type_list_and_add() {
 }
 
 #[test]
+fn pretty_and_compat_aliases() {
+    let dir = corpus();
+    // -p forces color+heading+line-numbers
+    let out = glep(dir.path()).args(["-p", "hello"]).assert().success();
+    let s = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(s.contains("\x1b["), "{s:?}");
+    // --passthrough == --passthru, --print0 == -0, --sort-files == --sort path
+    glep(dir.path())
+        .args(["--passthrough", "hello"])
+        .assert()
+        .success();
+    let out = glep(dir.path()).args(["--print0", "-l", "hello"]).assert().success();
+    assert!(out.get_output().stdout.contains(&0));
+    glep(dir.path())
+        .args(["--sort-files", "-l", "hello"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn pcre2_version_flag() {
+    let out = glep(&std::env::current_dir().unwrap())
+        .arg("--pcre2-version")
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.starts_with("PCRE2 "), "{s}");
+    assert!(s.contains("available"), "{s}");
+}
+
+#[test]
+fn glob_case_insensitive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.MD"), "hello\n").unwrap();
+    // -g '*.md' without --glob-case-insensitive misses .MD
+    glep(dir.path()).args(["-g", "*.md", "-l", "hello"]).assert().failure();
+    let out = glep(dir.path())
+        .args(["-g", "*.md", "--glob-case-insensitive", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("README.MD"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);

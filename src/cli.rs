@@ -153,8 +153,10 @@ pub struct Args {
     /// (rg --no-ignore-messages). Nonfatal IO warnings stay.
     #[arg(long)]
     pub no_ignore_messages: bool,
-    /// Suppress all nonfatal per-file warnings (rg --no-messages).
-    #[arg(long)]
+    /// Suppress all nonfatal per-file warnings (rg -s/--no-messages).
+    /// -s only silences errors; the missing-path check in run() still
+    /// reports operand problems (same class split as the reference).
+    #[arg(short = 's', long = "no-messages")]
     pub no_messages: bool,
     /// With -M, show a truncation preview marker on long lines
     /// (rg --max-columns-preview)
@@ -175,6 +177,39 @@ pub struct Args {
     /// Print all known file types and exit (rg --type-list)
     #[arg(long)]
     pub type_list: bool,
+    /// Alias spellings accepted for script compat (rg --passthrough,
+    /// --print0 = -0, --sort-files = --sort path)
+    #[arg(long = "passthrough", hide = true, overrides_with = "passthru")]
+    pub passthrough_alias: bool,
+    #[arg(long, hide = true)]
+    pub print0: bool,
+    #[arg(long = "sort-files", hide = true)]
+    pub sort_files: bool,
+    /// rg -p/--pretty: colors + heading + line numbers
+    #[arg(short = 'p', long = "pretty")]
+    pub pretty: bool,
+    /// Print the PCRE2 version and exit (rg --pcre2-version)
+    #[arg(long)]
+    pub pcre2_version: bool,
+    /// Make -g/--glob globs case-insensitive (rg --glob-case-insensitive)
+    #[arg(long)]
+    pub glob_case_insensitive: bool,
+    /// Case-insensitive ignore-file rule matching (rg --ignore-file-case-insensitive)
+    #[arg(long)]
+    pub ignore_file_case_insensitive: bool,
+    /// Emit OSC8 hyperlinks for file paths, in the given format
+    /// (rg --hyperlink-format; e.g. kitty, default, file)
+    #[arg(long, value_name = "FORMAT")]
+    pub hyperlink_format: Option<String>,
+    /// The hostname part embedded in hyperlinks (rg --hostname-bin)
+    #[arg(long, value_name = "HOSTNAME")]
+    pub hostname_bin: Option<String>,
+    /// Verbose debug output on stderr (rg --debug)
+    #[arg(long, conflicts_with = "quiet")]
+    pub debug: bool,
+    /// Trace-level debug output on stderr (rg --trace)
+    #[arg(long)]
+    pub trace: bool,
     /// NUL is the line terminator (rg --null-data)
     #[arg(long = "null-data")]
     pub null_data: bool,
@@ -232,8 +267,8 @@ pub struct Args {
     #[arg(long)]
     pub include_zero: bool,
     /// Only search files at most N levels below each path operand
-    /// (rg --max-depth; a file operand itself is depth 0)
-    #[arg(long, visible_alias = "maxdepth")]
+    /// (rg --max-depth/-d; a file operand itself is depth 0)
+    #[arg(short = 'd', long, visible_alias = "maxdepth", alias = "depth")]
     pub max_depth: Option<usize>,
     /// Worker thread count, 0 for auto (rg -j/--threads)
     #[arg(short = 'j', long = "threads")]
@@ -291,6 +326,10 @@ pub struct Args {
     /// Print each file's path on its own line above its matches
     #[arg(long)]
     pub heading: bool,
+    /// Inverse of --heading for scripts that may turn it back off
+    /// (rg --no-heading)
+    #[arg(long = "no-heading", overrides_with = "heading", hide = true)]
+    pub no_heading: bool,
     /// Suppress all output; the exit code alone reports whether a match
     /// exists (--json still emits the closing summary event, like rg)
     #[arg(short = 'q', long = "quiet")]
@@ -314,7 +353,7 @@ fn parse_path_separator(s: &str) -> Result<u8, String> {
     }
 }
 
-fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
+fn build_glob_icase(g: &str, icase: bool) -> anyhow::Result<globset::GlobMatcher> {
     // gitignore semantics: a slash-free pattern matches at any depth;
     // once a pattern contains a slash, * must not cross separators.
     let pat = if g.contains('/') {
@@ -324,6 +363,7 @@ fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
     };
     Ok(globset::GlobBuilder::new(&pat)
         .literal_separator(true)
+        .case_insensitive(icase)
         .build()?
         .compile_matcher())
 }
@@ -497,6 +537,7 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         // whitelist, `!` negates, last matching rule wins; with only
         // negations, unmatched files pass.
         let mut ob = ignore::overrides::OverrideBuilder::new("");
+        ob.case_insensitive(args.glob_case_insensitive)?;
         for g in &args.globs {
             ob.add(g)?;
         }
@@ -511,6 +552,7 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         for p in &args.ignore_file {
             let parent = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
             let mut b = ignore::gitignore::GitignoreBuilder::new(&parent);
+            b.case_insensitive(args.ignore_file_case_insensitive)?;
             if let Some(e) = b.add(p) {
                 anyhow::bail!("{}: {e}", p.display());
             }
@@ -724,6 +766,8 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         max_columns_preview: args.max_columns_preview,
         stop_on_nonmatch: args.stop_on_nonmatch,
         no_messages: args.no_messages || args.no_ignore_messages,
+        hyperlink_format: args.hyperlink_format.clone(),
+        hostname_bin: args.hostname_bin.clone(),
     }
 }
 
@@ -742,7 +786,7 @@ fn run_live_files(
     if args.files {
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
-            let glob = build_glob(g)?;
+            let glob = build_glob_icase(g, args.glob_case_insensitive)?;
             files.retain(|f| glob.is_match(f));
         }
         apply_filters(&mut files, args)?;
@@ -928,6 +972,12 @@ pub fn run() -> anyhow::Result<i32> {
     // Missing path filters are errors (exit 2), checked against the cwd
     // before paths are relativized into the index tree.
     let had_error = report_missing_paths(&args.paths, &cwd, args.files);
+    // Missing operands were already reported — drop them so the sweeps
+    // don't re-error on the same paths (search continues with the valid
+    // ones, matching the reference's report-and-continue contract).
+    if had_error {
+        args.paths.retain(|p| cwd.join(p).exists());
+    }
     normalize_path_filters(&mut args.paths, &root, &cwd_rel);
     // No explicit paths: the implicit scope is the cwd subtree (rg's
     // default `.`). At the discovered root itself this is "" — everything.
@@ -952,6 +1002,41 @@ pub fn run() -> anyhow::Result<i32> {
             println!("{}: {}", d.name(), d.globs().join(", "));
         }
         return Ok(0);
+    }
+
+    // --pcre2-version prints and exits before any index work.
+    if args.pcre2_version {
+        let jit = if grep_pcre2::is_jit_available() { " (JIT is available)" } else { "" };
+                let (maj, min) = grep_pcre2::version();
+        println!("PCRE2 {}.{:02} is available{}", maj, min, jit);
+        return Ok(0);
+    }
+    // Compat spellings fold into their canonical flags.
+    if args.passthrough_alias {
+        args.passthru = true;
+    }
+    if args.print0 {
+        args.null = true;
+    }
+    if args.sort_files {
+        args.sort = Some("path".to_string());
+    }
+    if args.pretty {
+        // -p: colors + heading + line numbers, like rg --pretty.
+        args.color = Some("always".to_string());
+        args.heading = true;
+        args.line_number = true;
+    }
+    if args.no_heading {
+        args.heading = false;
+    }
+    if args.debug || args.trace {
+        eprintln!(
+            "glep: DEBUG cwd={} threads={} pattern={:?}",
+            cwd.display(),
+            args.threads.map(|t| t.to_string()).unwrap_or("auto".into()),
+            args.pattern
+        );
     }
 
     // --engine validates before any index work (rg errors at arg-parse).
@@ -1061,7 +1146,7 @@ pub fn run() -> anyhow::Result<i32> {
         files.dedup();
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
-            let glob = build_glob(g)?;
+            let glob = build_glob_icase(g, args.glob_case_insensitive)?;
             files.retain(|f| glob.is_match(f));
         }
         let args2 = Args { pattern: None, ..args };

@@ -85,6 +85,10 @@ pub struct SearchOpts {
     pub stop_on_nonmatch: bool,
     /// rg --no-messages: suppress per-file nonfatal warnings.
     pub no_messages: bool,
+    /// OSC8 hyperlink format for emitted paths (rg --hyperlink-format).
+    pub hyperlink_format: Option<String>,
+    /// Hostname variable inside hyperlink formats (rg --hostname-bin).
+    pub hostname_bin: Option<String>,
     pub word: bool,
     pub line_regexp: bool,
     pub smart_case: bool,
@@ -388,6 +392,12 @@ fn run_printer_sinks<M: grep_matcher::Matcher, R: std::io::Read>(
 }
 
 /// The StandardBuilder config shared by the no-color and ANSI paths.
+/// Hostname for `{host}` hyperlink variables — same lookup the
+/// reference uses (gethostname); None when undiscoverable.
+fn hostname() -> Option<String> {
+    hostname::get().ok().map(|h| h.to_string_lossy().into_owned())
+}
+
 fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder {
     let mut b = grep_printer::StandardBuilder::new();
     b.heading(opts.heading)
@@ -403,6 +413,13 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         .path_terminator(opts.path_terminator)
         .separator_path(opts.path_separator)
         .stats(opts.stats);
+    if let Some(fmt) = &opts.hyperlink_format {
+        if let Ok(hf) = fmt.parse::<grep_printer::HyperlinkFormat>() {
+            let mut env = grep_printer::HyperlinkEnvironment::new();
+            env.host(opts.hostname_bin.clone().or_else(hostname));
+            b.hyperlink(hf.into_config(env));
+        }
+    }
     if let Some(s) = &opts.field_match_separator {
         b.separator_field_match(s.clone());
     }
@@ -920,6 +937,8 @@ mod tests {
             max_columns_preview: false,
             stop_on_nonmatch: false,
             no_messages: false,
+            hyperlink_format: None,
+            hostname_bin: None,
         }
     }
 

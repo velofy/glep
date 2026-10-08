@@ -348,7 +348,11 @@ pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
             match crate::walk_bulk::sweep_bulk(root) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    eprintln!("glep: bulk sweep failed ({e}), falling back to walker sweep");
+                    // ".ignore/.rgignore deferral" is an expected, quiet
+                    // fallback — only warn on real failures.
+                    if !e.to_string().ends_with("deferring to the walker") {
+                        eprintln!("glep: bulk sweep failed ({e}), falling back to walker sweep");
+                    }
                 }
             }
         }
