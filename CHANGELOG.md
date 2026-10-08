@@ -2,6 +2,12 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- Ancestor index discovery: running glep in a subdirectory finds the nearest `.glep/` upward (or `GLEP_INDEX_PATH`, which points at an index dir directly), scopes the search to the cwd subtree, and prints paths relative to the cwd — no more duplicate per-subdirectory indexes.
+- Missing path filters now print `glep: <path>: No such file or directory (os error 2)` and exit 2 instead of silently exiting 1; valid paths still produce their matches.
+- New `--no-index` flag: live gitignore-aware walk + scan that never opens the index (and never leaves a `.glep` behind).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
