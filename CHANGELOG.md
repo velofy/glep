@@ -32,6 +32,9 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 
 ## Unreleased
 
+- `-r/--replace` (printer `replacement`; captures resolve), `--pre`/`--pre-glob`
+  (search a command's stdout per file), `--crlf`, `--mmap`/`--no-mmap`,
+  `--block-buffered`, `--generate {man,complete-*}`
 - `--no-ignore-dot`/`--no-ignore-vcs`/`--no-ignore-exclude`/`--no-ignore-global`/`--no-ignore-parent`: per-source ignore toggles. Each is a live-scan escape hatch (files excluded by a disabled source aren't in the index) rooted at the operand dir so --no-ignore-parent is operand-relative like the reference.
 - `-uuu` completes the -u ladder (implies -a).
 - `--max-columns-preview`, `--stop-on-nonmatch`, `--no-messages`, `--no-ignore-messages`.

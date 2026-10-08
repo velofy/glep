@@ -175,6 +175,32 @@ pub struct Args {
     /// Print all known file types and exit (rg --type-list)
     #[arg(long)]
     pub type_list: bool,
+    /// Replace matched text in output lines; capture groups resolve as
+    /// $1/${name} (rg -r/--replace)
+    #[arg(short = 'r', long = "replace", value_name = "REPLACEMENT", conflicts_with = "json")]
+    pub replace: Option<String>,
+    /// Search each file's preprocessor output instead of its contents
+    /// (rg --pre; the path is passed as the command's sole argument)
+    #[arg(long, value_name = "COMMAND")]
+    pub pre: Option<String>,
+    /// Apply --pre only to files matching this glob (rg --pre-glob)
+    #[arg(long, value_name = "GLOB", requires = "pre")]
+    pub pre_glob: Option<String>,
+    /// Treat \r\n as the line terminator (rg --crlf)
+    #[arg(long)]
+    pub crlf: bool,
+    /// Use memory-mapped IO when searching files (rg --mmap)
+    #[arg(long)]
+    pub mmap: bool,
+    /// Never use memory maps (default; accepted for script compat)
+    #[arg(long, overrides_with = "mmap", hide = true)]
+    pub no_mmap: bool,
+    /// Accepted for script compat; glep streams output either way
+    #[arg(long, hide = true)]
+    pub block_buffered: bool,
+    /// Generate shell completions or man page and exit (rg --generate)
+    #[arg(long, value_name = "KIND", value_parser = ["man","complete-bash","complete-zsh","complete-fish","complete-powershell"])]
+    pub generate: Option<String>,
     /// NUL is the line terminator (rg --null-data)
     #[arg(long = "null-data")]
     pub null_data: bool,
@@ -724,6 +750,11 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         max_columns_preview: args.max_columns_preview,
         stop_on_nonmatch: args.stop_on_nonmatch,
         no_messages: args.no_messages || args.no_ignore_messages,
+        replace: args.replace.as_deref().map(|s| s.as_bytes().to_vec()),
+        pre: args.pre.clone(),
+        pre_glob: args.pre_glob.as_deref().map(build_glob).transpose().ok().flatten(),
+        crlf: args.crlf,
+        mmap_auto: args.mmap && !args.no_mmap,
     }
 }
 
@@ -935,6 +966,30 @@ pub fn run() -> anyhow::Result<i32> {
         args.paths.push(cwd_rel.clone());
     }
 
+    // --generate emits shell completions / a man page and exits.
+    if let Some(kind) = &args.generate {
+        use clap::CommandFactory;
+        let mut cmd = Args::command();
+        let mut out = std::io::stdout();
+        match kind.as_str() {
+            "man" => {
+                let man = clap_mangen::Man::new(cmd);
+                man.render(&mut out)?;
+            }
+            sh => {
+                let shell = match sh {
+                    "complete-bash" => clap_complete::Shell::Bash,
+                    "complete-zsh" => clap_complete::Shell::Zsh,
+                    "complete-fish" => clap_complete::Shell::Fish,
+                    "complete-powershell" => clap_complete::Shell::PowerShell,
+                    _ => anyhow::bail!("unsupported --generate kind: {sh}"),
+                };
+                clap_complete::generate(shell, &mut cmd, "glep", &mut out);
+            }
+        }
+        return Ok(0);
+    }
+
     // --type-list dumps the type table and exits (before any index work).
     if args.type_list {
         let mut tb = ignore::types::TypesBuilder::new();
@@ -1092,6 +1147,8 @@ pub fn run() -> anyhow::Result<i32> {
     //  -c --include-zero : every walked file emits `path:0`
     //  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
     //  -P patterns may use pcre2-only syntax (parse failure → Plan::All)
+    //  --pre     : the searched stream is a subprocess's output, not the
+    //              file's bytes — index trigrams can't narrow it.
     let utf8_only = match &args.encoding {
         Some(label) => grep_searcher::Encoding::new(label)
             .map_err(|e| anyhow::anyhow!("{label}: {e}"))?
@@ -1103,6 +1160,7 @@ pub fn run() -> anyhow::Result<i32> {
         || args.passthru
         || (args.count && args.include_zero)
         || !utf8_only
+        || args.pre.is_some()
     {
         crate::plan::Plan::All
     } else {

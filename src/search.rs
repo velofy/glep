@@ -85,6 +85,18 @@ pub struct SearchOpts {
     pub stop_on_nonmatch: bool,
     /// rg --no-messages: suppress per-file nonfatal warnings.
     pub no_messages: bool,
+    /// -r: rewrite matched text in output lines (capture refs like $1
+    /// resolve; byte-level, applied by the printer).
+    pub replace: Option<Vec<u8>>,
+    /// --pre COMMAND: search `COMMAND <path>`'s stdout instead of the file
+    /// (subprocess per candidate; --pre-glob restricts which paths get it).
+    pub pre: Option<String>,
+    /// --pre-glob: only --pre-process files matching this glob.
+    pub pre_glob: Option<globset::GlobMatcher>,
+    /// --crlf: CRLF-aware matching (matcher crlf mode).
+    pub crlf: bool,
+    /// --mmap: allow memory-map search strategy (rg --mmap; default off).
+    pub mmap_auto: bool,
     pub word: bool,
     pub line_regexp: bool,
     pub smart_case: bool,
@@ -231,6 +243,9 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
         // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
         b.line_terminator(Some(0));
     }
+    if opts.crlf {
+        b.crlf(true);
+    }
     if let Some(d) = opts.dfa_size_limit {
         b.dfa_size_limit(d);
     }
@@ -322,6 +337,12 @@ fn build_searcher(opts: &SearchOpts, encoding: Option<&grep_searcher::Encoding>)
     if opts.null_data {
         sb.line_terminator(grep_matcher::LineTerminator::byte(0));
     }
+    if opts.mmap_auto {
+        // SAFETY: same contract rg opts into under --mmap — a file
+        // truncated while mapped can raise SIGBUS; that's the documented
+        // and accepted risk of the flag.
+        unsafe { sb.memory_map(grep_searcher::MmapChoice::auto()); }
+    }
     sb.build()
 }
 
@@ -400,6 +421,7 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         .only_matching(opts.only_matching)
         .max_columns(opts.max_columns)
         .max_columns_preview(opts.max_columns_preview)
+        .replacement(opts.replace.clone())
         .path_terminator(opts.path_terminator)
         .separator_path(opts.path_separator)
         .stats(opts.stats);
@@ -459,10 +481,9 @@ fn search_one<M: grep_matcher::Matcher>(
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
-    encoding: Option<&grep_searcher::Encoding>,
+    searcher: &mut grep_searcher::Searcher,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = build_searcher(opts, encoding);
-    let full = root.join(rel);
+        let full = root.join(rel);
     // Paths print relative to the user's cwd, not the index root: strip
     // the scope prefix (no-op when the search ran at the root itself).
     let display: &Path = if opts.display_prefix.as_os_str().is_empty() {
@@ -470,6 +491,33 @@ fn search_one<M: grep_matcher::Matcher>(
     } else {
         rel.strip_prefix(&opts.display_prefix).unwrap_or(rel)
     };
+    // --pre: run the preprocessor on the file and search its stdout
+    // (--pre-glob restricts which candidates get it; the rest search raw).
+    if let Some(cmd) = &opts.pre {
+        let use_pre = opts
+            .pre_glob
+            .as_ref()
+            .map(|g| g.is_match(rel))
+            .unwrap_or(true);
+        if use_pre {
+            match std::process::Command::new(cmd)
+                .arg(&full)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let out = child.stdout.take().unwrap();
+                    let r = search_reader_sinks(matcher, searcher, out, display, opts);
+                    let _ = child.wait();
+                    return r.map_err(|e| anyhow::anyhow!("{e}"));
+                }
+                Err(e) => {
+                    anyhow::bail!("{}: {e}", rel.display());
+                }
+            }
+        }
+    }
     // -z: compressed files search their decoded stream, never their raw
     // bytes. Everything else (and unsupported formats) search normally.
     let compressed = opts.search_zip
@@ -480,7 +528,7 @@ fn search_one<M: grep_matcher::Matcher>(
         // A corrupt/mislabeled .gz yields an io error mid-decode; report
         // it per-file and move on (a bordered warning, other files still
         // searched — same contract).
-        return match search_reader_sinks(matcher, &mut searcher, dec, display, opts) {
+        return match search_reader_sinks(matcher, searcher, dec, display, opts) {
             Ok(v) => Ok(v),
             Err(e) => {
                 if !opts.no_messages { eprintln!("glep: {}: {e}", rel.display()); }
@@ -537,7 +585,7 @@ fn search_one<M: grep_matcher::Matcher>(
         searcher.search_path(matcher, &full, &mut sink)?;
         return Ok((Vec::new(), sink.0, None));
     }
-    run_printer_sinks::<M, std::io::Empty>(matcher, &mut searcher, display, opts, SearchSrc::Path(&full))
+    run_printer_sinks::<M, std::io::Empty>(matcher, searcher, display, opts, SearchSrc::Path(&full))
 }
 
 /// Write `rel` honoring --path-separator (components rejoined by the
@@ -742,13 +790,19 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
         let results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
             .enumerate()
-            .map(|(i, rel)| match search_one(matcher, root, rel, opts, encoding.as_ref()) {
+            // One searcher per rayon worker: build is allocation-heavy
+            // (regex scratch + line buffers) — reusing it across the
+            // chunk removes most per-file overhead in full scans.
+            .map_init(
+                || build_searcher(opts, encoding.as_ref()),
+                |searcher, (i, rel)| match search_one(matcher, root, rel, opts, searcher) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     if !opts.no_messages { eprintln!("glep: {}: {}", rel.display(), e); }
                     (i, Vec::new(), false, None)
                 }
-            })
+                },
+            )
             .collect();
         let mut stop = false;
         for (i, buf, matched, stats) in results {
@@ -920,6 +974,11 @@ mod tests {
             max_columns_preview: false,
             stop_on_nonmatch: false,
             no_messages: false,
+            replace: None,
+            pre: None,
+            pre_glob: None,
+            crlf: false,
+            mmap_auto: false,
         }
     }
 
