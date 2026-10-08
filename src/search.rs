@@ -416,30 +416,6 @@ fn search_reader_sinks<M: grep_matcher::Matcher, R: std::io::Read>(
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     if opts.count || opts.count_matches {
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
-    root: &Path,
-    rel: &Path,
-    opts: &SearchOpts,
-) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut sb = SearcherBuilder::new();
-    // --null-data makes NUL a record separator, so it can't stay a
-    // binary-detection signal — the searcher treats the file as text.
-    sb.binary_detection(if opts.null_data {
-        BinaryDetection::none()
-    } else {
-        BinaryDetection::quit(0)
-    })
-        .line_number(true)
-        .before_context(opts.before)
-        .after_context(opts.after)
-        .multi_line(opts.multiline);
-    if opts.null_data {
-        sb.line_terminator(grep_matcher::LineTerminator::byte(0));
-    }
-    let mut searcher = sb.build();
-    let full = root.join(rel);
-    if opts.count {
         let mut sink = CountSink {
             matcher,
             occurrences_mode: opts.count_matches || opts.multiline || opts.only_matching || opts.stats,
@@ -455,20 +431,9 @@ fn search_one(
                 line.push(opts.path_terminator.unwrap_or(b':'));
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
-            line.push(b'\n');
+            line.push(if opts.null_data { b'\0' } else { b'\n' });
             let stats = opts.stats.then(|| file_stats_buf(sink.count, sink.occurrences));
             return Ok((line, sink.count > 0, stats));
-        searcher.search_path(matcher, &full, &mut sink)?;
-        if sink.count > 0 {
-            // Under --null-data every output record is NUL-terminated
-            // (the field `:` stays; only the record end changes).
-            let term = if opts.null_data { b'\0' } else { b'\n' };
-            return Ok((
-                format!("{}:{}{}", rel.display(), sink.count, term as char)
-                    .into_bytes(),
-                true,
-                None,
-            ));
         }
         return Ok((Vec::new(), false, None));
     }
@@ -525,14 +490,15 @@ fn search_one<M: grep_matcher::Matcher>(
         searcher.search_path(matcher, &full, &mut sink)?;
         if sink.count > 0 || opts.include_zero {
             // `path` + field terminator (`:` normally, NUL under --null) +
-            // count; bare `N` when the path is suppressed.
+            // count; bare `N` when the path is suppressed. The record end
+            // is NUL under --null-data.
             let mut line = Vec::new();
             if opts.with_filename {
                 write_path(&mut line, display, opts.path_separator)?;
                 line.push(opts.path_terminator.unwrap_or(b':'));
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
-            line.push(b'\n');
+            line.push(if opts.null_data { b'\0' } else { b'\n' });
             let stats = opts.stats.then(|| {
                 file_stats(&full, sink.count, sink.occurrences)
             });
@@ -581,22 +547,6 @@ fn write_path<W: std::io::Write + ?Sized>(out: &mut W, rel: &Path, sep: Option<u
             }
             Ok(())
         }
-    let mut buf = Vec::new();
-    let matched;
-    let mut stats = None;
-    if opts.json {
-        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_path(matcher, &full, &mut sink)?;
-        matched = sink.has_match();
-        stats = Some(sink.stats().clone());
-    } else {
-        let mut printer_b = grep_printer::StandardBuilder::new();
-        printer_b.heading(false);
-        let mut printer = printer_b.build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_path(matcher, &full, &mut sink)?;
-        matched = sink.has_match();
     }
 }
 
@@ -838,19 +788,6 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
                         } else {
                             writeln!(out, "--")?;
                         }
-                let global_i = base + i;
-                if opts.files_with_matches {
-                    // -l names get the record terminator too: NUL under
-                    // --null-data, newline otherwise.
-                    if opts.null_data {
-                        out.write_all(files[global_i].as_os_str().as_encoded_bytes())?;
-                        out.write_all(b"\0")?;
-                    } else {
-                        writeln!(out, "{}", files[global_i].display())?;
-                    }
-                } else {
-                    if separate && printed_any {
-                        writeln!(out, "--")?;
                     }
                 }
             }
@@ -963,9 +900,6 @@ mod tests {
             heading: false,
             only_matching: false,
             quiet: false,
-            null_data: false,
-            dfa_size_limit: None,
-            regex_size_limit: None,
         }
     }
 

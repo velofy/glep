@@ -240,13 +240,6 @@ impl Index {
         // -c --include-zero counts them as 0).
         let binary_ok = |e: &manifest::FileEntry| {
             search_binary || e.flags & FLAG_SKIP_BINARY == 0
-        include_binary: bool,
-    ) -> Vec<PathBuf> {
-        // Binary-flagged files were never trigram-indexed; they only join
-        // when the mode can search them (e.g. --null-data treats NUL as a
-        // record separator rather than a binary signal).
-        let binary_ok = |e: &manifest::FileEntry| {
-            include_binary || e.flags & FLAG_SKIP_BINARY == 0
         };
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
@@ -280,7 +273,7 @@ impl Index {
                         .filter(|e| {
                             e.flags & FLAG_SKIP_TOO_LARGE != 0
                                 || (search_binary && e.flags & FLAG_SKIP_BINARY != 0)
-                                || (include_binary && e.flags & FLAG_SKIP_BINARY != 0)
+                                || (search_binary && e.flags & FLAG_SKIP_BINARY != 0)
                         })
                         .map(|e| e.id),
                 );
