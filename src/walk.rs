@@ -487,6 +487,36 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool, follow: bool) -> anyh
     Ok(v)
 }
 
+/// Portable sweep that stays on the root's filesystem (`--one-file-system`,
+/// rg `-x`... wait, that's `--one-file-system` not `-x`): all ignore
+/// sources on, hidden gated at the walker, and `same_file_system(true)`
+/// descends only into directories whose `st_dev` equals the root's.
+/// Deliberately walker-based (like `sweep_unfiltered`): the macOS bulk
+/// sweep has no mount filtering, and mount-point subtrees must not enter
+/// the index either — callers route this through the live-scan path.
+pub fn sweep_one_fs(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
+    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
+    let walker = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .hidden(!include_hidden)
+        .same_file_system(true)
+        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
+        .build_parallel();
+    let mut builder = CollectorBuilder {
+        root,
+        global: &collected,
+    };
+    walker.visit(&mut builder);
+    let mut v = collected.into_inner().unwrap();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
 #[cfg(test)]
 mod scoped_tests {
     use super::*;

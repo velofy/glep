@@ -645,6 +645,17 @@ fn unrestricted_count_maps_to_flags() {
     let out = glep(dir.path()).args(["-uu", "-l", "hello"]).assert().success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains(".hid.txt"), "{s}");
+fn null_data_searches_binaryish_files() {
+    let dir = tempfile::tempdir().unwrap();
+    // NUL-separated records: 'needle' on NUL-records 1 and 3
+    std::fs::write(dir.path().join("data.bin"), "aa\x00needle\x00bb\x00needle x\x00").unwrap();
+    let out = glep(dir.path())
+        .args(["--null-data", "needle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("data.bin:2:needle"), "{s}");
+    assert!(s.contains("data.bin:4:needle x"), "{s}");
 }
 
 #[test]

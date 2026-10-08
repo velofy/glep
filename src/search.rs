@@ -61,6 +61,12 @@ pub struct SearchOpts {
     pub passthru: bool,
     /// --no-unicode: matcher-level unicode off (\w, ., classes).
     pub unicode: bool,
+    /// --null-data: NUL is the line terminator (searcher + matcher).
+    pub null_data: bool,
+    /// --dfa-size-limit (None = default)
+    pub dfa_size_limit: Option<usize>,
+    /// --regex-size-limit
+    pub regex_size_limit: Option<usize>,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -166,6 +172,16 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
         b.dot_matches_new_line(true);
     if !opts.unicode {
         b.unicode(false);
+    if opts.null_data {
+        // NUL is the record separator: the matcher must know so `.`
+        // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
+        b.line_terminator(Some(0));
+    }
+    if let Some(d) = opts.dfa_size_limit {
+        b.dfa_size_limit(d);
+    }
+    if let Some(s) = opts.regex_size_limit {
+        b.size_limit(s);
     }
     Ok(b.build(pattern)?)
 }
@@ -245,6 +261,14 @@ fn search_one(
     let mut builder = SearcherBuilder::new();
     builder
         .binary_detection(BinaryDetection::quit(0))
+    let mut sb = SearcherBuilder::new();
+    // --null-data makes NUL a record separator, so it can't stay a
+    // binary-detection signal — the searcher treats the file as text.
+    sb.binary_detection(if opts.null_data {
+        BinaryDetection::none()
+    } else {
+        BinaryDetection::quit(0)
+    })
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
@@ -256,6 +280,10 @@ fn search_one(
         .multi_line(opts.multiline)
         .passthru(opts.passthru)
         .build();
+    if opts.null_data {
+        sb.line_terminator(grep_matcher::LineTerminator::byte(0));
+    }
+    let mut searcher = sb.build();
     let full = root.join(rel);
     // Paths print relative to the user's cwd, not the index root: strip
     // the scope prefix (no-op when the search ran at the root itself).
@@ -348,6 +376,10 @@ fn search_one(
             .stats(opts.stats)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
+        let mut printer_b = grep_printer::StandardBuilder::new();
+        printer_b.heading(false);
+        let mut printer = printer_b.build_no_color(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
         stats = sink.stats().cloned();
@@ -610,6 +642,9 @@ mod tests {
             color_specs: Vec::new(),
             passthru: false,
             unicode: true,
+            null_data: false,
+            dfa_size_limit: None,
+            regex_size_limit: None,
         }
     }
 
