@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New `-L`/`--follow`: follows symlinks during search. Implemented as a live-scan escape hatch (like `--no-ignore`): files reached through symlinked dirs aren't in the index, so index narrowing can't soundly narrow them — `-L` sweeps the followed tree (ignore rules still apply) and scans the result.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

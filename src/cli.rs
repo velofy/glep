@@ -47,6 +47,12 @@ pub struct Args {
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
     pub hidden: bool,
+    /// Follow symbolic links (-L/--follow). Live-scan escape hatch:
+    /// files reached through symlinked dirs are not in the index, so the
+    /// index can't narrow them — the query sweeps the followed tree and
+    /// scans everything (same trade as --no-ignore).
+    #[arg(short = 'L', long)]
+    pub follow: bool,
     /// Search ignored files too (gitignore/.ignore/global excludes all
     /// bypassed), rg semantics. Implemented as a live scan that never
     /// opens, updates, or writes the index: ignored trees (node_modules,
@@ -127,13 +133,37 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
 /// in walk.rs), so the result is not re-filtered by hidden here. The
 /// existing positional-path/glob/type filters (`apply_filters`, already
 /// normalized by the caller) and exit-code conventions are unchanged.
+/// `-L`/`--follow`: live-scan escape hatch — files reached through
+/// symlinked directories are never in the manifest, so index narrowing
+/// cannot find them; sweep the followed tree (ignore rules still
+/// applied — `-L` only changes traversal) and search everything. Same
+/// correctness-over-speed tradeoff as `--no-ignore`.
+fn run_follow(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_follow(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_follow");
+    run_live_files(root, args, timings, files)
+}
+
 fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
+    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden, args.follow)?
         .into_iter()
         .map(|m| m.path)
         .collect();
     timings.stage("sweep_unfiltered");
+    run_live_files(root, args, timings, files)
+}
 
+/// Shared tail of the live-scan escape hatches (`--no-ignore`, `-L`):
+/// --files listing and content search over an already-computed file set.
+fn run_live_files(
+    root: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    mut files: Vec<PathBuf>,
+) -> anyhow::Result<i32> {
     if args.files {
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
@@ -220,6 +250,9 @@ pub fn run() -> anyhow::Result<i32> {
 
     if args.no_ignore {
         return run_no_ignore(&root, &args, &mut timings);
+    }
+    if args.follow {
+        return run_follow(&root, &args, &mut timings);
     }
 
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
