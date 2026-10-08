@@ -476,7 +476,516 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn stats_block_appended() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--stats", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("2 matches\n"));
+    assert!(s.contains("2 matched lines\n"));
+    assert!(s.contains("2 files contained matches\n"));
+    assert!(s.contains("files searched\n"));
+    assert!(s.contains("seconds total\n"));
+    // and under -c the counters are exact (occurrences vs lines)
+    let out = glep(dir.path())
+        .args(["-c", "--stats", "o"]) // 'o' occurs twice on line 1 of notes.txt
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("notes.txt:2")); // hello + Kenobi
+}
+
+#[test]
+fn encoding_flag_transcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lat.txt"), b"caf\xe9 test\n").unwrap();
+    std::fs::write(dir.path().join("a.txt"), "caf ascii\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-E", "latin1", "café"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("lat.txt:1:café test"));
+    // 'café' (decoded side) does not appear in a.txt's "caf ascii"
+    assert!(!s.contains("a.txt"));
+    // unknown label errors
+    glep(dir.path())
+        .args(["-E", "bogus-enc", "x"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn multiple_e_patterns_union() {
+    let dir = corpus();
+    // notes.txt has "hello"+"Kenobi"; lib.rs has "hello" only.
+    glep(dir.path())
+        .args(["-e", "there", "-e", "kenobi", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\n");
+    glep(dir.path())
+        .args(["-e", "there", "-e", "hello_world", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\nsrc/lib.rs\n");
+    // -F with multiple -e: each arm is a literal, metachars don't parse.
+    glep(dir.path())
+        .args(["-F", "-e", "() {}", "-e", "kenobi", "-l"])
+        .assert()
+        .success()
+        .stdout("notes.txt\nsrc/lib.rs\n");
+    // -e makes positionals paths
+    glep(dir.path())
+        .args(["-e", "hello", "-l", "src"])
+        .assert()
+        .success()
+        .stdout("src/lib.rs\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_reaches_symlinked_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("real_target.txt"), "linktok real\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("realdir")).unwrap();
+    std::fs::write(dir.path().join("realdir/inner.txt"), "linktok inner\n").unwrap();
+    std::os::unix::fs::symlink("realdir", dir.path().join("linkdir")).unwrap();
+    std::os::unix::fs::symlink("real_target.txt", dir.path().join("linkfile.txt")).unwrap();
+
+    // default: links are not descended
+    let out = glep(dir.path()).args(["-l", "linktok"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("realdir/inner.txt"));
+    assert!(s.contains("real_target.txt"));
+    assert!(!s.contains("linkdir"));
+
+    // -L: linkdir path produces results through the link
+    let out = glep(dir.path()).args(["-L", "-l", "linktok"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("linkdir/inner.txt"), "{s}");
+    assert!(s.contains("linkfile.txt"), "{s}");
+}
+
+#[test]
+fn engine_rejects_unknown() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["--engine", "default", "hello"])
+        .assert()
+        .success();
+    glep(dir.path())
+        .args(["--engine", "bogus", "hello"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn ignore_file_filters_results() {
+    let dir = corpus();
+    let extra = dir.path().join("extra.ignore");
+    std::fs::write(&extra, "src/\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--ignore-file", extra.to_str().unwrap(), "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"));
+    assert!(!s.contains("lib.rs"));
+}
+
+#[test]
+fn pattern_file_unions_with_positional() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("pats.txt"), "hello\nworld\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
+    assert!(s.contains("src/lib.rs"), "{s}");
+    // -f + positional-as-path: 'src' is a path since -f is present
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l", "src"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(s, "src/lib.rs\n");
+}
+
+#[test]
+fn files_without_match_lists_non_matching() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--files-without-match", "hello_world"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
+    assert!(!s.contains("lib.rs"), "{s}");
+}
+
+#[test]
+fn require_git_outside_repo_live_scans_gitignored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(dir.path().join("x.log"), "hello log\n").unwrap();
+    std::fs::write(dir.path().join("x.txt"), "hello txt\n").unwrap();
+    // no .git: gitignore is inert under --require-git -> x.log matches
+    let out = glep(dir.path())
+        .args(["--require-git", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("x.log"), "{s}");
+    // without the flag, .gitignore applies and x.log is skipped
+    let out = glep(dir.path()).args(["-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s.contains("x.log"), "{s}");
+}
+
+#[test]
+fn unrestricted_count_maps_to_flags() {
+    let dir = corpus();
+    std::fs::write(dir.path().join(".gitignore"), "x.log\n").unwrap();
+    std::fs::write(dir.path().join("x.log"), "hello log\n").unwrap();
+    std::fs::write(dir.path().join(".hid.txt"), "hello hid\n").unwrap();
+    // -u: no-ignore (log found, hidden not)
+    let out = glep(dir.path()).args(["-u", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("x.log"), "{s}");
+    assert!(!s.contains(".hid.txt"), "{s}");
+    // -uu: + hidden
+    let out = glep(dir.path()).args(["-uu", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains(".hid.txt"), "{s}");
+}
+
+#[test]
+fn null_data_searches_binaryish_files() {
+    let dir = tempfile::tempdir().unwrap();
+    // NUL-separated records: 'needle' on NUL-records 1 and 3
+    std::fs::write(dir.path().join("data.bin"), "aa\x00needle\x00bb\x00needle x\x00").unwrap();
+    let out = glep(dir.path())
+        .args(["--null-data", "needle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("data.bin:2:needle"), "{s}");
+    assert!(s.contains("data.bin:4:needle x"), "{s}");
+}
+
+#[test]
+fn custom_separators() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--field-match-separator", "|", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt|1|hello"), "{s}");
+    // --context-separator replaces the between-file '--'
+    let out = glep(dir.path())
+        .args(["--context-separator", "==", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\n==\n"), "{s}");
+}
+
+#[test]
+fn pcre2_lookaround_and_backref() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.txt"), "fooxbar\nfooy\nlook(ahead)\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "aa bb aa\ncc dd\n").unwrap();
+    // lookahead: foo followed by x
+    let out = glep(dir.path()).args(["-P", "foo(?=x)", "-l"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("p.txt"), "{s}");
+    assert!(!s.contains("b.txt"), "{s}");
+    // backreference: repeated word
+    let out = glep(dir.path())
+        .args(["-P", "(\\w+) \\w+ \\1", "-l"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("b.txt"), "{s}");
+    // invalid under -P surfaces an error (not a silent miss)
+    glep(dir.path()).args(["-P", "("]).assert().failure();
+}
+
+#[test]
+fn search_zip_decompresses_gz() {
+    let dir = tempfile::tempdir().unwrap();
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    );
+    enc.write_all(b"zipneedle packed\n").unwrap();
+    std::fs::write(dir.path().join("pack.gz"), enc.finish().unwrap()).unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "zipneedle plain\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-z", "-l", "zipneedle"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("pack.gz"), "{s}");
+    assert!(s.contains("plain.txt"), "{s}");
+    // without -z the compressed file's raw bytes don't match
+    let out = glep(dir.path()).args(["-l", "zipneedle"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s.contains("pack.gz"), "{s}");
+}
+
+#[test]
+fn no_ignore_parent_toggles_parent_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
+    // parent .ignore hides a.txt by default
+    glep(&proj).args(["-l", "hello"]).assert().failure();
+    // --no-ignore-parent disables it -> live scan finds the file
+    let out = glep(&proj)
+        .args(["--no-ignore-parent", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("a.txt"), "{s}");
+}
+
+#[test]
+fn uuu_searches_binary_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("b.bin"), b"aa\x00hello\x00zz\n").unwrap();
+    let out = glep(dir.path()).args(["-uuu", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("b.bin"), "{s}");
+}
+
+#[test]
+fn max_columns_preview_marks_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "x".repeat(200) + "hello" + &"y".repeat(200);
+    std::fs::write(dir.path().join("long.txt"), format!("{long}\n")).unwrap();
+    let out = glep(dir.path())
+        .args(["-M", "50", "--max-columns-preview", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("[... omitted end of long line]"), "{s}");
+    // without the preview flag the marker is absent
+    let out = glep(dir.path()).args(["-M", "50", "hello"]).assert().success();
+    let s2 = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s2.contains("omitted end"), "{s2}");
+}
+
+#[test]
+fn type_list_and_add() {
+    let dir = corpus();
+    // --type-list prints the type table and exits (no index touched)
+    let out = glep(dir.path()).arg("--type-list").assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("rust:"), "{s}");
+    // --type-add registers a new glob for -t
+    std::fs::write(dir.path().join("m.weird"), "hello weird\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--type-add", "weird:*.weird", "-t", "weird", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("m.weird"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
+}
+
+/// Binary files are listed by --files and searched under -a/--binary, but
+/// the default quit detection suppresses them entirely.
+#[test]
+fn binary_files_suppressed_by_default() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("blob.bin"), b"aa\x00hello-bin\x00zz\n").unwrap();
+    // Default: no output, exit 1 — binary data suppresses the file.
+    glep(dir.path()).args(["hello-bin"]).assert().code(1);
+    // -a searches it as text and prints the raw line.
+    glep(dir.path())
+        .args(["-a", "hello-bin"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("blob.bin:1:aa"));
+    // --binary prints the notice rather than the matched line.
+    glep(dir.path())
+        .args(["--binary", "hello-bin"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("binary file matches"));
+    // --files already lists it (indexing and searching are distinct).
+    glep(dir.path())
+        .args(["--files"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("blob.bin"));
+}
+
+
+#[test]
+fn word_regexp_matches_whole_words_only() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("w.txt"), "aaafooaaa\nfoo bar\nxfooy\n").unwrap();
+    glep(dir.path())
+        .args(["-w", "foo"])
+        .assert()
+        .success()
+        .stdout("w.txt:2:foo bar\n");
+}
+
+#[test]
+fn line_regexp_matches_whole_lines_only() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("x.txt"), "foo\nxfoo\nfoo bar\n").unwrap();
+    glep(dir.path())
+        .args(["-x", "foo"])
+        .assert()
+        .success()
+        .stdout("x.txt:1:foo\n");
+}
+
+#[test]
+fn smart_case_resolves_from_pattern() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("c.txt"), "token\nTOKEN\nToken\n").unwrap();
+    glep(dir.path())
+        .args(["-S", "token"])
+        .assert()
+        .success()
+        .stdout("c.txt:1:token\nc.txt:2:TOKEN\nc.txt:3:Token\n");
+    glep(dir.path())
+        .args(["-S", "Token"])
+        .assert()
+        .success()
+        .stdout("c.txt:3:Token\n");
+}
+
+/// -v must print files that contain ZERO occurrences of the pattern:
+/// trigram narrowing would otherwise exclude them entirely (the index only
+/// knows which files contain a literal, and under inversion a file with no
+/// occurrences matches every line it has). This test guards that Plan::All
+/// fallback.
+#[test]
+fn invert_match_scans_files_without_the_literal() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-v", "hello"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:2:general kenobi"));
+    // Inversion composes with -c (count of non-matching lines).
+    glep(dir.path())
+        .args(["-v", "-c", "hello"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("notes.txt:1"));
+}
+
+#[test]
+fn max_count_stops_per_file() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("m.txt"), "m1\nm2\nm3\n").unwrap();
+    glep(dir.path())
+        .args(["-m", "1", "m"])
+        .assert()
+        .success()
+        .stdout("m.txt:1:m1\n");
+    // -m0: no output at all, exit 1 (rg semantics).
+    glep(dir.path()).args(["-m", "0", "m"]).assert().code(1);
+}
+
+#[test]
+fn only_matching_prints_match_parts_and_counts_matches() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("o.txt"), "foofoo\nfoo bar\n").unwrap();
+    glep(dir.path())
+        .args(["-o", "foo"])
+        .assert()
+        .success()
+        .stdout("o.txt:1:foo\no.txt:1:foo\no.txt:2:foo\n");
+    // With -o, -c counts matches rather than matched lines.
+    glep(dir.path())
+        .args(["-o", "-c", "foo"])
+        .assert()
+        .success()
+        .stdout("o.txt:3\n");
+}
+
+#[test]
+fn no_line_number_keeps_path_prefix() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-N", "hello"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt:hello there\nsrc/lib.rs:pub fn hello_world() {}\n"));
+}
+
+#[test]
+fn heading_groups_matches_under_path_lines() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--heading", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(
+        s,
+        p("notes.txt\n1:hello there\n\nsrc/lib.rs\n1:pub fn hello_world() {}\n")
+    );
+}
+
+#[test]
+fn quiet_suppresses_output_but_keeps_exit_code() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["-q", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(out.is_empty(), "-q must print nothing");
+    glep(dir.path()).args(["-q", "zz_absent_zz"]).assert().code(1);
+    // rg still emits the --json summary event under -q.
+    let out = glep(dir.path())
+        .args(["--json", "-q", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let summary: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(summary["type"], "summary");
 }
