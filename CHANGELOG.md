@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New flags: `--null-data` (NUL is the record separator — matcher + searcher line terminators switch to NUL, binary detection turns off, and binary-flagged files join the candidates since NULs are data there), `--dfa-size-limit`, `--regex-size-limit`, `--one-file-system` (live scan that stays on the root's filesystem; mount-point subtrees never enter the index).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

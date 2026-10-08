@@ -13,6 +13,12 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// --null-data: NUL is the line terminator (searcher + matcher).
+    pub null_data: bool,
+    /// --dfa-size-limit (None = default)
+    pub dfa_size_limit: Option<usize>,
+    /// --regex-size-limit
+    pub regex_size_limit: Option<usize>,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -114,6 +120,17 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     if opts.multiline {
         b.multi_line(true);
     }
+    if opts.null_data {
+        // NUL is the record separator: the matcher must know so `.`
+        // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
+        b.line_terminator(Some(0));
+    }
+    if let Some(d) = opts.dfa_size_limit {
+        b.dfa_size_limit(d);
+    }
+    if let Some(s) = opts.regex_size_limit {
+        b.size_limit(s);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -167,13 +184,22 @@ fn search_one(
     rel: &Path,
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(0))
+    let mut sb = SearcherBuilder::new();
+    // --null-data makes NUL a record separator, so it can't stay a
+    // binary-detection signal — the searcher treats the file as text.
+    sb.binary_detection(if opts.null_data {
+        BinaryDetection::none()
+    } else {
+        BinaryDetection::quit(0)
+    })
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
-        .multi_line(opts.multiline)
-        .build();
+        .multi_line(opts.multiline);
+    if opts.null_data {
+        sb.line_terminator(grep_matcher::LineTerminator::byte(0));
+    }
+    let mut searcher = sb.build();
     let full = root.join(rel);
     if opts.count {
         let mut sink = CountSink {
@@ -183,8 +209,12 @@ fn search_one(
         };
         searcher.search_path(matcher, &full, &mut sink)?;
         if sink.count > 0 {
+            // Under --null-data every output record is NUL-terminated
+            // (the field `:` stays; only the record end changes).
+            let term = if opts.null_data { b'\0' } else { b'\n' };
             return Ok((
-                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
+                format!("{}:{}{}", rel.display(), sink.count, term as char)
+                    .into_bytes(),
                 true,
                 None,
             ));
@@ -206,9 +236,9 @@ fn search_one(
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else {
-        let mut printer = grep_printer::StandardBuilder::new()
-            .heading(false)
-            .build_no_color(&mut buf);
+        let mut printer_b = grep_printer::StandardBuilder::new();
+        printer_b.heading(false);
+        let mut printer = printer_b.build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
@@ -259,7 +289,14 @@ pub fn run(
                 found = true;
                 let global_i = base + i;
                 if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
+                    // -l names get the record terminator too: NUL under
+                    // --null-data, newline otherwise.
+                    if opts.null_data {
+                        out.write_all(files[global_i].as_os_str().as_encoded_bytes())?;
+                        out.write_all(b"\0")?;
+                    } else {
+                        writeln!(out, "{}", files[global_i].display())?;
+                    }
                 } else {
                     if separate && printed_any {
                         writeln!(out, "--")?;
@@ -316,6 +353,9 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            null_data: false,
+            dfa_size_limit: None,
+            regex_size_limit: None,
         }
     }
 
