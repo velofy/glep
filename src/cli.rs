@@ -114,6 +114,9 @@ pub struct Args {
     /// "" disables the separator entirely.
     #[arg(long, value_name = "SEP")]
     pub context_separator: Option<String>,
+    /// PCRE2 regex engine (lookaround, backrefs, etc.)
+    #[arg(short = 'P', long = "pcre2")]
+    pub pcre2: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -806,6 +809,7 @@ fn run_one_fs(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result
             .as_ref()
             .map(|v| v.clone().into_bytes()),
         context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
+        pcre2: args.pcre2,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -1115,6 +1119,7 @@ pub fn run() -> anyhow::Result<i32> {
             .as_ref()
             .map(|v| v.clone().into_bytes()),
         context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
+        pcre2: args.pcre2,
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on

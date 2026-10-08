@@ -73,6 +73,8 @@ pub struct SearchOpts {
     pub field_context_separator: Option<Vec<u8>>,
     /// --context-separator ("" = none)
     pub context_separator: Option<Vec<u8>>,
+    /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
+    pub pcre2: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -157,6 +159,20 @@ fn merge_stats(total: &mut grep_printer::Stats, other: &grep_printer::Stats) {
     total.add_matches(other.matches());
 }
 
+fn build_pcre2_matcher(
+    pattern: &str,
+    opts: &SearchOpts,
+) -> anyhow::Result<grep_pcre2::RegexMatcher> {
+    let mut b = grep_pcre2::RegexMatcherBuilder::new();
+    b.fixed_strings(opts.fixed)
+        .caseless(opts.case_insensitive)
+        .jit_if_available(true);
+    if opts.multiline {
+        b.multi_line(true);
+    }
+    Ok(b.build(pattern)?)
+}
+
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
@@ -206,8 +222,8 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
-struct CountSink<'a> {
-    matcher: &'a grep_regex::RegexMatcher,
+struct CountSink<'a, M: grep_matcher::Matcher> {
+    matcher: &'a M,
     multiline: bool,
     /// Count occurrences per line instead of lines (-U needs it always;
     /// --count-matches needs it for output)
@@ -217,7 +233,7 @@ struct CountSink<'a> {
     occurrences: u64,
 }
 
-impl grep_searcher::Sink for CountSink<'_> {
+impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
     type Error = std::io::Error;
     fn matched(
         &mut self,
@@ -240,13 +256,14 @@ impl grep_searcher::Sink for CountSink<'_> {
         self.count += if self.multiline { n } else { 1 };
         if self.multiline || self.occurrences {
             use grep_matcher::Matcher;
+        if self.multiline {
             let mut n = 0u64;
             self.matcher
                 .find_iter(m.bytes(), |_| {
                     n += 1;
                     true
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             self.count += n.max(1);
         } else {
             self.count += 1;
@@ -255,8 +272,8 @@ impl grep_searcher::Sink for CountSink<'_> {
     }
 }
 
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
+fn search_one<M: grep_matcher::Matcher>(
+    matcher: &M,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
@@ -470,6 +487,23 @@ pub fn run(
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
+    // Two monomorphized paths — one per engine. Sinks and the searcher are
+    // generic over Matcher; only the builder differs.
+    if opts.pcre2 {
+        let matcher = build_pcre2_matcher(pattern, opts)?;
+        return run_impl(&matcher, root, files, opts, out);
+    }
+    let matcher = build_matcher(pattern, opts)?;
+    run_impl(&matcher, root, files, opts, out)
+}
+
+fn run_impl<M: grep_matcher::Matcher + Sync>(
+    matcher: &M,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
     // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
     let start = Instant::now();
@@ -498,6 +532,7 @@ pub fn run(
             .par_iter()
             .enumerate()
             .map(|(i, rel)| match search_one(&matcher, root, rel, opts, encoding.clone()) {
+            .map(|(i, rel)| match search_one(matcher, root, rel, opts) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
@@ -674,6 +709,7 @@ mod tests {
             field_match_separator: None,
             field_context_separator: None,
             context_separator: None,
+            pcre2: false,
         }
     }
 
