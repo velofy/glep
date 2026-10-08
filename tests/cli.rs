@@ -753,6 +753,67 @@ fn search_zip_decompresses_gz() {
 }
 
 #[test]
+fn no_ignore_parent_toggles_parent_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
+    // parent .ignore hides a.txt by default
+    glep(&proj).args(["-l", "hello"]).assert().failure();
+    // --no-ignore-parent disables it -> live scan finds the file
+    let out = glep(&proj)
+        .args(["--no-ignore-parent", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("a.txt"), "{s}");
+}
+
+#[test]
+fn uuu_searches_binary_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("b.bin"), b"aa\x00hello\x00zz\n").unwrap();
+    let out = glep(dir.path()).args(["-uuu", "-l", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("b.bin"), "{s}");
+}
+
+#[test]
+fn max_columns_preview_marks_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "x".repeat(200) + "hello" + &"y".repeat(200);
+    std::fs::write(dir.path().join("long.txt"), format!("{long}\n")).unwrap();
+    let out = glep(dir.path())
+        .args(["-M", "50", "--max-columns-preview", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("[... omitted end of long line]"), "{s}");
+    // without the preview flag the marker is absent
+    let out = glep(dir.path()).args(["-M", "50", "hello"]).assert().success();
+    let s2 = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!s2.contains("omitted end"), "{s2}");
+}
+
+#[test]
+fn type_list_and_add() {
+    let dir = corpus();
+    // --type-list prints the type table and exits (no index touched)
+    let out = glep(dir.path()).arg("--type-list").assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("rust:"), "{s}");
+    // --type-add registers a new glob for -t
+    std::fs::write(dir.path().join("m.weird"), "hello weird\n").unwrap();
+    let out = glep(dir.path())
+        .args(["--type-add", "weird:*.weird", "-t", "weird", "-l", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("m.weird"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);

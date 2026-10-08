@@ -72,12 +72,31 @@ struct DirMatchers {
 /// Whitelist rescue check for hidden candidates. One instance per sweep
 /// worker; also usable standalone (cli's extra-file path) since
 /// construction is free and every matcher load is lazily cached.
+/// Which ignore sources participate in this walk. `all()` is the
+/// default; each --no-ignore-* knob drops one source (its ignore AND
+/// whitelist rules both go inert — the crate has no notion of "whitelists
+/// in an inactive file").
+#[derive(Clone, Copy)]
+pub struct WalkFlags {
+    pub dot: bool,     // .ignore
+    pub vcs: bool,     // .gitignore
+    pub exclude: bool, // .git/info/exclude
+    pub global: bool,  // global gitignore
+}
+
+impl WalkFlags {
+    pub fn all() -> Self {
+        WalkFlags { dot: true, vcs: true, exclude: true, global: true }
+    }
+}
+
 pub struct WhitelistChecker {
     /// Keyed by the directory's path relative to the sweep root ("" is the
     /// root itself).
     dirs: HashMap<PathBuf, DirMatchers>,
     global_loaded: bool,
     global: Option<Gitignore>,
+    flags: WalkFlags,
 }
 
 impl Default for WhitelistChecker {
@@ -88,10 +107,15 @@ impl Default for WhitelistChecker {
 
 impl WhitelistChecker {
     pub fn new() -> Self {
+        Self::with_flags(WalkFlags::all())
+    }
+
+    pub fn with_flags(flags: WalkFlags) -> Self {
         WhitelistChecker {
             dirs: HashMap::new(),
             global_loaded: false,
             global: None,
+            flags,
         }
     }
 
@@ -109,14 +133,17 @@ impl WhitelistChecker {
                 }
                 b.build().ok()
             };
-            let git_exclude = if dir_abs.join(".git").exists() {
+            let flags = self.flags;
+            let git_exclude = if flags.exclude && dir_abs.join(".git").exists() {
                 load(".git/info/exclude")
             } else {
                 None
             };
             DirMatchers {
-                ignore: load(".ignore"),
-                gitignore: load(".gitignore"),
+                // Each --no-ignore-* switch gates its matcher: the file's
+                // ignore AND whitelist rules are both inert under it.
+                ignore: if flags.dot { load(".ignore") } else { None },
+                gitignore: if flags.vcs { load(".gitignore") } else { None },
                 git_exclude,
             }
         })
@@ -159,7 +186,7 @@ impl WhitelistChecker {
         }
         if !self.global_loaded {
             self.global_loaded = true;
-            self.global = Some(Gitignore::global().0);
+            self.global = self.flags.global.then(|| Gitignore::global().0);
         }
         let m_global = self
             .global
@@ -200,6 +227,9 @@ struct CollectorBuilder<'a> {
     /// False on the --no-ignore sweep: with ignore rules disabled there is
     /// no whitelist to consult, and hidden-ness is purely name-based.
     whitelists: bool,
+    /// Which ignore sources' `!` rules may rescue — mirrors the walker's
+    /// own toggles (a disabled source's whitelists go inert too).
+    flags: WalkFlags,
 }
 
 impl<'s> ParallelVisitorBuilder<'s> for CollectorBuilder<'s> {
@@ -209,7 +239,7 @@ impl<'s> ParallelVisitorBuilder<'s> for CollectorBuilder<'s> {
             local: Vec::new(),
             global: self.global,
             whitelists: self.whitelists,
-            whitelist: WhitelistChecker::new(),
+            whitelist: WhitelistChecker::with_flags(self.flags),
         })
     }
 }
@@ -288,10 +318,33 @@ impl Drop for Collector<'_> {
 /// `Err` from sweep_bulk also falls back to this walker, with a warning on
 /// stderr, so a bug in the macOS-only fast path can never surface as a
 /// hard failure, only as a missed speedup for that one sweep.
+/// True when any ancestor of `root` has a `.ignore`, `.rgignore`,
+/// `.gitignore`, or `.git/info/exclude` file that could apply to the
+/// sweep. The portable walker loads these through `parents(true)`; the
+/// macOS bulk sweep has no parent-chain machinery, so their presence
+/// forces the portable path (correctness over speed — ancestor files are
+/// a handful of stat calls to check, and most roots have none).
+fn ancestors_have_ignore_files(root: &Path) -> bool {
+    let mut dir = root.parent();
+    while let Some(d) = dir {
+        if d.join(".ignore").is_file()
+            || d.join(".rgignore").is_file()
+            || d.join(".gitignore").is_file()
+            || (d.join(".git").exists() && d.join(".git/info/exclude").is_file())
+        {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
 pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none()
+            && !ancestors_have_ignore_files(root)
+        {
             match crate::walk_bulk::sweep_bulk(root) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -335,6 +388,7 @@ pub fn sweep_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<Fil
         root,
         global: &collected,
         whitelists: true,
+        flags: WalkFlags::all(),
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -362,6 +416,7 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
         root,
         global: &collected,
         whitelists: true,
+        flags: WalkFlags::all(),
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -400,6 +455,7 @@ pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
         root,
         global: &collected,
         whitelists: true,
+        flags: WalkFlags::all(),
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -430,7 +486,10 @@ pub fn sweep_no_git(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
-        whitelists: false,
+        // gitignore-derived whitelists are inert here (git sources off),
+        // but .ignore `!` rules still apply.
+        whitelists: true,
+        flags: WalkFlags { dot: true, vcs: false, exclude: false, global: false },
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -483,6 +542,7 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool, follow: bool) -> anyh
         root,
         global: &collected,
         whitelists: false,
+        flags: WalkFlags::all(),
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -497,6 +557,48 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool, follow: bool) -> anyh
 /// Deliberately walker-based (like `sweep_unfiltered`): the macOS bulk
 /// sweep has no mount filtering, and mount-point subtrees must not enter
 /// the index either — callers route this through the live-scan path.
+/// Live sweep honoring individual ignore-source toggles
+/// (`--no-ignore-dot`/`--no-ignore-vcs`/`--no-ignore-exclude`/
+/// `--no-ignore-global`/`--no-ignore-parent`): like `--require-git`
+/// outside a repo, a file excluded by a disabled source simply isn't in
+/// the index, so the only sound path is a live scan — never the index.
+/// Whitelist `!` rules in a DISABLED source go inert with it.
+pub fn sweep_selective(
+    root: &Path,
+    include_hidden: bool,
+    follow: bool,
+    flags: WalkFlags,
+    parents: bool,
+) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
+    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
+    let walker = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .hidden(!include_hidden)
+        .ignore(flags.dot)
+        .git_ignore(flags.vcs)
+        .git_exclude(flags.exclude)
+        .git_global(flags.global)
+        .parents(parents)
+        .follow_links(follow)
+        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
+        .build_parallel();
+    let mut builder = CollectorBuilder {
+        root,
+        global: &collected,
+        whitelists: true,
+        flags,
+    };
+    walker.visit(&mut builder);
+    let mut v = collected.into_inner().unwrap();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
 pub fn sweep_one_fs(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
@@ -514,6 +616,7 @@ pub fn sweep_one_fs(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
         root,
         global: &collected,
         whitelists: true,
+        flags: WalkFlags::all(),
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -549,6 +652,42 @@ mod scoped_tests {
 
 #[cfg(test)]
 mod tests {
+
+#[test]
+fn sweep_selective_parent_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "x").unwrap();
+    std::fs::write(root.join("b.txt"), "x").unwrap();
+    // parent ignore file ignoring a.txt — should NOT apply with parents off
+    std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
+    let flags = crate::walk::WalkFlags::all();
+    let on: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, true)
+        .unwrap().into_iter().map(|m| m.path).collect();
+    let off: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, false)
+        .unwrap().into_iter().map(|m| m.path).collect();
+    eprintln!("on={on:?} off={off:?}");
+    assert_eq!(off, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+}
+
+#[test]
+fn sweep_selective_parent_off_inside_git_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("a.txt"), "x").unwrap();
+    std::fs::write(root.join("x.log"), "x").unwrap();
+    std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
+    let flags = crate::walk::WalkFlags::all();
+    let off: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, false)
+        .unwrap().into_iter().map(|m| m.path).collect();
+    eprintln!("off={off:?}");
+    // a.txt rescued (parent .ignore off), x.log still gitignored
+    assert_eq!(off, vec![PathBuf::from("a.txt")]);
+}
+
     use super::*;
 
     /// Convert a forward-slash path literal to the platform's native

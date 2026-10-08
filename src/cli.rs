@@ -132,6 +132,49 @@ pub struct Args {
     /// must not enter the index, so this never touches .glep.
     #[arg(long)]
     pub one_file_system: bool,
+    /// Don't respect .ignore files (rg --no-ignore-dot). Files excluded
+    /// only by .ignore aren't in the index → live-scan escape hatch.
+    #[arg(long)]
+    pub no_ignore_dot: bool,
+    /// Don't respect .gitignore files (rg --no-ignore-vcs).
+    #[arg(long)]
+    pub no_ignore_vcs: bool,
+    /// Don't respect .git/info/exclude (rg --no-ignore-exclude).
+    #[arg(long)]
+    pub no_ignore_exclude: bool,
+    /// Don't respect global gitignore rules (rg --no-ignore-global).
+    #[arg(long)]
+    pub no_ignore_global: bool,
+    /// Don't respect ignore files in parent dirs of the root
+    /// (rg --no-ignore-parent).
+    #[arg(long)]
+    pub no_ignore_parent: bool,
+    /// Suppress error messages about failed parses of ignore files
+    /// (rg --no-ignore-messages). Nonfatal IO warnings stay.
+    #[arg(long)]
+    pub no_ignore_messages: bool,
+    /// Suppress all nonfatal per-file warnings (rg --no-messages).
+    #[arg(long)]
+    pub no_messages: bool,
+    /// With -M, show a truncation preview marker on long lines
+    /// (rg --max-columns-preview)
+    #[arg(long, requires = "max_columns")]
+    pub max_columns_preview: bool,
+    /// Stop the whole search at the first non-match; meaningful with
+    /// --sort when later candidates can't beat an early one
+    /// (rg --stop-on-nonmatch)
+    #[arg(long)]
+    pub stop_on_nonmatch: bool,
+    /// Add a file-type def `name:glob` or `name:include:a,b`
+    /// (rg --type-add, repeatable)
+    #[arg(long, value_name = "TYPE_SPEC")]
+    pub type_add: Vec<String>,
+    /// Clear a file type's definitions (rg --type-clear, repeatable)
+    #[arg(long, value_name = "TYPE")]
+    pub type_clear: Vec<String>,
+    /// Print all known file types and exit (rg --type-list)
+    #[arg(long)]
+    pub type_list: bool,
     /// NUL is the line terminator (rg --null-data)
     #[arg(long = "null-data")]
     pub null_data: bool,
@@ -486,9 +529,18 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
             })
         });
     }
-    if !args.types.is_empty() || !args.types_not.is_empty() {
+    if !args.types.is_empty() || !args.types_not.is_empty()
+        || !args.type_add.is_empty() || !args.type_clear.is_empty()
+    {
         let mut tb = ignore::types::TypesBuilder::new();
         tb.add_defaults();
+        for spec in &args.type_add {
+            tb.add_def(spec)
+                .map_err(|e| anyhow::anyhow!("{spec}: {e}"))?;
+        }
+        for t in &args.type_clear {
+            tb.clear(t);
+        }
         for t in &args.types {
             tb.select(t);
         }
@@ -669,6 +721,9 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         heading: args.heading,
         only_matching: args.only_matching,
         quiet: args.quiet,
+        max_columns_preview: args.max_columns_preview,
+        stop_on_nonmatch: args.stop_on_nonmatch,
+        no_messages: args.no_messages || args.no_ignore_messages,
     }
 }
 
@@ -804,6 +859,40 @@ fn run_one_fs(
     run_live_files(root, cwd_rel, args, timings, files, had_error)
 }
 
+/// Any --no-ignore-* toggle: live-scan over a selectively-configured
+/// walker (never touches `.glep` — the disabled-source file set can't
+/// narrow through the index anyway).
+fn run_selective(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    // The walk is rooted at the cwd (the rg "operand"), not the index
+    // root: --no-ignore-parent gates ignore files above the operand, and
+    // parent ignores of the index root itself still apply through the
+    // walker's own parent chain when the flag is off.
+    let scan_root = root.join(cwd_rel);
+    let files: Vec<PathBuf> = walk::sweep_selective(
+        &scan_root,
+        args.hidden,
+        args.follow,
+        walk::WalkFlags {
+            dot: !args.no_ignore_dot,
+            vcs: !args.no_ignore_vcs,
+            exclude: !args.no_ignore_exclude,
+            global: !args.no_ignore_global,
+        },
+        !args.no_ignore_parent,
+    )?
+    .into_iter()
+    .map(|m| cwd_rel.join(m.path))
+    .collect();
+    timings.stage("sweep_selective");
+    run_live_files(root, cwd_rel, args, timings, files, had_error)
+}
+
 pub fn run() -> anyhow::Result<i32> {
     let mut args = Args::parse();
     if let Some(n) = args.threads {
@@ -828,6 +917,10 @@ pub fn run() -> anyhow::Result<i32> {
         if args.unrestricted >= 2 {
             args.hidden = true;
         }
+        // -uuu adds binary-as-text: NUL is data (-a), not a quit signal.
+        if args.unrestricted >= 3 {
+            args.text = true;
+        }
     }
 
     let cwd = std::env::current_dir()?;
@@ -840,6 +933,25 @@ pub fn run() -> anyhow::Result<i32> {
     // default `.`). At the discovered root itself this is "" — everything.
     if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
         args.paths.push(cwd_rel.clone());
+    }
+
+    // --type-list dumps the type table and exits (before any index work).
+    if args.type_list {
+        let mut tb = ignore::types::TypesBuilder::new();
+        tb.add_defaults();
+        for spec in &args.type_add {
+            tb.add_def(spec)
+                .map_err(|e| anyhow::anyhow!("{spec}: {e}"))?;
+        }
+        for t in &args.type_clear {
+            tb.clear(t);
+        }
+        let mut defs = tb.definitions();
+        defs.sort_by(|a, b| a.name().cmp(b.name()));
+        for d in defs {
+            println!("{}: {}", d.name(), d.globs().join(", "));
+        }
+        return Ok(0);
     }
 
     // --engine validates before any index work (rg errors at arg-parse).
@@ -891,6 +1003,17 @@ pub fn run() -> anyhow::Result<i32> {
     }
     if args.one_file_system {
         return run_one_fs(&root, &cwd_rel, &args, &mut timings, had_error);
+    }
+    // Individual --no-ignore-* toggles: files excluded only by a disabled
+    // source aren't in the manifest, so index narrowing can't find them —
+    // the same live-scan escape hatch as --no-ignore/--require-git.
+    if args.no_ignore_dot
+        || args.no_ignore_vcs
+        || args.no_ignore_exclude
+        || args.no_ignore_global
+        || args.no_ignore_parent
+    {
+        return run_selective(&root, &cwd_rel, &args, &mut timings, had_error);
     }
     if args.follow {
         return run_follow(&root, &cwd_rel, &args, &mut timings, had_error);

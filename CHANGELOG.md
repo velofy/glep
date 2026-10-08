@@ -30,6 +30,13 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - `-v` correctly disables trigram index narrowing (a file with zero occurrences matches every line under inversion); `-S` always narrows case-insensitively as a safe superset.
 - New flags: `--null-data` (NUL is the record separator — matcher + searcher line terminators switch to NUL, binary detection turns off, and binary-flagged files join the candidates since NULs are data there), `--dfa-size-limit`, `--regex-size-limit`, `--one-file-system` (live scan that stays on the root's filesystem; mount-point subtrees never enter the index).
 
+## Unreleased
+
+- `--no-ignore-dot`/`--no-ignore-vcs`/`--no-ignore-exclude`/`--no-ignore-global`/`--no-ignore-parent`: per-source ignore toggles. Each is a live-scan escape hatch (files excluded by a disabled source aren't in the index) rooted at the operand dir so --no-ignore-parent is operand-relative like the reference.
+- `-uuu` completes the -u ladder (implies -a).
+- `--max-columns-preview`, `--stop-on-nonmatch`, `--no-messages`, `--no-ignore-messages`.
+- `--type-add`, `--type-clear`, `--type-list` (type table is the ignore crate's; 4 defs newer than the reference's compiled-in list).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

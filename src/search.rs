@@ -77,6 +77,14 @@ pub struct SearchOpts {
     pub pcre2: bool,
     /// -z: decompress .gz files via flate2 and search the decoded stream.
     pub search_zip: bool,
+    /// -M preview: a truncated long line ends with a `[... N more matches]`
+    /// marker instead of the bare omission.
+    pub max_columns_preview: bool,
+    /// Stop the entire run at the first non-match (rg --stop-on-nonmatch;
+    /// pairs with --sort where "best" results can arrive early).
+    pub stop_on_nonmatch: bool,
+    /// rg --no-messages: suppress per-file nonfatal warnings.
+    pub no_messages: bool,
     pub word: bool,
     pub line_regexp: bool,
     pub smart_case: bool,
@@ -391,6 +399,7 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         .per_match_one_line(opts.vimgrep)
         .only_matching(opts.only_matching)
         .max_columns(opts.max_columns)
+        .max_columns_preview(opts.max_columns_preview)
         .path_terminator(opts.path_terminator)
         .separator_path(opts.path_separator)
         .stats(opts.stats);
@@ -474,7 +483,7 @@ fn search_one<M: grep_matcher::Matcher>(
         return match search_reader_sinks(matcher, &mut searcher, dec, display, opts) {
             Ok(v) => Ok(v),
             Err(e) => {
-                eprintln!("glep: {}: {e}", rel.display());
+                if !opts.no_messages { eprintln!("glep: {}: {e}", rel.display()); }
                 Ok((Vec::new(), false, None))
             }
         };
@@ -611,7 +620,7 @@ fn run_quiet<M: grep_matcher::Matcher + Sync>(
             .map(|rel| match quiet_one(rel) {
                 Ok((m, _)) => m,
                 Err(e) => {
-                    eprintln!("glep: {}: {}", rel.display(), e);
+                    if !opts.no_messages { eprintln!("glep: {}: {}", rel.display(), e); }
                     false
                 }
             })
@@ -626,7 +635,7 @@ fn run_quiet<M: grep_matcher::Matcher + Sync>(
             .map(|rel| match quiet_one(rel) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("glep: {}: {}", rel.display(), e);
+                    if !opts.no_messages { eprintln!("glep: {}: {}", rel.display(), e); }
                     (false, None)
                 }
             })
@@ -736,11 +745,12 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
             .map(|(i, rel)| match search_one(matcher, root, rel, opts, encoding.as_ref()) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
-                    eprintln!("glep: {}: {}", rel.display(), e);
+                    if !opts.no_messages { eprintln!("glep: {}: {}", rel.display(), e); }
                     (i, Vec::new(), false, None)
                 }
             })
             .collect();
+        let mut stop = false;
         for (i, buf, matched, stats) in results {
             if let Some(s) = &stats {
                 merge_stats(&mut total_stats, s);
@@ -796,8 +806,15 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
                 out.flush()?;
             }
             printed_any = true;
+            if opts.stop_on_nonmatch && !matched {
+                stop = true;
+                break;
+            }
         }
         base += chunk.len();
+        if stop {
+            break;
+        }
     }
     if opts.files_without_match {
         let uni = universe.unwrap_or(files);
@@ -900,6 +917,9 @@ mod tests {
             heading: false,
             only_matching: false,
             quiet: false,
+            max_columns_preview: false,
+            stop_on_nonmatch: false,
+            no_messages: false,
         }
     }
 
