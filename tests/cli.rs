@@ -476,6 +476,20 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn engine_rejects_unknown() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["--engine", "default", "hello"])
+        .assert()
+        .success();
+    glep(dir.path())
+        .args(["--engine", "pcre2", "hello"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
