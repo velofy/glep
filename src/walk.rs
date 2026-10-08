@@ -405,6 +405,36 @@ pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
     Ok(v)
 }
 
+/// `--require-git` on a non-repo tree: gitignore rules are inert so
+/// files that the index sweep skips (gitignored) can still appear in
+/// results — a live scan is the only sound option (the index doesn't
+/// have them). `.ignore`/`.rgignore`/global excludes still apply; only
+/// the git-derived sources are switched off. `include_hidden` gates
+/// hidden entries the same as `sweep_unfiltered`.
+pub fn sweep_no_git(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
+    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(!include_hidden)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
+        .build_parallel();
+    let mut builder = CollectorBuilder {
+        root,
+        global: &collected,
+    };
+    walker.visit(&mut builder);
+    let mut v = collected.into_inner().unwrap();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
 /// Live, index-bypassing sweep for `--no-ignore`: same shape as `sweep`
 /// (root.is_dir() ensure with identical error text, Err-entry warnings on
 /// stderr, output sorted by relative path, `.git`/`.glep` hard-excluded at
