@@ -476,6 +476,34 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn stats_block_appended() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--stats", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("2 matches\n"));
+    assert!(s.contains("2 matched lines\n"));
+    assert!(s.contains("2 files contained matches\n"));
+    assert!(s.contains("files searched\n"));
+    assert!(s.contains("seconds total\n"));
+    // and under -c the counters are exact (occurrences vs lines)
+    let out = glep(dir.path())
+        .args(["-c", "--stats", "o"]) // 'o' occurs twice on line 1 of notes.txt
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("notes.txt:2")); // hello + Kenobi
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);

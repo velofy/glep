@@ -41,7 +41,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 - **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
-- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore`.
+- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --stats --hidden --no-ignore`.
 - **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface

@@ -54,6 +54,9 @@ pub struct Args {
     /// that guarantee. .git/.glep are still always excluded.
     #[arg(long)]
     pub no_ignore: bool,
+    /// Print the rg-style stats block after results (rg --stats)
+    #[arg(long)]
+    pub stats: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -166,6 +169,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        stats: args.stats,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -277,6 +281,7 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        stats: args.stats,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
