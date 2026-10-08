@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- `-e`/`--regexp` is now repeatable: multiple patterns OR together (each arm is wrapped non-capturing so anchors stay per-arm; under `-F` each arm is a literal). With any `-e` present positionals remain paths, as before.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).

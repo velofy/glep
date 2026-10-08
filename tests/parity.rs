@@ -128,6 +128,10 @@ fn parity_with_ripgrep() {
         // --sort path still applies, so the harness's fixed rg flag set
         // composes cleanly with --files --no-ignore for both tools.
         &["--no-ignore", "--files"],
+        // repeatable -e: union of patterns; positional still a path
+        &["-e", "hello", "-e", "answer", "-l"],
+        &["-e", "hello", "-l", "src"],
+        &["-F", "-e", "fn m", "-e", "answer", "-l"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);
