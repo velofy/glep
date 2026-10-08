@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"GLEPPOST";
-const VERSION: u32 = 2;
+// Version history: 2 = hidden flagging, 3 = UTF-16 transcode entries,
+// 4 = whitelist-rescued dotfiles (FLAG_HIDDEN must be recomputed for
+// files a `!` rule un-hides; bumping forces a one-time rebuild).
+const VERSION: u32 = 4;
 const HEADER: usize = 24; // magic 8 + version 4 + count 4 + generation 8
 const ENTRY: usize = 16; // trigram 4 + offset 8 + len 4
 
