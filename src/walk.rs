@@ -149,6 +149,44 @@ pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     sweep_walker(root)
 }
 
+/// Scoped sweep: same semantics as `sweep` (ignore files applied,
+/// `.git`/`.glep` hard-excluded, hidden entries flagged) but only
+/// descends into the given index-relative subtrees. Ancestor ignore files
+/// still apply because `WalkBuilder::parents` loads them for each
+/// subtree root. File (non-dir) prefixes are stat'ed and yielded
+/// directly. Missing subtrees produce an `Err` entry on stderr like any
+/// other path problem. Used by `Index::update_scoped` for queries
+/// already restricted by path filters, where sweeping the rest of the
+/// tree would be wasted work (issue #21).
+///
+/// Portable-walker-only by design, like `sweep_unfiltered`: a scoped
+/// subtree is small, so the `getattrlistbulk` fast path is not worth the
+/// extra ignore-stack machinery for ancestor rules here.
+pub fn sweep_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<FileMeta>> {
+    // A missing or root-anchored scope is just the full sweep.
+    if prefixes.is_empty() || prefixes.iter().any(|p| p.as_os_str().is_empty()) {
+        return sweep(root);
+    }
+    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
+    let mut wb = ignore::WalkBuilder::new(root.join(&prefixes[0]));
+    for p in &prefixes[1..] {
+        wb.add(root.join(p));
+    }
+    let walker = wb
+        .require_git(false)
+        .hidden(false)
+        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
+        .build_parallel();
+    let mut builder = CollectorBuilder {
+        root,
+        global: &collected,
+    };
+    walker.visit(&mut builder);
+    let mut v = collected.into_inner().unwrap();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
 /// Portable, non-macOS-specific sweep: `ignore::WalkParallel` plus a
 /// `stat()`-class metadata() call per file. This is the sole implementation
 /// on non-macOS platforms, and the fallback / correctness reference on
@@ -223,6 +261,32 @@ pub fn sweep_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec
     let mut v = collected.into_inner().unwrap();
     v.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(v)
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+    #[test]
+    fn sweep_scoped_visits_only_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().join("src");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join("a.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "y").unwrap();
+        let metas = sweep_scoped(dir.path(), &[PathBuf::from("src")]).unwrap();
+        assert_eq!(
+            metas.iter().map(|m| m.path.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("src/a.txt")]
+        );
+    }
+
+    #[test]
+    fn sweep_scoped_empty_or_root_prefix_is_full_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let metas = sweep_scoped(dir.path(), &[PathBuf::from("")]).unwrap();
+        assert_eq!(metas.len(), 1);
+    }
 }
 
 #[cfg(test)]
