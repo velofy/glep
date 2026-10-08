@@ -20,6 +20,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags: `--require-git` (git-derived ignore rules apply only inside a real repo; outside, `gitignored` files aren't indexed so a live scan covers them), `--ignore-file` (extra rules file, resolved relative to its dir — narrows candidates post-hoc).
 - New flags: `--color=always|auto|never` (rg's default spec set; `auto` colors only on a tty), `--colors` user spec overrides, `-u`/`-uu` unrestricted aliases (fold into `--no-ignore`/`--hidden`; `-uuu` reserved until `-a` lands).
 - New flags: `--passthru` (emit every line of every searched file — forces a full scan since non-matching lines must appear), `--no-unicode` (matcher unicode off).
+- New flags: `-f`/`--file` (patterns from file, one per line, OR'd with `-e`/positional; each arm non-capturing so anchors stay local; `-F` arms escape individually), `--files-without-match` (names of files with no match — exit 0 when any listed).
 
 ## 0.3.1 (2026-09-30)
 

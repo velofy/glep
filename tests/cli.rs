@@ -583,6 +583,34 @@ fn ignore_file_filters_results() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("notes.txt"));
+fn pattern_file_unions_with_positional() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("pats.txt"), "hello\nworld\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
+    assert!(s.contains("src/lib.rs"), "{s}");
+    // -f + positional-as-path: 'src' is a path since -f is present
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l", "src"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(s, "src/lib.rs\n");
+}
+
+#[test]
+fn files_without_match_lists_non_matching() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--files-without-match", "hello_world"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
     assert!(!s.contains("lib.rs"), "{s}");
 }
 

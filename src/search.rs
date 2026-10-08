@@ -8,6 +8,8 @@ pub struct SearchOpts {
     pub case_insensitive: bool,
     pub fixed: bool,
     pub files_with_matches: bool,
+    /// --files-without-match: emit names of files with NO match.
+    pub files_without_match: bool,
     pub before: usize,
     pub after: usize,
     pub json: bool,
@@ -410,12 +412,18 @@ pub fn run(
     pattern: &str,
     root: &Path,
     files: &[PathBuf],
+    // For --files-without-match: the full live+filtered set. Files that
+    // were narrowed out by the index can't contain the pattern, so
+    // they're "without match" by construction and emit directly — the
+    // index still narrows what's actually searched.
+    universe: Option<&[PathBuf]>,
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
     // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
     let start = Instant::now();
+    let mut matched_names = std::collections::BTreeSet::new();
     // Build the matcher once up front; shared by reference across the rayon
     // closure (grep_regex::RegexMatcher is Sync). This also validates the
     // pattern before I/O, matching prior behavior.
@@ -459,6 +467,16 @@ pub fn run(
                 if matched {
                     found = true;
                 }
+            if opts.files_without_match {
+                // Collect matched names; the complement of `universe`
+                // emits after the loop.
+                if matched {
+                    matched_names.insert(files[base + i].clone());
+                }
+                continue;
+            }
+            if matched {
+                found = true;
                 let global_i = base + i;
                 if opts.files_with_matches {
                     let display = files[global_i]
@@ -499,6 +517,15 @@ pub fn run(
             printed_any = true;
         }
         base += chunk.len();
+    }
+    if opts.files_without_match {
+        let uni = universe.unwrap_or(files);
+        for p in uni {
+            if !matched_names.contains(p) {
+                found = true;
+                writeln!(out, "{}", p.display())?;
+            }
+        }
     }
     if opts.json {
         // Per design: both `elapsed_total` and `stats.elapsed` are filled
@@ -558,6 +585,7 @@ mod tests {
             case_insensitive: false,
             fixed: false,
             files_with_matches: false,
+            files_without_match: false,
             before: 0,
             after: 0,
             json: false,
@@ -590,7 +618,7 @@ mod tests {
         let dir = corpus();
         let files = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
         let mut out = Vec::new();
-        let found = run("hello", dir.path(), &files, &opts(), &mut out).unwrap();
+        let found = run("hello", dir.path(), &files, None, &opts(), &mut out).unwrap();
         assert!(found);
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -605,7 +633,7 @@ mod tests {
         let mut o = opts();
         o.files_with_matches = true;
         let mut out = Vec::new();
-        let found = run("hello", dir.path(), &files, &o, &mut out).unwrap();
+        let found = run("hello", dir.path(), &files, None, &o, &mut out).unwrap();
         assert!(found);
         assert_eq!(String::from_utf8(out).unwrap(), "a.txt\n");
     }
@@ -615,7 +643,7 @@ mod tests {
         let dir = corpus();
         let files = vec![PathBuf::from("a.txt")];
         let mut out = Vec::new();
-        let found = run("absent_zz", dir.path(), &files, &opts(), &mut out).unwrap();
+        let found = run("absent_zz", dir.path(), &files, None, &opts(), &mut out).unwrap();
         assert!(!found);
         assert!(out.is_empty());
     }
@@ -627,6 +655,6 @@ mod tests {
         let mut o = opts();
         o.case_insensitive = true;
         let mut out = Vec::new();
-        assert!(run("HELLO", dir.path(), &files, &o, &mut out).unwrap());
+        assert!(run("HELLO", dir.path(), &files, None, &o, &mut out).unwrap());
     }
 }

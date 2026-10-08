@@ -17,9 +17,17 @@ pub struct Args {
     /// present, all positionals are paths.
     #[arg(short = 'e', long = "regexp")]
     pub regexp: Vec<String>,
+    pub regexp: Option<String>,
+    /// Read patterns from a file, one per line; OR'd with -e/positional
+    /// (rg -f/--file, repeatable)
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub pattern_files: Vec<std::path::PathBuf>,
     /// List files matching a glob instead of searching content
     #[arg(long)]
     pub files: bool,
+    /// List files that do NOT match the pattern (rg --files-without-match)
+    #[arg(long, conflicts_with_all = ["files_with_matches", "json", "count"])]
+    pub files_without_match: bool,
     #[arg(short = 'i', long)]
     pub ignore_case: bool,
     #[arg(short = 'F', long)]
@@ -286,6 +294,28 @@ fn combine_patterns(args: &Args) -> anyhow::Result<(String, bool)> {
             None => &[],
         }
     };
+/// Combine -e/--file/positional into one pattern string. Multiple
+/// sources OR together, each arm wrapped in a non-capturing group so
+/// ^/$ stay arm-local. -f files contribute one arm per non-empty line
+/// (rg -f semantics; line-trailing `\n` stripped).
+fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
+    let mut pats: Vec<String> = args.regexp.clone().into_iter().collect();
+    for f in &args.pattern_files {
+        let text = std::fs::read_to_string(f)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
+        for line in text.lines() {
+            if !line.is_empty() {
+                pats.push(line.to_string());
+            }
+        }
+    }
+    // -e/-f leave the positional slot as a path; only the bare
+    // positional counts as a pattern when no -e/-f is present.
+    if pats.is_empty() {
+        if let Some(p) = &args.pattern {
+            pats.push(p.clone());
+        }
+    }
     if pats.is_empty() {
         anyhow::bail!("a pattern is required (or --files)");
     }
@@ -296,6 +326,8 @@ fn combine_patterns(args: &Args) -> anyhow::Result<(String, bool)> {
     // non-capturing group so ^/$ stay arm-local. Under -F each arm is
     // escaped individually and the matcher/planner treat the union as a
     // regex (effective_fixed = false).
+    // -F across multiple arms: each arm escapes to a literal and the
+    // union is a regex — the matcher/planner see effective_fixed=false.
     let fixed = args.fixed_strings;
     let joined = pats
         .iter()
@@ -600,6 +632,7 @@ fn run_live_files(
     }
 
     let (pattern, effective_fixed) = combine_patterns(&args)?;
+    let (pattern, effective_fixed) = resolve_pattern(&args)?;
     apply_filters(&mut files, args)?;
     timings.stage("candidates");
 
@@ -609,6 +642,7 @@ fn run_live_files(
         case_insensitive: args.ignore_case,
         fixed: effective_fixed,
         files_with_matches: args.files_with_matches,
+        files_without_match: args.files_without_match,
         before,
         after,
         json: args.json,
@@ -629,7 +663,7 @@ fn run_live_files(
     let opts = search_opts(args, root);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    let found = search::run(&pattern, root, &files, None, &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
     Ok(if had_error {
@@ -704,6 +738,7 @@ pub fn run() -> anyhow::Result<i32> {
     // With -e/--regexp the positional pattern slot is free; a bare
     // positional there is a path (e.g. `glep -e foo src`).
     if !args.regexp.is_empty() && !args.files {
+    if (args.regexp.is_some() || !args.pattern_files.is_empty()) && !args.files {
         if let Some(p) = args.pattern.take() {
             args.paths.insert(0, PathBuf::from(p));
         }
@@ -921,6 +956,23 @@ pub fn run() -> anyhow::Result<i32> {
     // be pure IO cost (matches rg's observed behavior either way).
     let search_binary = args.text || args.binary;
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, search_binary);
+    let (pattern, effective_fixed) = resolve_pattern(&args)?;
+    let query_plan = plan::build(&pattern, effective_fixed, args.ignore_case);
+    timings.stage("plan");
+    // --files-without-match needs the full live set as its universe:
+    // narrowed-out files can't match, so they emit without searching.
+    let universe;
+    if args.files_without_match {
+        let mut u = idx.live_files(args.hidden);
+        u.extend(extra.iter().cloned());
+        apply_filters(&mut u, &args)?;
+        u.sort();
+        u.dedup();
+        universe = Some(u);
+    } else {
+        universe = None;
+    }
+    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     files.extend(extra);
     let mut files = idx.candidates(
         &query_plan,
@@ -941,6 +993,7 @@ pub fn run() -> anyhow::Result<i32> {
         case_insensitive: args.ignore_case,
         fixed: effective_fixed,
         files_with_matches: args.files_with_matches,
+        files_without_match: args.files_without_match,
         before,
         after,
         json: args.json,
@@ -978,7 +1031,7 @@ pub fn run() -> anyhow::Result<i32> {
     let opts = search_opts(&args, &root);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+    let found = search::run(&pattern, &root, &files, universe.as_deref(), &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
     Ok(if had_error {
