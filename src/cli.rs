@@ -26,8 +26,9 @@ pub struct Args {
     pub files_with_matches: bool,
     #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
     pub count: bool,
-    /// Filter candidate files by glob (repeatable)
-    #[arg(short = 'g', long = "glob")]
+    /// Filter candidate files by glob (repeatable; gitignore-style `!`
+    /// negation, last match wins). --iglob is an alias for ag compat.
+    #[arg(short = 'g', long = "glob", visible_alias = "iglob")]
     pub globs: Vec<String>,
     /// Filter candidate files by type from the ignore crate's defaults (repeatable)
     #[arg(short = 't', long = "type")]
@@ -54,6 +55,19 @@ pub struct Args {
     /// that guarantee. .git/.glep are still always excluded.
     #[arg(long)]
     pub no_ignore: bool,
+    /// Decode files with the given encoding label before searching
+    /// (e.g. utf-16, latin1, shift_jis). Unknown labels error out like
+    /// the reference.
+    #[arg(short = 'E', long = "encoding")]
+    pub encoding: Option<String>,
+    /// Make `.` match newlines (dotall / (?s) regex mode). Independently
+    /// settable like the reference; only visibly changes multiline (-U)
+    /// searches since single-line scanning can't span lines anyway.
+    #[arg(long)]
+    pub multiline_dotall: bool,
+    /// Flush stdout after every output record (rg --line-buffered).
+    #[arg(long)]
+    pub line_buffered: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -94,12 +108,15 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         files.retain(|f| args.paths.iter().any(|p| f.starts_with(p)));
     }
     if !args.globs.is_empty() {
-        let matchers = args
-            .globs
-            .iter()
-            .map(|g| build_glob(g))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        files.retain(|f| matchers.iter().any(|m| m.is_match(f)));
+        // Gitignore-style overrides (rg's -g semantics): positives
+        // whitelist, `!` negates, last matching rule wins; with only
+        // negations, unmatched files pass.
+        let mut ob = ignore::overrides::OverrideBuilder::new("");
+        for g in &args.globs {
+            ob.add(g)?;
+        }
+        let overrides = ob.build()?;
+        files.retain(|f| !overrides.matched(f, false).is_ignore());
     }
     if !args.types.is_empty() {
         let mut tb = ignore::types::TypesBuilder::new();
@@ -166,6 +183,9 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        multiline_dotall: args.multiline_dotall,
+        encoding: args.encoding.clone(),
+        line_buffered: args.line_buffered,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -257,7 +277,22 @@ pub fn run() -> anyhow::Result<i32> {
         Some(p) => p,
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
-    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    // The index stores RAW file bytes; a non-UTF-8 -E decodes before
+    // matching, so index trigrams can't narrow a decoded match — fall
+    // back to scanning everything (sound, just slower). ASCII-only
+    // patterns on single-byte encodings could narrow, but keep it simple
+    // and always-correct.
+    let utf8_only = match &args.encoding {
+        Some(label) => grep_searcher::Encoding::new(label)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?
+            == grep_searcher::Encoding::new("utf-8").unwrap(),
+        None => true,
+    };
+    let query_plan = if utf8_only {
+        plan::build(&pattern, args.fixed_strings, args.ignore_case)
+    } else {
+        crate::plan::Plan::All
+    };
     timings.stage("plan");
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     files.extend(extra);
@@ -277,6 +312,9 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        multiline_dotall: args.multiline_dotall,
+        encoding: args.encoding.clone(),
+        line_buffered: args.line_buffered,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

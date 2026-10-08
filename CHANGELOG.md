@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New flags: `-E`/`--encoding` (transcode files before searching — non-UTF-8 encodings bypass index narrowing since trigrams index raw bytes), `--multiline-dotall` (`.` spans newlines), `--line-buffered` (flush per record). `-g`/`--glob`/`--iglob` now honors gitignore-style `!` negations with last-match-wins ordering instead of plain any-match.
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
