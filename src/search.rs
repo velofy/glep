@@ -214,8 +214,10 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     }
     if opts.multiline_dotall {
         b.dot_matches_new_line(true);
+    }
     if !opts.unicode {
         b.unicode(false);
+    }
     if opts.null_data {
         // NUL is the record separator: the matcher must know so `.`
         // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
@@ -246,20 +248,17 @@ impl grep_searcher::Sink for FoundSink {
 
 struct CountSink<'a, M: grep_matcher::Matcher> {
     matcher: &'a M,
-    multiline: bool,
-    /// Count occurrences per line instead of lines (-U needs it always;
-    /// --count-matches needs it for output)
-    occurrences: bool,
-struct CountSink<'a> {
-    matcher: &'a grep_regex::RegexMatcher,
-    // rg semantics: under -o (and -U) -c counts individual matches, not
-    // matched lines. Under -v a reported "match" is a whole non-matching
-    // line the matcher doesn't match, so find_iter yields 0 and the line
-    // still counts once via n.max(1), matching rg -o -v -c.
-    count_matches: bool,
+    /// Run `find_iter` on each matched line to count real occurrences —
+    /// needed by --count-matches, -U (a match may span lines), -o (rg -o
+    /// -c counts occurrences), -v (each non-matching line counts once via
+    /// the max(1) floor), and --stats (true occurrence count).
+    occurrences_mode: bool,
+    /// What -c prints: occurrences in occurrence-mode, matched lines else.
     count: u64,
-    /// Match occurrences (a line can hold several) — needed by --stats.
+    /// True match occurrences — for --stats.
     occurrences: u64,
+    /// When -c counts occurrences: count_matches || multiline || only_matching.
+    count_occurrences: bool,
 }
 
 impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
@@ -269,24 +268,7 @@ impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
         _: &grep_searcher::Searcher,
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        // Occurrences are always counted (--stats wants them);
-        // under -U the reported count is occurrences (a match may span
-        // lines), under plain mode it's matched lines.
-        use grep_matcher::Matcher;
-        let mut n = 0u64;
-        self.matcher
-            .find_iter(m.bytes(), |_| {
-                n += 1;
-                true
-            })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let n = n.max(1);
-        self.occurrences += n;
-        self.count += if self.multiline { n } else { 1 };
-        if self.multiline || self.occurrences {
-        if self.count_matches {
-            use grep_matcher::Matcher;
-        if self.multiline {
+        if self.occurrences_mode {
             let mut n = 0u64;
             self.matcher
                 .find_iter(m.bytes(), |_| {
@@ -294,120 +276,183 @@ impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
                     true
                 })
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            self.count += n.max(1);
+            // Under -v the sink is invoked on non-matching lines — the
+            // matcher finds 0 occurrences but the line still counts once.
+            let n = n.max(1);
+            self.occurrences += n;
+            self.count += if self.count_occurrences { n } else { 1 };
         } else {
             self.count += 1;
+            self.occurrences += 1;
         }
         Ok(true)
     }
 }
 
-fn search_one<M: grep_matcher::Matcher>(
-    matcher: &M,
-/// The compressed-body half of `search_one`: identical sink wiring,
-/// but the source is a decoded reader rather than a path.
-fn search_one_decoded<R: std::io::Read>(
-fn build_searcher(opts: &SearchOpts) -> grep_searcher::Searcher {
-    SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(0))
+/// One `Searcher` configured from opts — built per file (cheap; the heavy
+/// state lives in the matcher).
+fn build_searcher(opts: &SearchOpts, encoding: Option<&grep_searcher::Encoding>) -> grep_searcher::Searcher {
+    let mut sb = SearcherBuilder::new();
+    // --null-data makes NUL a record separator, so it can't stay a
+    // binary-detection signal — the searcher treats the file as text.
+    let detection = if opts.null_data {
+        BinaryDetection::none()
+    } else {
+        opts.binary.clone()
+    };
+    sb.binary_detection(detection)
         .line_number(opts.line_number)
         .invert_match(opts.invert)
         .max_matches(opts.max_count)
         .before_context(opts.before)
         .after_context(opts.after)
         .multi_line(opts.multiline)
-        .build()
+        .passthru(opts.passthru);
+    if let Some(enc) = encoding {
+        sb.encoding(Some(enc.clone()));
+    }
+    if opts.null_data {
+        sb.line_terminator(grep_matcher::LineTerminator::byte(0));
+    }
+    sb.build()
 }
 
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
-    mut reader: R,
+/// Search source for the printer path: a file on disk, or a decoded
+/// reader (-z). One call site per sink type, switched here.
+enum SearchSrc<'a, R: std::io::Read> {
+    Path(&'a Path),
+    Reader(&'a mut R),
+}
+
+/// Wire the printer (JSON / ANSI / plain) and run the search. Shared by
+/// the on-disk and decoded-reader paths.
+fn run_printer_sinks<M: grep_matcher::Matcher, R: std::io::Read>(
+    matcher: &M,
+    searcher: &mut grep_searcher::Searcher,
     rel: &Path,
     opts: &SearchOpts,
-    searcher: &mut grep_searcher::Searcher,
+    mut src: SearchSrc<'_, R>,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = build_searcher(opts);
-    let full = root.join(rel);
-    if opts.count {
-        let mut sink = CountSink {
-            matcher,
-            count_matches: opts.multiline || opts.only_matching,
-            count: 0,
+    macro_rules! go {
+        ($sink:expr) => {
+            match &mut src {
+                SearchSrc::Path(p) => searcher
+                    .search_path(matcher, p, $sink)
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+                SearchSrc::Reader(r) => searcher
+                    .search_reader(matcher, &mut *r, $sink)
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+            }
         };
-        searcher.search_reader(matcher, &mut reader, &mut sink)?;
-        if sink.count > 0 {
-            return Ok((
-                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
-                true,
-                None,
-            ));
-        }
-        return Ok((Vec::new(), false, None));
-    }
-    if opts.files_with_matches {
-        let mut sink = FoundSink(false);
-        searcher.search_reader(matcher, &mut reader, &mut sink)?;
-        return Ok((Vec::new(), sink.0, None));
     }
     let mut buf = Vec::new();
     let matched;
-    let mut stats = None;
+    let stats;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        go!(&mut sink)?;
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
-    } else {
-        // only_matching/max_columns have no JSON-builder knobs and rg
-        // itself ignores -o and -M under --json, so they stay standard-only.
-        let mut printer = grep_printer::StandardBuilder::new()
-            .heading(opts.heading)
-            .only_matching(opts.only_matching)
-            .max_columns(opts.max_columns)
-            .build_no_color(&mut buf);
+    } else if opts.color {
+        let mut all = grep_printer::default_color_specs();
+        for s in &opts.color_specs {
+            if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
+                all.push(spec);
+            }
+        }
+        let mut b = standard_printer_builder(opts);
+        b.color_specs(grep_printer::ColorSpecs::new(&all));
+        let mut printer = b.build(termcolor::Ansi::new(&mut buf));
         let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        go!(&mut sink)?;
         matched = sink.has_match();
+        stats = sink.stats().cloned();
+    } else {
+        let b = standard_printer_builder(opts);
+        let mut printer = b.build_no_color(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, rel);
+        go!(&mut sink)?;
+        matched = sink.has_match();
+        stats = sink.stats().cloned();
     }
     Ok((buf, matched, stats))
 }
 
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
+/// The StandardBuilder config shared by the no-color and ANSI paths.
+fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder {
+    let mut b = grep_printer::StandardBuilder::new();
+    b.heading(opts.heading)
+        .path(opts.with_filename)
+        .column(opts.column || opts.vimgrep)
+        .byte_offset(opts.byte_offset)
+        .trim_ascii(opts.trim)
+        .per_match(opts.vimgrep)
+        .per_match_one_line(opts.vimgrep)
+        .only_matching(opts.only_matching)
+        .max_columns(opts.max_columns)
+        .path_terminator(opts.path_terminator)
+        .separator_path(opts.path_separator)
+        .stats(opts.stats);
+    if let Some(s) = &opts.field_match_separator {
+        b.separator_field_match(s.clone());
+    }
+    if let Some(s) = &opts.field_context_separator {
+        b.separator_field_context(s.clone());
+    }
+    if let Some(s) = &opts.context_separator {
+        b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
+    }
+    b
+}
+
+/// The compressed-body half of `search_one`: identical sink wiring,
+/// but the source is a decoded reader rather than a path.
+fn search_reader_sinks<M: grep_matcher::Matcher, R: std::io::Read>(
+    matcher: &M,
+    searcher: &mut grep_searcher::Searcher,
+    mut reader: R,
+    display: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
+    if opts.count || opts.count_matches {
+        let mut sink = CountSink {
+            matcher,
+            occurrences_mode: opts.count_matches || opts.multiline || opts.only_matching || opts.stats,
+            count: 0,
+            occurrences: 0,
+            count_occurrences: opts.count_matches || opts.multiline || opts.only_matching,
+        };
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        if sink.count > 0 || opts.include_zero {
+            let mut line = Vec::new();
+            if opts.with_filename {
+                write_path(&mut line, display, opts.path_separator)?;
+                line.push(opts.path_terminator.unwrap_or(b':'));
+            }
+            line.extend_from_slice(sink.count.to_string().as_bytes());
+            line.push(b'\n');
+            let stats = opts.stats.then(|| file_stats_buf(sink.count, sink.occurrences));
+            return Ok((line, sink.count > 0, stats));
+        }
+        return Ok((Vec::new(), false, None));
+    }
+    if opts.files_with_matches || opts.files_without_match {
+        let mut sink = FoundSink(false);
+        searcher.search_reader(matcher, &mut reader, &mut sink)?;
+        return Ok((Vec::new(), sink.0, None));
+    }
+    run_printer_sinks(matcher, searcher, display, opts, SearchSrc::Reader(&mut reader))
+}
+
+fn search_one<M: grep_matcher::Matcher>(
+    matcher: &M,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
-    encoding: Option<grep_searcher::Encoding>,
+    encoding: Option<&grep_searcher::Encoding>,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(opts.binary.clone())
-    let mut builder = SearcherBuilder::new();
-    builder
-        .binary_detection(BinaryDetection::quit(0))
-    let mut sb = SearcherBuilder::new();
-    // --null-data makes NUL a record separator, so it can't stay a
-    // binary-detection signal — the searcher treats the file as text.
-    sb.binary_detection(if opts.null_data {
-        BinaryDetection::none()
-    } else {
-        BinaryDetection::quit(0)
-    })
-        .line_number(true)
-        .before_context(opts.before)
-        .after_context(opts.after)
-        .multi_line(opts.multiline);
-    if let Some(enc) = &encoding {
-        builder.encoding(Some(enc.clone()));
-    }
-    let mut searcher = builder.build();
-        .multi_line(opts.multiline)
-        .passthru(opts.passthru)
-        .build();
-    if opts.null_data {
-        sb.line_terminator(grep_matcher::LineTerminator::byte(0));
-    }
-    let mut searcher = sb.build();
+    let mut searcher = build_searcher(opts, encoding);
     let full = root.join(rel);
     // Paths print relative to the user's cwd, not the index root: strip
     // the scope prefix (no-op when the search ran at the root itself).
@@ -422,11 +467,11 @@ fn search_one(
         && rel.extension().map(|x| x == "gz").unwrap_or(false);
     if compressed {
         let file = std::fs::File::open(&full)?;
-        let mut dec = flate2::read::GzDecoder::new(file);
+        let dec = flate2::read::GzDecoder::new(file);
         // A corrupt/mislabeled .gz yields an io error mid-decode; report
-        // it per-file and move on (the reference does the same: a bordered
-        // gzip warning to stderr, other files still searched).
-        return match search_one_decoded(matcher, &mut dec, rel, opts, &mut searcher) {
+        // it per-file and move on (a bordered warning, other files still
+        // searched — same contract).
+        return match search_reader_sinks(matcher, &mut searcher, dec, display, opts) {
             Ok(v) => Ok(v),
             Err(e) => {
                 eprintln!("glep: {}: {e}", rel.display());
@@ -434,55 +479,42 @@ fn search_one(
             }
         };
     }
-    if opts.count {
     if opts.count || opts.count_matches {
         let mut sink = CountSink {
             matcher,
-            multiline: opts.multiline,
-            occurrences: opts.count_matches,
+            occurrences_mode: opts.count_matches || opts.multiline || opts.only_matching || opts.stats,
             count: 0,
             occurrences: 0,
+            count_occurrences: opts.count_matches || opts.multiline || opts.only_matching,
         };
         searcher.search_path(matcher, &full, &mut sink)?;
-        if sink.count > 0 || opts.stats {
-            let stats = opts.stats.then(|| {
-                file_stats(&full, sink.count, sink.occurrences)
-            });
-            return Ok((
-                format!("{}:{}\n", display.display(), sink.count).into_bytes(),
-                true,
-                None,
-                if sink.count > 0 {
-                    format!("{}:{}\n", rel.display(), sink.count).into_bytes()
-                } else {
-                    Vec::new()
-                },
-                sink.count > 0,
-                stats,
-            ));
         if sink.count > 0 || opts.include_zero {
-            // `path` + path terminator (`:` normally, NUL under --null) +
+            // `path` + field terminator (`:` normally, NUL under --null) +
             // count; bare `N` when the path is suppressed.
             let mut line = Vec::new();
             if opts.with_filename {
-                write_path(&mut line, rel, opts.path_separator)?;
+                write_path(&mut line, display, opts.path_separator)?;
                 line.push(opts.path_terminator.unwrap_or(b':'));
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
             line.push(b'\n');
-            return Ok((line, sink.count > 0, None));
+            let stats = opts.stats.then(|| {
+                file_stats(&full, sink.count, sink.occurrences)
+            });
+            return Ok((line, sink.count > 0, stats));
         }
-        return Ok((Vec::new(), false, None));
+        return Ok((Vec::new(), false, opts.stats.then(|| file_stats(&full, 0, 0))));
     }
-    if opts.files_with_matches {
+    if opts.files_with_matches || opts.files_without_match {
         if opts.stats {
             // --stats needs real counts: run the count sink instead of
             // the early-exit one.
             let mut sink = CountSink {
                 matcher,
-                multiline: opts.multiline,
+                occurrences_mode: true,
                 count: 0,
                 occurrences: 0,
+                count_occurrences: false,
             };
             searcher.search_path(matcher, &full, &mut sink)?;
             return Ok((
@@ -495,70 +527,7 @@ fn search_one(
         searcher.search_path(matcher, &full, &mut sink)?;
         return Ok((Vec::new(), sink.0, None));
     }
-    let mut buf = Vec::new();
-    let matched;
-    let stats;
-    if opts.json {
-        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, display);
-        searcher.search_path(matcher, &full, &mut sink)?;
-        matched = sink.has_match();
-        stats = Some(sink.stats().clone());
-    } else {
-        let mut printer = grep_printer::StandardBuilder::new()
-            .heading(false)
-            .path(opts.with_filename)
-            .column(opts.column || opts.vimgrep)
-            .byte_offset(opts.byte_offset)
-            .trim_ascii(opts.trim)
-            .per_match(opts.vimgrep)
-            .per_match_one_line(true)
-            .path_terminator(opts.path_terminator)
-            .separator_path(opts.path_separator)
-            .stats(opts.stats)
-            .build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, display);
-        let mut printer_b = grep_printer::StandardBuilder::new();
-        printer_b.heading(false);
-        let mut printer = printer_b.build_no_color(&mut buf);
-        let mut b = grep_printer::StandardBuilder::new();
-        b.heading(false);
-        if let Some(s) = &opts.field_match_separator {
-            b.separator_field_match(s.clone());
-        }
-        if let Some(s) = &opts.field_context_separator {
-            b.separator_field_context(s.clone());
-        }
-        if let Some(s) = &opts.context_separator {
-            b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
-        }
-        let mut printer = b.build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_path(matcher, &full, &mut sink)?;
-        matched = sink.has_match();
-        stats = sink.stats().cloned();
-        let mut b = grep_printer::StandardBuilder::new();
-        b.heading(false);
-        if opts.color {
-            let mut all = grep_printer::default_color_specs();
-            for s in &opts.color_specs {
-                if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
-                    all.push(spec);
-                }
-            }
-            b.color_specs(grep_printer::ColorSpecs::new(&all));
-            let mut printer = b.build(termcolor::Ansi::new(&mut buf));
-            let mut sink = printer.sink_with_path(matcher, rel);
-            searcher.search_path(matcher, &full, &mut sink)?;
-            matched = sink.has_match();
-        } else {
-            let mut printer = b.build_no_color(&mut buf);
-            let mut sink = printer.sink_with_path(matcher, rel);
-            searcher.search_path(matcher, &full, &mut sink)?;
-            matched = sink.has_match();
-        }
-    }
-    Ok((buf, matched, stats))
+    run_printer_sinks::<M, std::io::Empty>(matcher, &mut searcher, display, opts, SearchSrc::Path(&full))
 }
 
 /// Write `rel` honoring --path-separator (components rejoined by the
@@ -578,7 +547,9 @@ fn write_path<W: std::io::Write + ?Sized>(out: &mut W, rel: &Path, sep: Option<u
             Ok(())
         }
     }
-/// Stats for paths searched without the printer (count/fwm modes):
+}
+
+/// Stats for paths searched (count/fwm modes):
 /// occurrences, matched lines, one search, bytes from the file size.
 fn file_stats(full: &Path, matched_lines: u64, matches: u64) -> grep_printer::Stats {
     let mut s = grep_printer::Stats::new();
@@ -590,6 +561,19 @@ fn file_stats(full: &Path, matched_lines: u64, matches: u64) -> grep_printer::St
         s.add_bytes_searched(m.len() as u64);
     }
     s
+}
+
+/// Also needed by -z: stats for a decoded stream where no stat()able
+/// file exists — bytes tracked as searched via the stream already.
+fn file_stats_buf(matched_lines: u64, matches: u64) -> grep_printer::Stats {
+    let mut s = grep_printer::Stats::new();
+    s.add_searches(1);
+    s.add_searches_with_match(u64::from(matched_lines > 0));
+    s.add_matched_lines(matched_lines);
+    s.add_matches(matches);
+    s
+}
+
 /// -q: nothing is written; the answer is carried purely by the exit code.
 /// The one exception is `--json -q`, where rg still emits the closing
 /// summary event (verified against rg 15.0.0), so for json each file is
@@ -597,8 +581,8 @@ fn file_stats(full: &Path, matched_lines: u64, matches: u64) -> grep_printer::St
 /// stats. Plain -q uses FoundSink with `.any()` short-circuit so the first
 /// matching file ends the run, and --json -q stops after the first chunk
 /// containing a match (so its stats reflect what was actually searched).
-fn run_quiet(
-    matcher: &grep_regex::RegexMatcher,
+fn run_quiet<M: grep_matcher::Matcher + Sync>(
+    matcher: &M,
     root: &Path,
     files: &[PathBuf],
     opts: &SearchOpts,
@@ -606,7 +590,7 @@ fn run_quiet(
     start: Instant,
 ) -> anyhow::Result<bool> {
     let quiet_one = |rel: &PathBuf| -> anyhow::Result<(bool, Option<grep_printer::Stats>)> {
-        let mut searcher = build_searcher(opts);
+        let mut searcher = build_searcher(opts, None);
         let full = root.join(rel);
         if opts.json {
             let mut scratch = Vec::new();
@@ -701,27 +685,23 @@ pub fn run(
     // generic over Matcher; only the builder differs.
     if opts.pcre2 {
         let matcher = build_pcre2_matcher(pattern, opts)?;
-        return run_impl(&matcher, root, files, opts, out);
+        return run_impl(&matcher, root, files, universe, opts, out);
     }
     let matcher = build_matcher(pattern, opts)?;
-    run_impl(&matcher, root, files, opts, out)
+    run_impl(&matcher, root, files, universe, opts, out)
 }
 
 fn run_impl<M: grep_matcher::Matcher + Sync>(
     matcher: &M,
     root: &Path,
     files: &[PathBuf],
+    universe: Option<&[PathBuf]>,
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
     // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
     let start = Instant::now();
-    let mut matched_names = std::collections::BTreeSet::new();
-    // Build the matcher once up front; shared by reference across the rayon
-    // closure (grep_regex::RegexMatcher is Sync). This also validates the
-    // pattern before I/O, matching prior behavior.
-    let matcher = build_matcher(pattern, opts)?;
     // Resolve the -E label up front so a bad label errors before any I/O
     // (the reference exits 2 on an unknown encoding).
     let encoding = match &opts.encoding {
@@ -732,25 +712,27 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
         None => None,
     };
     if opts.quiet {
-        return run_quiet(&matcher, root, files, opts, out, start);
+        return run_quiet(matcher, root, files, opts, out, start);
     }
+    let mut matched_names = std::collections::BTreeSet::new();
     let mut found = false;
     // Per-file groups are separated: a blank line under --heading (our
     // fresh-per-file printers can't emit it, so run() inserts it), `--`
     // under context mode. Both match rg's grouping bytes.
     let separate = (opts.heading || opts.before > 0 || opts.after > 0)
         && !opts.files_with_matches
+        && !opts.files_without_match
         && !opts.json
-        && !opts.count;
+        && !opts.count
+        && !opts.count_matches;
     let mut printed_any = false;
     let mut base = 0usize;
     let mut total_stats = grep_printer::Stats::new();
     for chunk in files.chunks(128) {
-        let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
+        let results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
             .enumerate()
-            .map(|(i, rel)| match search_one(&matcher, root, rel, opts, encoding.clone()) {
-            .map(|(i, rel)| match search_one(matcher, root, rel, opts) {
+            .map(|(i, rel)| match search_one(matcher, root, rel, opts, encoding.as_ref()) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
@@ -758,74 +740,60 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
                 }
             })
             .collect();
-        results.sort_by_key(|(i, _, _, _)| *i);
         for (i, buf, matched, stats) in results {
             if let Some(s) = &stats {
                 merge_stats(&mut total_stats, s);
             }
-            // Write any produced output, not just matches: --passthru
-            // emits every line including non-matching ones, so a
-            // no-match file can still produce bytes.
-            if matched || !buf.is_empty() {
-                if matched {
-                    found = true;
-                }
+            let global_i = base + i;
+            // --files-without-match: collect matched names; the universe
+            // complement emits after the loop.
             if opts.files_without_match {
-                // Collect matched names; the complement of `universe`
-                // emits after the loop.
                 if matched {
-                    matched_names.insert(files[base + i].clone());
+                    matched_names.insert(files[global_i].clone());
                 }
                 continue;
             }
-            if matched {
-                found = true;
-                let global_i = base + i;
-                if opts.files_with_matches {
+            if opts.files_with_matches {
+                if matched {
+                    found = true;
                     let display = files[global_i]
                         .strip_prefix(&opts.display_prefix)
                         .unwrap_or(&files[global_i]);
-                    writeln!(out, "{}", display.display())?;
-                    if matched {
-                        writeln!(out, "{}", files[global_i].display())?;
-                    }
-                } else {
-                    if separate && printed_any {
-                        match &opts.context_separator {
-                            // "" disables the separator entirely
-                            Some(v) if v.is_empty() => {}
-                            Some(v) => {
-                                out.write_all(v)?;
-                                out.write_all(b"\n")?;
-                            }
-                            None => writeln!(out, "--")?,
-                        }
-                        writeln!(out, "{}", if opts.heading { "" } else { "--" })?;
-                    }
-                    out.write_all(&buf)?;
-                    if opts.line_buffered {
-                        out.flush()?;
-                    }
-                    printed_any = true;
-                }
-            }
-            if opts.files_with_matches {
-                if matched {
-                    let global_i = base + i;
-                    write_path(out, &files[global_i], opts.path_separator)?;
+                    write_path(out, display, opts.path_separator)?;
                     out.write_all(&[opts.path_terminator.unwrap_or(b'\n')])?;
                 }
                 continue;
             }
-            // Non-empty buffers print even when the file didn't match:
+            // Write any produced output, not just matches: --passthru
+            // emits every line including non-matching ones, and
             // --include-zero -c emits `path:0` lines for searched files.
             if buf.is_empty() {
                 continue;
             }
+            if matched {
+                found = true;
+            }
             if separate && printed_any {
-                writeln!(out, "--")?;
+                match &opts.context_separator {
+                    // "" disables the separator entirely
+                    Some(v) if v.is_empty() => {}
+                    Some(v) => {
+                        out.write_all(v)?;
+                        out.write_all(b"\n")?;
+                    }
+                    None => {
+                        if opts.heading {
+                            writeln!(out)?;
+                        } else {
+                            writeln!(out, "--")?;
+                        }
+                    }
+                }
             }
             out.write_all(&buf)?;
+            if opts.line_buffered {
+                out.flush()?;
+            }
             printed_any = true;
         }
         base += chunk.len();
@@ -848,17 +816,7 @@ fn run_impl<M: grep_matcher::Matcher + Sync>(
         // are masked out of tests/json_parity.rs's comparison, so this
         // simplification is safe; `merge_stats` above deliberately never
         // touches `elapsed`, so this is the only place it's set.
-        let elapsed = start.elapsed();
-        total_stats.add_elapsed(elapsed);
-        let event = SummaryEvent {
-            kind: "summary",
-            data: SummaryData {
-                elapsed_total: NiceDuration::from(elapsed),
-                stats: total_stats.clone(),
-            },
-        };
-        writeln!(out, "{}", serde_json::to_string(&event)?)?;
-        write_summary(out, &mut total_stats, elapsed)?;
+        write_summary(out, &mut total_stats, start.elapsed())?;
     }
     if opts.stats && !opts.json {
         // rg's stats block: a blank line then fixed-order counters.

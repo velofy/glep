@@ -334,6 +334,7 @@ pub fn sweep_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<Fil
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: true,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -398,6 +399,7 @@ pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: true,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -428,6 +430,7 @@ pub fn sweep_no_git(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: false,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();
@@ -510,6 +513,7 @@ pub fn sweep_one_fs(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        whitelists: true,
     };
     walker.visit(&mut builder);
     let mut v = collected.into_inner().unwrap();

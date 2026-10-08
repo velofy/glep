@@ -17,7 +17,6 @@ pub struct Args {
     /// present, all positionals are paths.
     #[arg(short = 'e', long = "regexp")]
     pub regexp: Vec<String>,
-    pub regexp: Option<String>,
     /// Read patterns from a file, one per line; OR'd with -e/positional
     /// (rg -f/--file, repeatable)
     #[arg(short = 'f', long = "file", value_name = "FILE")]
@@ -347,25 +346,25 @@ fn discover_index_root(cwd: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
 }
 
 fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel: &Path) {
-/// Combine `-e` patterns and the positional into one pattern string.
-/// Multiple patterns OR together (each wrapped in a non-capturing group
-/// so `^`/`$`/anchors keep their per-arm semantics). Under -F each arm is
-/// escaped individually and the result is a plain regex union — the
-/// matcher/planner must then treat it as regex, not literal, so callers
-/// use `effective_fixed` from this same helper.
-fn combine_patterns(args: &Args) -> anyhow::Result<(String, bool)> {
-    let pats: &[String] = if !args.regexp.is_empty() {
-        &args.regexp
-    } else {
-        match &args.pattern {
-            Some(p) => std::slice::from_ref(p),
-            None => &[],
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for p in paths.iter_mut() {
+        if p.is_absolute() {
+            let canonical_p = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
+            if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
+                *p = rel.to_path_buf();
+            }
+        } else {
+            *p = norm_join(cwd_rel, p).unwrap_or_else(|| p.clone());
         }
-    };
+    }
+}
+
 /// Combine -e/--file/positional into one pattern string. Multiple
 /// sources OR together, each arm wrapped in a non-capturing group so
 /// ^/$ stay arm-local. -f files contribute one arm per non-empty line
-/// (rg -f semantics; line-trailing `\n` stripped).
+/// (rg -f semantics; line-trailing `\n` stripped). Under -F each arm is
+/// escaped individually and the union is a regex — the matcher/planner
+/// see effective_fixed=false.
 fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
     let mut pats: Vec<String> = args.regexp.clone().into_iter().collect();
     for f in &args.pattern_files {
@@ -390,12 +389,6 @@ fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
     if pats.len() == 1 {
         return Ok((pats[0].clone(), args.fixed_strings));
     }
-    // Multiple patterns OR together; each arm wrapped in a
-    // non-capturing group so ^/$ stay arm-local. Under -F each arm is
-    // escaped individually and the matcher/planner treat the union as a
-    // regex (effective_fixed = false).
-    // -F across multiple arms: each arm escapes to a literal and the
-    // union is a regex — the matcher/planner see effective_fixed=false.
     let fixed = args.fixed_strings;
     let joined = pats
         .iter()
@@ -404,20 +397,6 @@ fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
         .collect::<Vec<_>>()
         .join("|");
     Ok((joined, false))
-}
-
-fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
-    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    for p in paths.iter_mut() {
-        if p.is_absolute() {
-            let canonical_p = std::fs::canonicalize(&*p).unwrap_or_else(|_| p.clone());
-            if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
-                *p = rel.to_path_buf();
-            }
-        } else {
-            *p = norm_join(cwd_rel, p).unwrap_or_else(|| p.clone());
-        }
-    }
 }
 
 /// Display form of an index-relative path: strip the cwd scope prefix so
@@ -450,6 +429,8 @@ fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool
         }
     }
     missing
+}
+
 /// --color WHEN resolution: `always` and `auto`+tty enable ANSI output;
 /// `never` and anything else disable it. `auto` on a piped stream is the
 /// common path (agents capture stdout), so it stays colorless there.
@@ -479,7 +460,6 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
         let overrides = ob.build()?;
         files.retain(|f| !overrides.matched(f, false).is_ignore());
     }
-    if !args.types.is_empty() || !args.types_not.is_empty() {
     if !args.ignore_file.is_empty() {
         // Build one Gitignore per extra rules file, anchored at the
         // file's parent dir so its patterns resolve like a .gitignore
@@ -506,7 +486,7 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
             })
         });
     }
-    if !args.types.is_empty() {
+    if !args.types.is_empty() || !args.types_not.is_empty() {
         let mut tb = ignore::types::TypesBuilder::new();
         tb.add_defaults();
         for t in &args.types {
@@ -523,11 +503,27 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
             !m.is_ignore() && (args.types.is_empty() || m.is_whitelist())
         });
     }
+    if let Some(maxd) = args.max_depth {
+        // Depth is operand-relative: a file's depth is its component count
+        // minus the containing operand's. With no operands the implicit
+        // root is the operand, so depth is the whole component count.
+        files.retain(|f| {
+            let depth = f.components().count();
+            if args.paths.is_empty() {
+                depth <= maxd
+            } else {
+                args.paths.iter().any(|p| {
+                    f.starts_with(p)
+                        && depth.saturating_sub(p.components().count()) <= maxd
+                })
+            }
+        });
+    }
     Ok(())
 }
 
 /// Sort the file list per --sort/--sortr. `modified` uses manifest mtimes
-/// via `mtime_of`; `accessed`/`created` stat each candidate (sets are
+/// via `mtime_map`; `accessed`/`created` stat each candidate (sets are
 /// usually small); `path` is the default order; `none` keeps sweep order.
 fn apply_sort(
     files: &mut Vec<PathBuf>,
@@ -562,28 +558,10 @@ fn apply_sort(
     if args.sortr.is_some() {
         files.reverse();
     }
-    if let Some(maxd) = args.max_depth {
-        // Depth is operand-relative: a file's depth is its component count
-        // minus the containing operand's. With no operands the implicit
-        // root is the operand, so depth is the whole component count.
-        files.retain(|f| {
-            let depth = f.components().count();
-            if args.paths.is_empty() {
-                depth <= maxd
-            } else {
-                args.paths.iter().any(|p| {
-                    f.starts_with(p)
-                        && depth.saturating_sub(p.components().count()) <= maxd
-                })
-            }
-        });
-    }
     Ok(())
 }
-
-/// Write a path honoring --path-separator (components rejoined by the
-/// custom byte) followed by the path terminator: NUL under --null,
-/// newline otherwise.
+/// Write `rel` with `sep` between components (rg --path-separator), then
+/// the record terminator (`\0` under -0/--null, newline otherwise).
 fn write_terminated_path(
     out: &mut dyn std::io::Write,
     rel: &Path,
@@ -599,22 +577,87 @@ fn write_terminated_path(
             first = false;
             out.write_all(c.as_os_str().as_encoded_bytes())?;
         }
+        write!(out, "")?;
     } else {
         write!(out, "{}", rel.display())?;
     }
     out.write_all(&[term])
-fn search_opts(args: &Args) -> search::SearchOpts {
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
+}
+
+/// -a/--binary/--null-data → the searcher's binary-detection mode.
+/// last-wins ordering between -a and --binary matters (rg semantics).
+fn binary_detection(args: &Args) -> grep_searcher::BinaryDetection {
+    if args.text {
+        grep_searcher::BinaryDetection::none()
+    } else if args.binary {
+        grep_searcher::BinaryDetection::convert(b'\x00')
+    } else {
+        grep_searcher::BinaryDetection::quit(b'\x00')
+    }
+}
+
+/// rg's implicit with-filename heuristic: a sole explicit file operand
+/// prints bare matches (no path); everything else prints `path:`.
+fn with_filename(args: &Args, root: &Path) -> bool {
+    if args.with_filename {
+        return true;
+    }
+    if args.no_filename {
+        return false;
+    }
+    // A sole explicit FILE operand suppresses paths; a dir operand does not.
+    if args.paths.len() == 1 {
+        let p = root.join(&args.paths[0]);
+        if p.is_file() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Full SearchOpts builder — every flag mode in one place. `root`/`cwd_rel`
+/// feed the with_filename heuristic and the display-prefix strip.
+fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
     search::SearchOpts {
         case_insensitive: args.ignore_case,
         fixed: args.fixed_strings,
         files_with_matches: args.files_with_matches,
-        before,
-        after,
+        files_without_match: args.files_without_match,
+        before: args.before_context.or(args.context).unwrap_or(0),
+        after: args.after_context.or(args.context).unwrap_or(0),
         json: args.json,
         count: args.count,
+        count_matches: args.count_matches,
         multiline: args.multiline,
+        binary: binary_detection(args),
+        display_prefix: cwd_rel.to_path_buf(),
+        column: args.column || args.vimgrep,
+        byte_offset: args.byte_offset,
+        vimgrep: args.vimgrep,
+        trim: args.trim,
+        path_terminator: args.null.then_some(0u8),
+        path_separator: args.path_separator,
+        include_zero: args.include_zero,
+        with_filename: with_filename(args, root),
+        stats: args.stats,
+        multiline_dotall: args.multiline_dotall,
+        encoding: args.encoding.clone(),
+        line_buffered: args.line_buffered,
+        color: want_color(args),
+        color_specs: args.color_specs.clone(),
+        passthru: args.passthru,
+        unicode: !args.no_unicode,
+        null_data: args.null_data,
+        dfa_size_limit: args.dfa_size_limit,
+        regex_size_limit: args.regex_size_limit,
+        field_match_separator: args.field_match_separator.as_ref().map(|v| v.clone().into_bytes()),
+        field_context_separator: args
+            .field_context_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
+        pcre2: args.pcre2,
+        search_zip: args.search_zip,
         word: args.word_regexp,
         line_regexp: args.line_regexp,
         smart_case: args.smart_case,
@@ -629,75 +672,17 @@ fn search_opts(args: &Args) -> search::SearchOpts {
     }
 }
 
-/// `--no-ignore`: content mode and `--files` mode both bypass the index
-/// entirely (no open, no update, no write, not even a read-only fallback
-/// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
-/// walks with every ignore source disabled. This is the escape hatch's
-/// whole point: ignored trees must never enter the index, so the only
-/// sound way to search them is to never touch the index at all for this
-/// run. Slower than the indexed path (full walk + full scan every time,
-/// same cost as `rg --no-ignore` itself), but that trade is deliberate.
-///
-/// `args.hidden` gates hidden files exactly as it does on the indexed
-/// path; `sweep_unfiltered` does that gating itself (see its doc comment
-/// in walk.rs), so the result is not re-filtered by hidden here. The
-/// existing positional-path/glob/type filters (`apply_filters`, already
-/// normalized by the caller) and exit-code conventions are unchanged.
-fn run_no_ignore(
+/// Shared tail of every live-scan escape hatch (`--no-ignore`, `-L`,
+/// `--require-git` outside a repo, `--one-file-system`): --files listing
+/// and content search over an already-computed file set. `cwd_rel` feeds
+/// display paths, `had_error` propagates missing-path exit 2.
+fn run_live_files(
     root: &Path,
     cwd_rel: &Path,
     args: &Args,
     timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
-/// `-L`/`--follow`: live-scan escape hatch — files reached through
-/// symlinked directories are never in the manifest, so index narrowing
-/// cannot find them; sweep the followed tree (ignore rules still
-/// applied — `-L` only changes traversal) and search everything. Same
-/// correctness-over-speed tradeoff as `--no-ignore`.
-fn run_follow(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_follow(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_follow");
-    run_live_files(root, args, timings, files)
-}
-
-fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden, args.follow)?
-fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_unfiltered");
-    run_live_files(root, args, timings, files)
-}
-
-/// Shared tail of the live-scan escape hatches (`--no-ignore`, `-L`):
-/// --files listing and content search over an already-computed file set.
-/// `--require-git` outside a repo: git-derived ignore rules are inert,
-/// so files the manifest lacks (gitignored) can match — live scan over
-/// `sweep_no_git` (git sources off, `.ignore`/`.rgignore` still on).
-fn run_require_git(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_no_git(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_no_git");
-    run_live_files(root, args, timings, files)
-}
-
-/// Shared tail of the live-scan paths (`--no-ignore`, `--require-git`
-/// outside a repo): --files listing and content search over an
-/// already-computed file set.
-fn run_live_files(
-    root: &Path,
-    args: &Args,
-    timings: &mut Timings,
     mut files: Vec<PathBuf>,
+    had_error: bool,
 ) -> anyhow::Result<i32> {
     if args.files {
         // With --files the pattern slot is the glob.
@@ -710,8 +695,7 @@ fn run_live_files(
         let mut lock = stdout.lock();
         let term = if args.null { 0 } else { b'\n' };
         for f in &files {
-            println!("{}", display_path(f, cwd_rel).display());
-            write_terminated_path(&mut lock, f, args.path_separator, term)?;
+            write_terminated_path(&mut lock, display_path(f, cwd_rel), args.path_separator, term)?;
         }
         timings.finish();
         return Ok(if had_error {
@@ -723,39 +707,12 @@ fn run_live_files(
         });
     }
 
-    let (pattern, effective_fixed) = combine_patterns(&args)?;
     let (pattern, effective_fixed) = resolve_pattern(&args)?;
+    let _ = effective_fixed;
     apply_filters(&mut files, args)?;
     timings.stage("candidates");
-
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
-    let opts = search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: effective_fixed,
-        files_with_matches: args.files_with_matches,
-        files_without_match: args.files_without_match,
-        before,
-        after,
-        json: args.json,
-        count: args.count,
-        count_matches: args.count_matches,
-        multiline: args.multiline,
-        binary: binary_detection(args),
-        display_prefix: cwd_rel.to_path_buf(),
-        stats: args.stats,
-        multiline_dotall: args.multiline_dotall,
-        encoding: args.encoding.clone(),
-        line_buffered: args.line_buffered,
-        color: want_color(&args),
-        color_specs: args.color_specs.clone(),
-        passthru: args.passthru,
-        unicode: !args.no_unicode,
-        null_data: args.null_data,
-        dfa_size_limit: args.dfa_size_limit,
-        regex_size_limit: args.regex_size_limit,
-    };
-    let opts = search_opts(args, root);
+    let mut opts = search_opts(args, root, cwd_rel);
+    opts.fixed = effective_fixed;
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, root, &files, None, &opts, &mut lock)?;
@@ -770,119 +727,81 @@ fn run_live_files(
     })
 }
 
-/// Binary-detection mode for the searcher: `-a` searches binary files as
-/// raw text, `--binary` searches them but reports a notice instead of the
-/// matched lines, and the default quits a file at the first NUL byte.
-/// `-a`/`--binary` are a last-wins pair, like rg.
-fn binary_detection(args: &Args) -> grep_searcher::BinaryDetection {
-    use grep_searcher::BinaryDetection;
-    if args.text {
-        BinaryDetection::none()
-    } else if args.binary {
-        BinaryDetection::convert(0)
-    } else {
-        BinaryDetection::quit(0)
-    }
+/// `--no-ignore`: content mode and `--files` mode both bypass the index
+/// entirely (no open, no update, no write, not even a read-only fallback
+/// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
+/// walks with every ignore source disabled. This is the escape hatch's
+/// whole point: ignored trees must never enter the index, so the only
+/// sound way to search them is to never touch the index at all for this
+/// run. `args.follow` passes through to the walker (-L composes).
+fn run_no_ignore(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden, args.follow)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_unfiltered");
+    run_live_files(root, cwd_rel, args, timings, files, had_error)
 }
 
-/// Resolved path-prefixing: explicit -H/-I win (last-wins pair); else on
-/// for --vimgrep, or whenever the operand isn't exactly one file.
-fn with_filename(args: &Args, root: &Path) -> bool {
-    if args.no_filename {
-        return false;
-    }
-    if args.with_filename {
-        return true;
-    }
-    let single_file =
-        args.paths.len() == 1 && root.join(&args.paths[0]).is_file();
-    args.vimgrep || !single_file
+/// `-L`/`--follow`: live-scan escape hatch — files reached through
+/// symlinked directories are never in the manifest, so index narrowing
+/// cannot find them; sweep the followed tree (ignore rules still
+/// applied — `-L` only changes traversal) and search everything.
+fn run_follow(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_follow(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_follow");
+    run_live_files(root, cwd_rel, args, timings, files, had_error)
 }
 
-fn search_opts(args: &Args, root: &Path) -> search::SearchOpts {
-    search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
-        files_with_matches: args.files_with_matches,
-        before: args.before_context.or(args.context).unwrap_or(0),
-        after: args.after_context.or(args.context).unwrap_or(0),
-        json: args.json,
-        count: args.count,
-        multiline: args.multiline,
-        column: args.column || args.vimgrep,
-        byte_offset: args.byte_offset,
-        vimgrep: args.vimgrep,
-        trim: args.trim,
-        path_terminator: args.null.then_some(0u8),
-        path_separator: args.path_separator,
-        include_zero: args.include_zero,
-        with_filename: with_filename(args, root),
-    }
+/// `--require-git` outside a repo: git-derived ignore rules are inert,
+/// so files the manifest lacks (gitignored) can match — live scan over
+/// `sweep_no_git` (git sources off, `.ignore`/`.rgignore` still on).
+fn run_require_git(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_no_git(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_no_git");
+    run_live_files(root, cwd_rel, args, timings, files, had_error)
 }
 
-/// `--one-file-system`: live-scan escape hatch in the same shape as
-/// `--no-ignore` — mount-point subtrees must not enter the index, so the
-/// flag routes through `walk::sweep_one_fs` (ignores ON, same-st_dev
-/// descent) instead of ever consulting the index.
-fn run_one_fs(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let mut files: Vec<PathBuf> = walk::sweep_one_fs(root, args.hidden)?
+/// `--one-file-system`: live-scan escape hatch — mount-point subtrees
+/// never enter the index, so this sweeps with `same_file_system` on
+/// (ignores still applied) and never touches `.glep`.
+fn run_one_fs(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_one_fs(root, args.hidden)?
         .into_iter()
         .map(|m| m.path)
         .collect();
     timings.stage("sweep_one_fs");
-
-    if args.files {
-        if let Some(g) = args.pattern.as_deref() {
-            let glob = build_glob(g)?;
-            files.retain(|f| glob.is_match(f));
-        }
-        apply_filters(&mut files, args)?;
-        for f in &files {
-            println!("{}", f.display());
-        }
-        timings.finish();
-        return Ok(if files.is_empty() { 1 } else { 0 });
-    }
-
-    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
-        Some(p) => p,
-        None => anyhow::bail!("a pattern is required (or --files)"),
-    };
-    apply_filters(&mut files, args)?;
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
-    let opts = search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: args.fixed_strings,
-        files_with_matches: args.files_with_matches,
-        before,
-        after,
-        json: args.json,
-        count: args.count,
-        multiline: args.multiline,
-        null_data: args.null_data,
-        dfa_size_limit: args.dfa_size_limit,
-        regex_size_limit: args.regex_size_limit,
-        field_match_separator: args
-            .field_match_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        field_context_separator: args
-            .field_context_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
-        pcre2: args.pcre2,
-        search_zip: args.search_zip,
-    };
-    timings.stage("candidates");
-
-    let opts = search_opts(&args);
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
-    timings.finish();
-    Ok(if found { 0 } else { 1 })
+    run_live_files(root, cwd_rel, args, timings, files, had_error)
 }
 
 pub fn run() -> anyhow::Result<i32> {
@@ -895,14 +814,22 @@ pub fn run() -> anyhow::Result<i32> {
             .build_global();
     }
 
-    // With -e/--regexp the positional pattern slot is free; a bare
-    // positional there is a path (e.g. `glep -e foo src`).
-    if !args.regexp.is_empty() && !args.files {
-    if (args.regexp.is_some() || !args.pattern_files.is_empty()) && !args.files {
+    // With -e/-f the positional pattern slot is free; a bare positional
+    // there is a path (e.g. `glep -e foo src`, `glep -f pats src`).
+    if (!args.regexp.is_empty() || !args.pattern_files.is_empty()) && !args.files {
         if let Some(p) = args.pattern.take() {
             args.paths.insert(0, PathBuf::from(p));
         }
     }
+    // -u/-uu fold into their flag equivalents (rg semantics; -uuu reserved
+    // pending -a — see the flag tracker).
+    if args.unrestricted > 0 {
+        args.no_ignore = true;
+        if args.unrestricted >= 2 {
+            args.hidden = true;
+        }
+    }
+
     let cwd = std::env::current_dir()?;
     let (root, cwd_rel) = discover_index_root(&cwd)?;
     // Missing path filters are errors (exit 2), checked against the cwd
@@ -914,18 +841,17 @@ pub fn run() -> anyhow::Result<i32> {
     if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
         args.paths.push(cwd_rel.clone());
     }
-    // -u/-uu/-uuu fold into their flag equivalents (rg semantics).
-    if args.unrestricted > 0 {
-        args.no_ignore = true;
-        if args.unrestricted >= 2 {
-            args.hidden = true;
+
+    // --engine validates before any index work (rg errors at arg-parse).
+    if let Some(e) = &args.engine {
+        match e.as_str() {
+            "default" | "auto" | "pcre2" => {}
+            other => anyhow::bail!("unrecognized regex engine '{other}'"),
         }
     }
-    let root = std::env::current_dir()?;
-    normalize_path_filters(&mut args.paths, &root);
 
     // Subcommand-style words in the pattern slot.
-    if args.regexp.is_empty() && !args.files && !args.no_ignore {
+    if args.regexp.is_empty() && args.pattern_files.is_empty() && !args.files && !args.no_ignore {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;
@@ -934,7 +860,9 @@ pub fn run() -> anyhow::Result<i32> {
             }
             Some("status") => {
                 let mut idx = Index::open_or_build(&root, args.max_filesize)?;
-                if !idx.read_only { idx.update(args.max_filesize, 0)?; }
+                if !idx.read_only {
+                    idx.update(args.max_filesize, 0)?;
+                }
                 let live = idx.manifest.live_entries().count();
                 let skipped = idx
                     .manifest
@@ -954,81 +882,32 @@ pub fn run() -> anyhow::Result<i32> {
 
     let mut timings = Timings::new();
 
+    // Escape hatches — each never reads or writes the index.
     if args.no_ignore {
         return run_no_ignore(&root, &cwd_rel, &args, &mut timings, had_error);
     }
     if args.require_git && !root.join(".git").exists() {
-        return run_require_git(&root, &args, &mut timings);
+        return run_require_git(&root, &cwd_rel, &args, &mut timings, had_error);
     }
     if args.one_file_system {
-        return run_one_fs(&root, &args, &mut timings);
+        return run_one_fs(&root, &cwd_rel, &args, &mut timings, had_error);
+    }
+    if args.follow {
+        return run_follow(&root, &cwd_rel, &args, &mut timings, had_error);
     }
 
     if args.no_index {
         // Live gitignore-aware scan of the discovered tree: same file set
         // as the indexed path would yield, minus all trigram narrowing.
-        let mut files: Vec<PathBuf> = walk::sweep(&root)?
+        let files: Vec<PathBuf> = walk::sweep(&root)?
             .into_iter()
             .filter(|m| args.hidden || !m.hidden)
             .map(|m| m.path)
             .collect();
         timings.stage("sweep");
-        if args.files {
-            if let Some(g) = args.pattern.as_deref() {
-                let glob = build_glob(g)?;
-                files.retain(|f| glob.is_match(f));
-            }
-            apply_filters(&mut files, &args)?;
-            for f in &files {
-                println!("{}", display_path(f, &cwd_rel).display());
-            }
-            timings.finish();
-            return Ok(if had_error {
-                2
-            } else if files.is_empty() {
-                1
-            } else {
-                0
-            });
-        }
-        let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
-            Some(p) => p,
-            None => anyhow::bail!("a pattern is required (or --files)"),
-        };
-        apply_filters(&mut files, &args)?;
-        let opts = search::SearchOpts {
-            case_insensitive: args.ignore_case,
-            fixed: args.fixed_strings,
-            files_with_matches: args.files_with_matches,
-            before: args.before_context.or(args.context).unwrap_or(0),
-            after: args.after_context.or(args.context).unwrap_or(0),
-            json: args.json,
-            count: args.count,
-            multiline: args.multiline,
-            display_prefix: cwd_rel.to_path_buf(),
-        };
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
-        timings.finish();
-        return Ok(if had_error {
-            2
-        } else if found {
-            0
-        } else {
-            1
-        });
-    }
-    if args.follow {
-        return run_follow(&root, &args, &mut timings);
+        return run_live_files(&root, &cwd_rel, &args, &mut timings, files, had_error);
     }
 
-    if let Some(e) = &args.engine {
-        match e.as_str() {
-            "default" | "auto" => {}
-            other => anyhow::bail!("unrecognized regex engine '{other}'"),
-        }
-    }
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
     // Path filters scope the freshness sweep too: subtrees outside the
@@ -1061,12 +940,12 @@ pub fn run() -> anyhow::Result<i32> {
         }
         let args2 = Args { pattern: None, ..args };
         apply_filters(&mut files, &args2)?;
+        apply_sort(&mut files, &args2, &idx, &root)?;
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
         let term = if args.null { 0 } else { b'\n' };
         for f in &files {
-            println!("{}", display_path(f, &cwd_rel).display());
-            write_terminated_path(&mut lock, f, args.path_separator, term)?;
+            write_terminated_path(&mut lock, display_path(f, &cwd_rel), args.path_separator, term)?;
         }
         timings.finish();
         return Ok(if had_error {
@@ -1078,50 +957,49 @@ pub fn run() -> anyhow::Result<i32> {
         });
     }
 
-    let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
-        Some(p) => p,
-        None => anyhow::bail!("a pattern is required (or --files)"),
-    };
-    // -c --include-zero must emit `:0` for every walked file, so trigram
-    // narrowing is unsound: degenerate to the full candidate set. Binary
-    // files join too — under quit detection they simply count as 0.
-    let include_binary = args.count && args.include_zero;
-    let query_plan = if include_binary {
-    // --passthru prints every line of every *searched* file, so index
-    // narrowing would silently drop files whose lines must still appear:
-    // it forces a full scan.
-    let query_plan = if args.passthru {
-        crate::plan::Plan::All
-    } else {
-        plan::build(&pattern, args.fixed_strings, args.ignore_case)
-    };
-    let (pattern, effective_fixed) = combine_patterns(&args)?;
-    let query_plan = plan::build(&pattern, effective_fixed, args.ignore_case);
-    // The index stores RAW file bytes; a non-UTF-8 -E decodes before
-    // matching, so index trigrams can't narrow a decoded match — fall
-    // back to scanning everything (sound, just slower). ASCII-only
-    // patterns on single-byte encodings could narrow, but keep it simple
-    // and always-correct.
+    let (pattern, effective_fixed) = resolve_pattern(&args)?;
+
+    // Plan selection — several modes must bypass trigram narrowing
+    // (each is sound, just scans more):
+    //  -v        : a file with zero literal occurrences still "matches" all lines
+    //  --passthru: non-matching lines of searched files must still print
+    //  -c --include-zero : every walked file emits `path:0`
+    //  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
+    //  -P patterns may use pcre2-only syntax (parse failure → Plan::All)
     let utf8_only = match &args.encoding {
         Some(label) => grep_searcher::Encoding::new(label)
             .map_err(|e| anyhow::anyhow!("{label}: {e}"))?
             == grep_searcher::Encoding::new("utf-8").unwrap(),
         None => true,
     };
-    let query_plan = if utf8_only {
-        plan::build(&pattern, args.fixed_strings, args.ignore_case)
-    } else {
+    let plan_ic = args.ignore_case || args.smart_case;
+    let query_plan = if args.invert_match
+        || args.passthru
+        || (args.count && args.include_zero)
+        || !utf8_only
+    {
         crate::plan::Plan::All
+    } else {
+        plan::build(&pattern, effective_fixed, plan_ic)
     };
     timings.stage("plan");
-    // Binary-flagged files are candidates only under -a/--binary: the
-    // default quit detection can never emit them, so including them would
-    // be pure IO cost (matches rg's observed behavior either way).
-    let search_binary = args.text || args.binary;
-    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, search_binary);
-    let (pattern, effective_fixed) = resolve_pattern(&args)?;
-    let query_plan = plan::build(&pattern, effective_fixed, args.ignore_case);
-    timings.stage("plan");
+
+    // Binary-flagged files are candidates only when the mode can surface
+    // them: -a/--binary and --null-data (NUL is a separator, not binary).
+    // Under quit detection they can never emit anything — and rg excludes
+    // them even under -c --include-zero (verified), so they stay out.
+    let search_binary = args.text || args.binary || args.null_data;
+    let mut files = idx.candidates(&query_plan, plan_ic, args.hidden, search_binary);
+    if args.search_zip {
+        files.extend(idx.zip_candidates(args.hidden));
+    }
+    files.extend(extra.iter().cloned());
+    files.sort();
+    files.dedup();
+    apply_filters(&mut files, &args)?;
+    apply_sort(&mut files, &args, &idx, &root)?;
+    timings.stage("candidates");
+
     // --files-without-match needs the full live set as its universe:
     // narrowed-out files can't match, so they emit without searching.
     let universe;
@@ -1135,76 +1013,10 @@ pub fn run() -> anyhow::Result<i32> {
     } else {
         universe = None;
     }
-    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
-    let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden, args.null_data);
-    if args.search_zip {
-        files.extend(idx.zip_candidates(args.hidden));
-    }
-    // -S resolves case per-pattern at match time (an inline (?i) wins), so
-    // for narrowing it is treated as case-insensitive unconditionally: the
-    // case-variant union is a superset of whatever the matcher resolves to.
-    let plan_ic = args.ignore_case || args.smart_case;
-    // Under -v even a file with zero occurrences of the literals has all of
-    // its lines "match", so trigram narrowing is unsound; scan everything.
-    let query_plan = if args.invert_match {
-        plan::Plan::All
-    } else {
-        plan::build(&pattern, args.fixed_strings, plan_ic)
-    };
-    timings.stage("plan");
-    let mut files = idx.candidates(&query_plan, plan_ic, args.hidden);
-    files.extend(extra);
-    let mut files = idx.candidates(
-        &query_plan,
-        args.ignore_case,
-        args.hidden,
-        include_binary,
-    );
-    files.extend(extra.iter().cloned());
-    files.sort();
-    files.dedup();
-    apply_filters(&mut files, &args)?;
-    apply_sort(&mut files, &args, &idx, &root)?;
-    timings.stage("candidates");
 
-    let before = args.before_context.or(args.context).unwrap_or(0);
-    let after = args.after_context.or(args.context).unwrap_or(0);
-    let opts = search::SearchOpts {
-        case_insensitive: args.ignore_case,
-        fixed: effective_fixed,
-        files_with_matches: args.files_with_matches,
-        files_without_match: args.files_without_match,
-        before,
-        after,
-        json: args.json,
-        count: args.count,
-        count_matches: args.count_matches,
-        multiline: args.multiline,
-        binary: binary_detection(&args),
-        display_prefix: cwd_rel.to_path_buf(),
-        stats: args.stats,
-        multiline_dotall: args.multiline_dotall,
-        encoding: args.encoding.clone(),
-        line_buffered: args.line_buffered,
-        color: want_color(&args),
-        color_specs: args.color_specs.clone(),
-        passthru: args.passthru,
-        unicode: !args.no_unicode,
-        null_data: args.null_data,
-        dfa_size_limit: args.dfa_size_limit,
-        regex_size_limit: args.regex_size_limit,
-        field_match_separator: args
-            .field_match_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        field_context_separator: args
-            .field_context_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
-        pcre2: args.pcre2,
-        search_zip: args.search_zip,
-    };
+    let mut opts = search_opts(&args, &root, &cwd_rel);
+    opts.fixed = effective_fixed;
+
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on
     // stderr and exits 2. An empty set produced by trigram narrowing is a
@@ -1222,15 +1034,12 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
-    let opts = search_opts(&args, &root);
-    let opts = search_opts(&args);
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, universe.as_deref(), &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
-    Ok(if had_error {
-    Ok(if nothing_searched {
+    Ok(if had_error || nothing_searched {
         2
     } else if found {
         0

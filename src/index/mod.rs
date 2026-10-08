@@ -227,25 +227,24 @@ impl Index {
     /// them) adds binary-flagged files to the live-scan candidate set.
     /// Under the default quit detection they can never emit output, so
     /// excluding them is otherwise a pure win.
-    pub fn candidates(&self, plan: &Plan, case_insensitive: bool, include_hidden: bool, search_binary: bool) -> Vec<PathBuf> {
     pub fn candidates(
         &self,
         plan: &Plan,
         case_insensitive: bool,
         include_hidden: bool,
-        include_binary: bool,
+        search_binary: bool,
     ) -> Vec<PathBuf> {
         // Binary-flagged files were never trigram-indexed; they only join
-        // when the mode can search them (e.g. --null-data treats NUL as a
-        // record separator rather than a binary signal).
+        // when the mode can search them (-a/--binary surface them,
+        // --null-data treats NUL as a record separator, and
+        // -c --include-zero counts them as 0).
         let binary_ok = |e: &manifest::FileEntry| {
-            include_binary || e.flags & FLAG_SKIP_BINARY == 0
+            search_binary || e.flags & FLAG_SKIP_BINARY == 0
         };
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
                 .manifest
                 .live_entries()
-                .filter(|e| search_binary || e.flags & FLAG_SKIP_BINARY == 0)
                 .filter(|e| binary_ok(e))
                 .map(|e| e.id)
                 .collect(),
@@ -267,7 +266,6 @@ impl Index {
                     union.extend(acc);
                 }
                 // Skip-flagged text files were never indexed; always scan
-                // them. Binary files too, when the mode can surface them.
                 // them. Binary files too, when the caller can surface them.
                 union.extend(
                     self.manifest
@@ -275,7 +273,6 @@ impl Index {
                         .filter(|e| {
                             e.flags & FLAG_SKIP_TOO_LARGE != 0
                                 || (search_binary && e.flags & FLAG_SKIP_BINARY != 0)
-                                || (include_binary && e.flags & FLAG_SKIP_BINARY != 0)
                         })
                         .map(|e| e.id),
                 );
@@ -603,13 +600,13 @@ mod tests {
             .unwrap();
         // The in-scope change is now indexed (fresh files join the delta).
         let plan = crate::plan::build("v2x a", true, false);
-        let c = idx.candidates(&plan, false, false);
+        let c = idx.candidates(&plan, false, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("src/a.txt")]);
         // Out-of-scope changes were never looked at: b.txt's new
         // contents are NOT a candidate (still stale — sound, since a
         // scoped query never returns it anyway).
         let plan2 = crate::plan::build("b v2x", true, false);
-        assert!(idx.candidates(&plan2, false, false).is_empty());
+        assert!(idx.candidates(&plan2, false, false, false).is_empty());
     }
 
     #[test]
@@ -631,11 +628,11 @@ mod tests {
         // y.txt is indexed; the ignored y.ign was never swept.
         let plan = crate::plan::build("new visible", true, false);
         assert_eq!(
-            idx.candidates(&plan, false, false),
+            idx.candidates(&plan, false, false, false),
             vec![std::path::PathBuf::from("src/y.txt")]
         );
         let plan2 = crate::plan::build("new ignored", true, false);
-        assert!(idx.candidates(&plan2, false, false).is_empty());
+        assert!(idx.candidates(&plan2, false, false, false).is_empty());
     }
 
     #[test]

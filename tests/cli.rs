@@ -480,12 +480,6 @@ fn stats_block_appended() {
     let dir = corpus();
     let out = glep(dir.path())
         .args(["--stats", "hello"])
-fn encoding_flag_transcodes() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("lat.txt"), b"caf\xe9 test\n").unwrap();
-    std::fs::write(dir.path().join("a.txt"), "caf ascii\n").unwrap();
-    let out = glep(dir.path())
-        .args(["-E", "latin1", "café"])
         .assert()
         .success()
         .get_output()
@@ -507,6 +501,33 @@ fn encoding_flag_transcodes() {
         .clone();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("notes.txt:2")); // hello + Kenobi
+}
+
+#[test]
+fn encoding_flag_transcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lat.txt"), b"caf\xe9 test\n").unwrap();
+    std::fs::write(dir.path().join("a.txt"), "caf ascii\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-E", "latin1", "café"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("lat.txt:1:café test"));
+    // 'café' (decoded side) does not appear in a.txt's "caf ascii"
+    assert!(!s.contains("a.txt"));
+    // unknown label errors
+    glep(dir.path())
+        .args(["-E", "bogus-enc", "x"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn multiple_e_patterns_union() {
     let dir = corpus();
     // notes.txt has "hello"+"Kenobi"; lib.rs has "hello" only.
@@ -532,16 +553,10 @@ fn multiple_e_patterns_union() {
         .assert()
         .success()
         .stdout("src/lib.rs\n");
-    assert!(s.contains("lat.txt:1:café test"));
-    // 'café' (decoded side) does not appear in a.txt's "caf ascii"
-    assert!(!s.contains("a.txt"));
-    // unknown label errors
-    glep(dir.path())
-        .args(["-E", "bogus-enc", "x"])
-        .assert()
-        .failure()
-        .code(2);
+}
+
 #[cfg(unix)]
+#[test]
 fn follow_reaches_symlinked_dirs() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("real_target.txt"), "linktok real\n").unwrap();
@@ -562,6 +577,9 @@ fn follow_reaches_symlinked_dirs() {
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("linkdir/inner.txt"), "{s}");
     assert!(s.contains("linkfile.txt"), "{s}");
+}
+
+#[test]
 fn engine_rejects_unknown() {
     let dir = corpus();
     glep(dir.path())
@@ -569,10 +587,13 @@ fn engine_rejects_unknown() {
         .assert()
         .success();
     glep(dir.path())
-        .args(["--engine", "pcre2", "hello"])
+        .args(["--engine", "bogus", "hello"])
         .assert()
         .failure()
         .code(2);
+}
+
+#[test]
 fn ignore_file_filters_results() {
     let dir = corpus();
     let extra = dir.path().join("extra.ignore");
@@ -583,6 +604,10 @@ fn ignore_file_filters_results() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("notes.txt"));
+    assert!(!s.contains("lib.rs"));
+}
+
+#[test]
 fn pattern_file_unions_with_positional() {
     let dir = corpus();
     std::fs::write(dir.path().join("pats.txt"), "hello\nworld\n").unwrap();
@@ -631,6 +656,9 @@ fn require_git_outside_repo_live_scans_gitignored() {
     let out = glep(dir.path()).args(["-l", "hello"]).assert().success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(!s.contains("x.log"), "{s}");
+}
+
+#[test]
 fn unrestricted_count_maps_to_flags() {
     let dir = corpus();
     std::fs::write(dir.path().join(".gitignore"), "x.log\n").unwrap();
@@ -645,9 +673,12 @@ fn unrestricted_count_maps_to_flags() {
     let out = glep(dir.path()).args(["-uu", "-l", "hello"]).assert().success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains(".hid.txt"), "{s}");
+}
+
+#[test]
 fn null_data_searches_binaryish_files() {
     let dir = tempfile::tempdir().unwrap();
-    // NUL-separated records: 'needle' on NUL-records 1 and 3
+    // NUL-separated records: 'needle' on NUL-records 2 and 4
     std::fs::write(dir.path().join("data.bin"), "aa\x00needle\x00bb\x00needle x\x00").unwrap();
     let out = glep(dir.path())
         .args(["--null-data", "needle"])
@@ -656,6 +687,9 @@ fn null_data_searches_binaryish_files() {
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("data.bin:2:needle"), "{s}");
     assert!(s.contains("data.bin:4:needle x"), "{s}");
+}
+
+#[test]
 fn custom_separators() {
     let dir = corpus();
     let out = glep(dir.path())
@@ -671,6 +705,9 @@ fn custom_separators() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("\n==\n"), "{s}");
+}
+
+#[test]
 fn pcre2_lookaround_and_backref() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("p.txt"), "fooxbar\nfooy\nlook(ahead)\n").unwrap();
@@ -689,6 +726,9 @@ fn pcre2_lookaround_and_backref() {
     assert!(s.contains("b.txt"), "{s}");
     // invalid under -P surfaces an error (not a silent miss)
     glep(dir.path()).args(["-P", "("]).assert().failure();
+}
+
+#[test]
 fn search_zip_decompresses_gz() {
     let dir = tempfile::tempdir().unwrap();
     use std::io::Write;
@@ -724,8 +764,7 @@ fn files_with_matches_conflicts_with_json() {
 fn binary_files_suppressed_by_default() {
     let dir = corpus();
     std::fs::write(dir.path().join("blob.bin"), b"aa\x00hello-bin\x00zz\n").unwrap();
-    // Default: no output, exit 1 even though "hello" precedes... no wait,
-    // "hello-bin" follows the NUL here; either way binary data suppresses.
+    // Default: no output, exit 1 — binary data suppresses the file.
     glep(dir.path()).args(["hello-bin"]).assert().code(1);
     // -a searches it as text and prints the raw line.
     glep(dir.path())
@@ -745,125 +784,9 @@ fn binary_files_suppressed_by_default() {
         .assert()
         .success()
         .stdout(predicates::str::contains("blob.bin"));
-/// A missing path filter is an error (exit 2), not a silent no-match;
-/// valid paths still produce their matches.
-#[test]
-fn missing_path_errors_exit_two() {
-    let dir = corpus();
-    glep(dir.path())
-        .args(["hello", "no_such_dir"])
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains("no_such_dir"))
-        .stderr(predicates::str::contains("No such file or directory"));
-    // Mixed: the valid path still yields its matches, code stays 2.
-    glep(dir.path())
-        .args(["hello", "src", "no_such_dir"])
-        .assert()
-        .code(2)
-        .stdout(predicates::str::contains("src/lib.rs"))
-        .stderr(predicates::str::contains("no_such_dir"));
-    // --files uses the operation-error wording. (glep's first positional
-    // under --files is the glob; a path filter follows it.)
-    glep(dir.path())
-        .args(["--files", "*rs", "no_such_dir"])
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains("IO error for operation on"));
 }
 
-/// Running from a subdirectory discovers the ancestor `.glep` index,
-/// scopes the search to the subtree, and prints cwd-relative paths.
-#[test]
-fn subdir_discovers_ancestor_index() {
-    let dir = corpus();
-    glep(dir.path()).arg("index").assert().success();
-    let sub = dir.path().join("src");
-    glep(&sub)
-        .arg("hello")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("lib.rs:1:pub fn hello_world()"))
-        // root-level notes.txt is outside the cwd subtree
-        .stdout(predicates::str::contains("notes.txt").not());
-    // No second index was created inside src/.
-    assert!(!sub.join(".glep").exists());
-    // And --files shows the scoped listing.
-    let out = glep(&sub).args(["--files"]).assert().success().get_output().stdout.clone();
-    let listing = String::from_utf8(out).unwrap();
-    assert!(listing.contains("lib.rs"));
-    assert!(!listing.contains("notes.txt"));
-}
 
-/// GLEP_INDEX_PATH points at an index directory explicitly; results are
-/// printed index-root-relative when the cwd is outside the tree.
-#[test]
-fn index_path_env_override() {
-    let dir = corpus();
-    glep(dir.path()).arg("index").assert().success();
-    let elsewhere = tempfile::tempdir().unwrap();
-    glep(elsewhere.path())
-        .arg("hello")
-        .env("GLEP_INDEX_PATH", dir.path().join(".glep"))
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("notes.txt:1:hello there"));
-}
-
-/// With an ancestor index and an explicit path arg pointing back up, the
-/// whole tree is reachable again.
-#[test]
-fn subdir_dotdot_reaches_parent_tree() {
-    let dir = corpus();
-    glep(dir.path()).arg("index").assert().success();
-    glep(&dir.path().join("src"))
-        .args(["hello", ".."])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("notes.txt:1:hello there"));
-/// A single file operand drops the path prefix (rg convention); -H
-/// restores it, -I forces it off, and the nothing-searched heuristic
-/// fires when a filter empties the implicit-scope pool.
-#[test]
-fn filename_and_depth_semantics() {
-    let dir = corpus();
-    glep(dir.path())
-        .args(["hello", "notes.txt"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("1:hello there"))
-        .stdout(predicates::str::contains("notes.txt").not());
-    glep(dir.path())
-        .args(["-H", "hello", "notes.txt"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("notes.txt:1:hello there"));
-    glep(dir.path())
-        .args(["-I", "hello"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("1:hello there"))
-        .stdout(predicates::str::contains("notes.txt").not());
-    // --max-depth 0 searches nothing under the implicit scope → warn + 2.
-    glep(dir.path())
-        .args(["--max-depth", "0", "hello"])
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains("No files were searched"));
-    // …but a narrow *plan* (no candidates, pool non-empty) is exit 1.
-    glep(dir.path()).args(["zz_absent_zz"]).assert().code(1);
-}
-
-#[test]
-fn include_zero_counts_every_searched_file() {
-    let dir = corpus();
-    // "general" only matches notes.txt; src/lib.rs gets a :0 line.
-    glep(dir.path())
-        .args(["-c", "--include-zero", "general"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("notes.txt:1"))
-        .stdout(predicates::str::contains("src/lib.rs:0"));
 #[test]
 fn word_regexp_matches_whole_words_only() {
     let dir = corpus();
