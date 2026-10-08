@@ -2,6 +2,10 @@
 
 All notable changes to glep. Dates are the tagged commit dates for versions up to 0.3.0. Full history: https://velofy.co/glep/changelog/
 
+## Unreleased
+
+- New `--stats` flag: prints the rg-style stats block after results (`N matches / matched lines / files contained matches / files searched / bytes printed / bytes searched / seconds`) — exact counters for content, `-c`, and `-l` modes (occurrences vs lines distinguished correctly under `-U` too).
+
 ## 0.3.1 (2026-09-30)
 
 - Package metadata now points to https://velofy.co/glep/ and https://github.com/velofy/glep (homepage, documentation, repository, changelog links on PyPI and crates.io).
