@@ -54,6 +54,11 @@ pub struct Args {
     /// that guarantee. .git/.glep are still always excluded.
     #[arg(long)]
     pub no_ignore: bool,
+    /// Skip the index for this run: live gitignore-aware walk + scan of
+    /// the whole discovered tree. Useful for one-off queries on huge
+    /// trees or to sanity-check index freshness.
+    #[arg(long)]
+    pub no_index: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -75,7 +80,67 @@ fn build_glob(g: &str) -> anyhow::Result<globset::GlobMatcher> {
         .compile_matcher())
 }
 
-fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
+/// Lexically join a base dir and a relative path, folding `.`/`..`
+/// components. Returns None when the result escapes above `base`'s own
+/// root — i.e. the normalized path would start with `..` (an indexed
+/// search can never serve such a path; it is kept verbatim so existence
+/// checks still fire and filters simply match nothing).
+fn norm_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::from(base);
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(s) => out.push(s),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    Some(out)
+}
+
+/// Discover the tree root: `GLEP_INDEX_PATH` (points at the index dir
+/// itself; its parent is the root) wins; otherwise the nearest ancestor
+/// of `cwd` containing a `.glep/` directory; otherwise `cwd` itself (the
+/// index will be built there). Returns `(root, cwd_rel)` where `cwd_rel`
+/// is `cwd` relative to `root` ("" when the same) — it is both the
+/// implicit search scope and the display prefix to strip.
+fn discover_index_root(cwd: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if let Some(v) = std::env::var_os("GLEP_INDEX_PATH").filter(|v| !v.is_empty()) {
+        let idx_dir = PathBuf::from(&v);
+        let idx_dir = if idx_dir.is_absolute() {
+            idx_dir
+        } else {
+            cwd.join(idx_dir)
+        };
+        anyhow::ensure!(
+            idx_dir.is_dir(),
+            "glep: {}: not an index directory (GLEP_INDEX_PATH)",
+            idx_dir.display()
+        );
+        let idx_canon = std::fs::canonicalize(&idx_dir).unwrap_or(idx_dir);
+        let root = idx_canon
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| idx_canon.clone());
+        let cwd_rel = cwd_canon.strip_prefix(&root).unwrap_or(Path::new("")).to_path_buf();
+        return Ok((root, cwd_rel));
+    }
+    let mut dir = Some(cwd_canon.as_path());
+    while let Some(d) = dir {
+        if d.join(".glep").is_dir() {
+            return Ok((d.to_path_buf(), cwd_canon.strip_prefix(d).unwrap_or(Path::new("")).to_path_buf()));
+        }
+        dir = d.parent();
+    }
+    Ok((cwd_canon, PathBuf::new()))
+}
+
+fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel: &Path) {
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for p in paths.iter_mut() {
         if p.is_absolute() {
@@ -83,10 +148,42 @@ fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path) {
             if let Ok(rel) = canonical_p.strip_prefix(&canonical_root) {
                 *p = rel.to_path_buf();
             }
-        } else if let Ok(stripped) = p.strip_prefix(".") {
-            *p = stripped.to_path_buf();
+        } else {
+            *p = norm_join(cwd_rel, p).unwrap_or_else(|| p.clone());
         }
     }
+}
+
+/// Display form of an index-relative path: strip the cwd scope prefix so
+/// output stays relative to the directory the user ran from.
+fn display_path<'a>(p: &'a Path, cwd_rel: &Path) -> &'a Path {
+    if cwd_rel.as_os_str().is_empty() {
+        p
+    } else {
+        p.strip_prefix(cwd_rel).unwrap_or(p)
+    }
+}
+
+/// Drop path filters that don't exist on disk, printing the rg-style
+/// error for each. Returns true if any path was missing (final exit code
+/// must be 2 regardless of matches).
+fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool {
+    let mut missing = false;
+    for p in paths {
+        if !cwd.join(p).exists() {
+            missing = true;
+            if files_mode {
+                eprintln!(
+                    "glep: {}: IO error for operation on {}: No such file or directory (os error 2)",
+                    p.display(),
+                    p.display()
+                );
+            } else {
+                eprintln!("glep: {}: No such file or directory (os error 2)", p.display());
+            }
+        }
+    }
+    missing
 }
 
 fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
@@ -127,7 +224,13 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
 /// in walk.rs), so the result is not re-filtered by hidden here. The
 /// existing positional-path/glob/type filters (`apply_filters`, already
 /// normalized by the caller) and exit-code conventions are unchanged.
-fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
+fn run_no_ignore(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
     let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
         .into_iter()
         .map(|m| m.path)
@@ -142,10 +245,16 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         }
         apply_filters(&mut files, args)?;
         for f in &files {
-            println!("{}", f.display());
+            println!("{}", display_path(f, cwd_rel).display());
         }
         timings.finish();
-        return Ok(if files.is_empty() { 1 } else { 0 });
+        return Ok(if had_error {
+            2
+        } else if files.is_empty() {
+            1
+        } else {
+            0
+        });
     }
 
     let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
@@ -166,13 +275,20 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        display_prefix: cwd_rel.to_path_buf(),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
-    Ok(if found { 0 } else { 1 })
+    Ok(if had_error {
+        2
+    } else if found {
+        0
+    } else {
+        1
+    })
 }
 
 pub fn run() -> anyhow::Result<i32> {
@@ -185,8 +301,17 @@ pub fn run() -> anyhow::Result<i32> {
             args.paths.insert(0, PathBuf::from(p));
         }
     }
-    let root = std::env::current_dir()?;
-    normalize_path_filters(&mut args.paths, &root);
+    let cwd = std::env::current_dir()?;
+    let (root, cwd_rel) = discover_index_root(&cwd)?;
+    // Missing path filters are errors (exit 2), checked against the cwd
+    // before paths are relativized into the index tree.
+    let had_error = report_missing_paths(&args.paths, &cwd, args.files);
+    normalize_path_filters(&mut args.paths, &root, &cwd_rel);
+    // No explicit paths: the implicit scope is the cwd subtree (rg's
+    // default `.`). At the discovered root itself this is "" — everything.
+    if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
+        args.paths.push(cwd_rel.clone());
+    }
 
     // Subcommand-style words in the pattern slot.
     if args.regexp.is_none() && !args.files && !args.no_ignore {
@@ -219,7 +344,63 @@ pub fn run() -> anyhow::Result<i32> {
     let mut timings = Timings::new();
 
     if args.no_ignore {
-        return run_no_ignore(&root, &args, &mut timings);
+        return run_no_ignore(&root, &cwd_rel, &args, &mut timings, had_error);
+    }
+
+    if args.no_index {
+        // Live gitignore-aware scan of the discovered tree: same file set
+        // as the indexed path would yield, minus all trigram narrowing.
+        let mut files: Vec<PathBuf> = walk::sweep(&root)?
+            .into_iter()
+            .filter(|m| args.hidden || !m.hidden)
+            .map(|m| m.path)
+            .collect();
+        timings.stage("sweep");
+        if args.files {
+            if let Some(g) = args.pattern.as_deref() {
+                let glob = build_glob(g)?;
+                files.retain(|f| glob.is_match(f));
+            }
+            apply_filters(&mut files, &args)?;
+            for f in &files {
+                println!("{}", display_path(f, &cwd_rel).display());
+            }
+            timings.finish();
+            return Ok(if had_error {
+                2
+            } else if files.is_empty() {
+                1
+            } else {
+                0
+            });
+        }
+        let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
+            Some(p) => p,
+            None => anyhow::bail!("a pattern is required (or --files)"),
+        };
+        apply_filters(&mut files, &args)?;
+        let opts = search::SearchOpts {
+            case_insensitive: args.ignore_case,
+            fixed: args.fixed_strings,
+            files_with_matches: args.files_with_matches,
+            before: args.before_context.or(args.context).unwrap_or(0),
+            after: args.after_context.or(args.context).unwrap_or(0),
+            json: args.json,
+            count: args.count,
+            multiline: args.multiline,
+            display_prefix: cwd_rel.to_path_buf(),
+        };
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+        timings.finish();
+        return Ok(if had_error {
+            2
+        } else if found {
+            0
+        } else {
+            1
+        });
     }
 
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
@@ -247,10 +428,16 @@ pub fn run() -> anyhow::Result<i32> {
         let args2 = Args { pattern: None, ..args };
         apply_filters(&mut files, &args2)?;
         for f in &files {
-            println!("{}", f.display());
+            println!("{}", display_path(f, &cwd_rel).display());
         }
         timings.finish();
-        return Ok(if files.is_empty() { 1 } else { 0 });
+        return Ok(if had_error {
+            2
+        } else if files.is_empty() {
+            1
+        } else {
+            0
+        });
     }
 
     let pattern = match args.regexp.clone().or_else(|| args.pattern.clone()) {
@@ -277,11 +464,18 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        display_prefix: cwd_rel.to_path_buf(),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
     timings.stage("search");
     timings.finish();
-    Ok(if found { 0 } else { 1 })
+    Ok(if had_error {
+        2
+    } else if found {
+        0
+    } else {
+        1
+    })
 }

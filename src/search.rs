@@ -13,6 +13,10 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// Index-relative prefix to strip from paths for display. Results
+    /// always print relative to the cwd the user ran in, which may be a
+    /// subdirectory of the discovered index root; "" means no stripping.
+    pub display_prefix: PathBuf,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -175,6 +179,13 @@ fn search_one(
         .multi_line(opts.multiline)
         .build();
     let full = root.join(rel);
+    // Paths print relative to the user's cwd, not the index root: strip
+    // the scope prefix (no-op when the search ran at the root itself).
+    let display: &Path = if opts.display_prefix.as_os_str().is_empty() {
+        rel
+    } else {
+        rel.strip_prefix(&opts.display_prefix).unwrap_or(rel)
+    };
     if opts.count {
         let mut sink = CountSink {
             matcher,
@@ -184,7 +195,7 @@ fn search_one(
         searcher.search_path(matcher, &full, &mut sink)?;
         if sink.count > 0 {
             return Ok((
-                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
+                format!("{}:{}\n", display.display(), sink.count).into_bytes(),
                 true,
                 None,
             ));
@@ -201,7 +212,7 @@ fn search_one(
     let mut stats = None;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
+        let mut sink = printer.sink_with_path(matcher, display);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
@@ -209,7 +220,7 @@ fn search_one(
         let mut printer = grep_printer::StandardBuilder::new()
             .heading(false)
             .build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
+        let mut sink = printer.sink_with_path(matcher, display);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     }
@@ -259,7 +270,10 @@ pub fn run(
                 found = true;
                 let global_i = base + i;
                 if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
+                    let display = files[global_i]
+                        .strip_prefix(&opts.display_prefix)
+                        .unwrap_or(&files[global_i]);
+                    writeln!(out, "{}", display.display())?;
                 } else {
                     if separate && printed_any {
                         writeln!(out, "--")?;
@@ -316,6 +330,7 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            display_prefix: PathBuf::new(),
         }
     }
 
