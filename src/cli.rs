@@ -102,6 +102,18 @@ pub struct Args {
     /// Disable unicode mode in the regex (rg --no-unicode)
     #[arg(long)]
     pub no_unicode: bool,
+    /// Separator between match fields (path/line/content), single byte —
+    /// rg --field-match-separator
+    #[arg(long, value_name = "SEP")]
+    pub field_match_separator: Option<String>,
+    /// Separator between context fields, single byte —
+    /// rg --field-context-separator
+    #[arg(long, value_name = "SEP")]
+    pub field_context_separator: Option<String>,
+    /// Separator printed between match groups/files — rg --context-separator.
+    /// "" disables the separator entirely.
+    #[arg(long, value_name = "SEP")]
+    pub context_separator: Option<String>,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -785,6 +797,15 @@ fn run_one_fs(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result
         null_data: args.null_data,
         dfa_size_limit: args.dfa_size_limit,
         regex_size_limit: args.regex_size_limit,
+        field_match_separator: args
+            .field_match_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        field_context_separator: args
+            .field_context_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -1085,6 +1106,15 @@ pub fn run() -> anyhow::Result<i32> {
         null_data: args.null_data,
         dfa_size_limit: args.dfa_size_limit,
         regex_size_limit: args.regex_size_limit,
+        field_match_separator: args
+            .field_match_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        field_context_separator: args
+            .field_context_separator
+            .as_ref()
+            .map(|v| v.clone().into_bytes()),
+        context_separator: args.context_separator.as_ref().map(|v| v.clone().into_bytes()),
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on

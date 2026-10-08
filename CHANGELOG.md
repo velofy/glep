@@ -22,6 +22,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - New flags: `--passthru` (emit every line of every searched file — forces a full scan since non-matching lines must appear), `--no-unicode` (matcher unicode off).
 - New flags: `-f`/`--file` (patterns from file, one per line, OR'd with `-e`/positional; each arm non-capturing so anchors stay local; `-F` arms escape individually), `--files-without-match` (names of files with no match — exit 0 when any listed).
 - New flags: `--null-data` (NUL is the record separator — matcher + searcher line terminators switch to NUL, binary detection turns off, and binary-flagged files join the candidates since NULs are data there), `--dfa-size-limit`, `--regex-size-limit`, `--one-file-system` (live scan that stays on the root's filesystem; mount-point subtrees never enter the index).
+- New flags: `--field-match-separator`, `--field-context-separator` (printer-level byte sequences), `--context-separator` (replaces the between-file `--`; empty disables it).
 
 ## 0.3.1 (2026-09-30)
 

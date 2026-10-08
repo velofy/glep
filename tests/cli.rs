@@ -656,6 +656,21 @@ fn null_data_searches_binaryish_files() {
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("data.bin:2:needle"), "{s}");
     assert!(s.contains("data.bin:4:needle x"), "{s}");
+fn custom_separators() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--field-match-separator", "|", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt|1|hello"), "{s}");
+    // --context-separator replaces the between-file '--'
+    let out = glep(dir.path())
+        .args(["--context-separator", "==", "-A1", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("\n==\n"), "{s}");
 }
 
 #[test]
