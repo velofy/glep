@@ -476,6 +476,38 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn pattern_file_unions_with_positional() {
+    let dir = corpus();
+    std::fs::write(dir.path().join("pats.txt"), "hello\nworld\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
+    assert!(s.contains("src/lib.rs"), "{s}");
+    // -f + positional-as-path: 'src' is a path since -f is present
+    let out = glep(dir.path())
+        .args(["-f", "pats.txt", "-l", "src"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(s, "src/lib.rs\n");
+}
+
+#[test]
+fn files_without_match_lists_non_matching() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--files-without-match", "hello_world"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("notes.txt"), "{s}");
+    assert!(!s.contains("lib.rs"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
