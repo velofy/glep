@@ -43,6 +43,16 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Only apply .gitignore/.gitexclude rules inside a real git repo
+    /// (rg --require-git). Outside a repo git rules are inert — those
+    /// files aren't in the manifest, so that case takes a live-scan
+    /// escape hatch. .ignore/.rgignore still apply either way.
+    #[arg(long)]
+    pub require_git: bool,
+    /// Additional ignore rules file applied to results (repeatable,
+    /// rg --ignore-file). Rules resolve relative to the file's dir.
+    #[arg(long, value_name = "PATH")]
+    pub ignore_file: Vec<std::path::PathBuf>,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -101,6 +111,32 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
             .collect::<anyhow::Result<Vec<_>>>()?;
         files.retain(|f| matchers.iter().any(|m| m.is_match(f)));
     }
+    if !args.ignore_file.is_empty() {
+        // Build one Gitignore per extra rules file, anchored at the
+        // file's parent dir so its patterns resolve like a .gitignore
+        // sitting there (rg semantics).
+        let mut gbs = Vec::new();
+        for p in &args.ignore_file {
+            let parent = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+            let mut b = ignore::gitignore::GitignoreBuilder::new(&parent);
+            if let Some(e) = b.add(p) {
+                anyhow::bail!("{}: {e}", p.display());
+            }
+            // Canonicalize for the strip below (macOS /var -> /private/var
+            // etc.); matched_path_or_any_parents panics on paths outside
+            // the gitignore root, so only call it when the strip works.
+            let parent = std::fs::canonicalize(&parent).unwrap_or(parent);
+            gbs.push((parent, b.build()?));
+        }
+        files.retain(|f| {
+            let abs = std::fs::canonicalize(f).unwrap_or_else(|_| f.clone());
+            !gbs.iter().any(|(root, g)| {
+                abs.strip_prefix(root).is_ok_and(|rel| {
+                    g.matched_path_or_any_parents(rel, false).is_ignore()
+                })
+            })
+        });
+    }
     if !args.types.is_empty() {
         let mut tb = ignore::types::TypesBuilder::new();
         tb.add_defaults();
@@ -128,12 +164,35 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
 /// existing positional-path/glob/type filters (`apply_filters`, already
 /// normalized by the caller) and exit-code conventions are unchanged.
 fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
-    let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
+    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
         .into_iter()
         .map(|m| m.path)
         .collect();
     timings.stage("sweep_unfiltered");
+    run_live_files(root, args, timings, files)
+}
 
+/// `--require-git` outside a repo: git-derived ignore rules are inert,
+/// so files the manifest lacks (gitignored) can match — live scan over
+/// `sweep_no_git` (git sources off, `.ignore`/`.rgignore` still on).
+fn run_require_git(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
+    let files: Vec<PathBuf> = walk::sweep_no_git(root, args.hidden)?
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    timings.stage("sweep_no_git");
+    run_live_files(root, args, timings, files)
+}
+
+/// Shared tail of the live-scan paths (`--no-ignore`, `--require-git`
+/// outside a repo): --files listing and content search over an
+/// already-computed file set.
+fn run_live_files(
+    root: &Path,
+    args: &Args,
+    timings: &mut Timings,
+    mut files: Vec<PathBuf>,
+) -> anyhow::Result<i32> {
     if args.files {
         // With --files the pattern slot is the glob.
         if let Some(g) = args.pattern.as_deref() {
@@ -220,6 +279,9 @@ pub fn run() -> anyhow::Result<i32> {
 
     if args.no_ignore {
         return run_no_ignore(&root, &args, &mut timings);
+    }
+    if args.require_git && !root.join(".git").exists() {
+        return run_require_git(&root, &args, &mut timings);
     }
 
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
