@@ -56,6 +56,22 @@ fn corpus() -> tempfile::TempDir {
     // carries a match BEFORE the NUL to cover the suppression case.
     std::fs::write(dir.path().join("binnul.bin"), b"all\x00binary\x00here\n").unwrap();
     std::fs::write(dir.path().join("binpre.bin"), b"match before\nnul\x00after\n").unwrap();
+    // Whitelist rescue (kernel-style): dotkit/.gitignore ignores all
+    // dotfiles via `.*` then un-hides select ones with `!` rules. rg shows
+    // whitelisted dotfiles and the contents of whitelisted dot-dirs; a
+    // dotfile with no `!` rule stays ignored entirely (invisible even to
+    // --hidden, since it is *ignored*, not merely hidden). Scoped to a
+    // subdir so the top-level fixtures keep their plain hidden semantics.
+    std::fs::create_dir_all(dir.path().join("dotkit/.wdir")).unwrap();
+    std::fs::write(
+        dir.path().join("dotkit/.gitignore"),
+        ".*\n!.gitignore\n!.keepme\n!.wdir/\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("dotkit/.keepme"), "keeptoken whitelisted\n").unwrap();
+    std::fs::write(dir.path().join("dotkit/.nope"), "nopetoken still hidden\n").unwrap();
+    std::fs::write(dir.path().join("dotkit/.wdir/in.txt"), "wdirtoken under whitelisted dir\n").unwrap();
+    std::fs::write(dir.path().join("dotkit/plain.txt"), "plaintoken normal file\n").unwrap();
     dir
 }
 
@@ -150,6 +166,14 @@ fn parity_with_ripgrep() {
         // --sort path still applies, so the harness's fixed rg flag set
         // composes cleanly with --files --no-ignore for both tools.
         &["--no-ignore", "--files"],
+        // Whitelist rescue: whitelisted dotfiles are searched and listed;
+        // `nopetoken` is ignored (not merely hidden) so nothing shows it.
+        &["--files"],
+        &["keeptoken"],
+        &["wdirtoken"],
+        &["nopetoken"],
+        &["--hidden", "nopetoken"],
+        &["-l", "keeptoken"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

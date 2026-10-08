@@ -393,6 +393,18 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &Os
     if is_hard_excluded(name) {
         return true;
     }
+    matches!(stack_verdict(stack, abs_path, is_dir), ignore::Match::Ignore(_))
+}
+
+/// The stack's combined verdict for `abs_path`: deepest non-None wins
+/// (matchers were pushed shallowest to deepest). Returns the raw Match so
+/// the caller can distinguish Whitelist (rescues hidden-ness) from a
+/// plain no-match.
+fn stack_verdict<'a>(
+    stack: &'a [Arc<Gitignore>],
+    abs_path: &Path,
+    is_dir: bool,
+) -> ignore::Match<&'a ignore::gitignore::Glob> {
     let mut verdict = ignore::Match::None;
     for gi in stack {
         match gi.matched(abs_path, is_dir) {
@@ -400,10 +412,36 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &Os
             m => verdict = m,
         }
     }
-    match verdict {
-        ignore::Match::Ignore(_) => true,
-        ignore::Match::Whitelist(_) => false,
-        ignore::Match::None => false,
+    verdict
+}
+
+/// Effective hiddenness for a yielded file, mirroring the walker check:
+/// hidden iff some dot-prefixed prefix of `rel` did not earn a whitelist
+/// verdict from the ignore stack. A whitelisted `.github/` dir makes its
+/// children ordinary files; `.github/.env` still needs a rescue of its
+/// own. `rel` is the root-relative path. Non-dot paths short-circuit
+/// through the component scan without a matcher call.
+fn still_hidden(
+    stack: &[Arc<Gitignore>],
+    root: &Path,
+    rel: &Path,
+) -> bool {
+    let mut p = rel;
+    loop {
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            let is_dir = p != rel;
+            let verdict = stack_verdict(stack, &root.join(p), is_dir);
+            if !verdict.is_whitelist() {
+                return true;
+            }
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => return false,
+        }
     }
 }
 
@@ -674,7 +712,9 @@ fn scan_recursive<'scope>(
             continue;
         }
         let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
-        let hidden = crate::walk::path_is_hidden(&rel);
+        // still_hidden is cheap for ordinary paths (a component scan);
+        // only dot-prefixed prefixes pay a matcher lookup.
+        let hidden = still_hidden(&stack, root, &rel);
         local_files.push(FileMeta {
             path: rel,
             mtime_ns: entry.mtime_ns,

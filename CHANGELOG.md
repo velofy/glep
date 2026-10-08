@@ -5,6 +5,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 ## Unreleased
 
 - New flags `-a/--text` and `--binary` (last-wins pair): binary files are searched as raw text under `-a`, and reported via a "binary file matches" notice under `--binary`. Binary-flagged files join live-scan candidates only under these flags; default quit detection still suppresses them entirely, matching rg's output and exit codes.
+- `!` whitelist rules in `.gitignore`/`.ignore` now rescue dotfiles from the hidden filter: `!.clang-format` un-hides the file, `!.github/` un-hides the dir and lets its children be judged on their own names. A dot-prefixed path stays hidden only when some dot component earns no whitelist verdict — matching the reference rule where the hidden filter applies only when ignore matchers return no verdict. Applies to `--files` and content search. Postings format v2 → v4 forces a one-time rebuild so existing indexes recompute `FLAG_HIDDEN`.
 
 ## 0.3.1 (2026-09-30)
 
