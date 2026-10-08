@@ -39,6 +39,8 @@ pub struct SearchOpts {
     pub include_zero: bool,
     /// Print the path field; rg suppresses it for a single file operand.
     pub with_filename: bool,
+    /// Print the rg-style stats block after results (rg --stats).
+    pub stats: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -161,6 +163,8 @@ struct CountSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     multiline: bool,
     count: u64,
+    /// Match occurrences (a line can hold several) — needed by --stats.
+    occurrences: u64,
 }
 
 impl grep_searcher::Sink for CountSink<'_> {
@@ -170,19 +174,20 @@ impl grep_searcher::Sink for CountSink<'_> {
         _: &grep_searcher::Searcher,
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        if self.multiline {
-            use grep_matcher::Matcher;
-            let mut n = 0u64;
-            self.matcher
-                .find_iter(m.bytes(), |_| {
-                    n += 1;
-                    true
-                })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            self.count += n.max(1);
-        } else {
-            self.count += 1;
-        }
+        // Occurrences are always counted (--stats wants them);
+        // under -U the reported count is occurrences (a match may span
+        // lines), under plain mode it's matched lines.
+        use grep_matcher::Matcher;
+        let mut n = 0u64;
+        self.matcher
+            .find_iter(m.bytes(), |_| {
+                n += 1;
+                true
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let n = n.max(1);
+        self.occurrences += n;
+        self.count += if self.multiline { n } else { 1 };
         Ok(true)
     }
 }
@@ -213,13 +218,24 @@ fn search_one(
             matcher,
             multiline: opts.multiline,
             count: 0,
+            occurrences: 0,
         };
         searcher.search_path(matcher, &full, &mut sink)?;
-        if sink.count > 0 {
+        if sink.count > 0 || opts.stats {
+            let stats = opts.stats.then(|| {
+                file_stats(&full, sink.count, sink.occurrences)
+            });
             return Ok((
                 format!("{}:{}\n", display.display(), sink.count).into_bytes(),
                 true,
                 None,
+                if sink.count > 0 {
+                    format!("{}:{}\n", rel.display(), sink.count).into_bytes()
+                } else {
+                    Vec::new()
+                },
+                sink.count > 0,
+                stats,
             ));
         if sink.count > 0 || opts.include_zero {
             // `path` + path terminator (`:` normally, NUL under --null) +
@@ -236,13 +252,29 @@ fn search_one(
         return Ok((Vec::new(), false, None));
     }
     if opts.files_with_matches {
+        if opts.stats {
+            // --stats needs real counts: run the count sink instead of
+            // the early-exit one.
+            let mut sink = CountSink {
+                matcher,
+                multiline: opts.multiline,
+                count: 0,
+                occurrences: 0,
+            };
+            searcher.search_path(matcher, &full, &mut sink)?;
+            return Ok((
+                Vec::new(),
+                sink.count > 0,
+                Some(file_stats(&full, sink.count, sink.occurrences)),
+            ));
+        }
         let mut sink = FoundSink(false);
         searcher.search_path(matcher, &full, &mut sink)?;
         return Ok((Vec::new(), sink.0, None));
     }
     let mut buf = Vec::new();
     let matched;
-    let mut stats = None;
+    let stats;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
@@ -260,10 +292,12 @@ fn search_one(
             .per_match_one_line(true)
             .path_terminator(opts.path_terminator)
             .separator_path(opts.path_separator)
+            .stats(opts.stats)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
         searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
+        stats = sink.stats().cloned();
     }
     Ok((buf, matched, stats))
 }
@@ -285,6 +319,18 @@ fn write_path<W: std::io::Write + ?Sized>(out: &mut W, rel: &Path, sep: Option<u
             Ok(())
         }
     }
+/// Stats for paths searched without the printer (count/fwm modes):
+/// occurrences, matched lines, one search, bytes from the file size.
+fn file_stats(full: &Path, matched_lines: u64, matches: u64) -> grep_printer::Stats {
+    let mut s = grep_printer::Stats::new();
+    s.add_searches(1);
+    s.add_searches_with_match(u64::from(matched_lines > 0));
+    s.add_matched_lines(matched_lines);
+    s.add_matches(matches);
+    if let Ok(m) = std::fs::metadata(full) {
+        s.add_bytes_searched(m.len() as u64);
+    }
+    s
 }
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
@@ -378,10 +424,28 @@ pub fn run(
             kind: "summary",
             data: SummaryData {
                 elapsed_total: NiceDuration::from(elapsed),
-                stats: total_stats,
+                stats: total_stats.clone(),
             },
         };
         writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    }
+    if opts.stats && !opts.json {
+        // rg's stats block: a blank line then fixed-order counters.
+        // `bytes_printed` is whatever the printer tracked (standard mode);
+        // count/-l modes report 0 there like rg's non-printer paths.
+        let elapsed = start.elapsed();
+        writeln!(
+            out,
+            "\n{} matches\n{} matched lines\n{} files contained matches\n{} files searched\n{} bytes printed\n{} bytes searched\n{:.6} seconds spent searching\n{:.6} seconds total",
+            total_stats.matches(),
+            total_stats.matched_lines(),
+            total_stats.searches_with_match(),
+            total_stats.searches(),
+            total_stats.bytes_printed(),
+            total_stats.bytes_searched(),
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64()
+        )?;
     }
     Ok(found)
 }
@@ -418,6 +482,7 @@ mod tests {
             path_separator: None,
             include_zero: false,
             with_filename: true,
+            stats: false,
         }
     }
 

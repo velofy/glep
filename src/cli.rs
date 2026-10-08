@@ -104,6 +104,9 @@ pub struct Args {
     /// Never print the file path with matches (rg -I/--no-filename)
     #[arg(short = 'I', long, overrides_with = "with_filename")]
     pub no_filename: bool,
+    /// Print the rg-style stats block after results (rg --stats)
+    #[arg(long)]
+    pub stats: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
@@ -378,6 +381,7 @@ fn run_no_ignore(
         multiline: args.multiline,
         binary: binary_detection(args),
         display_prefix: cwd_rel.to_path_buf(),
+        stats: args.stats,
     };
     let opts = search_opts(args, root);
     let stdout = std::io::stdout();
@@ -651,6 +655,7 @@ pub fn run() -> anyhow::Result<i32> {
         multiline: args.multiline,
         binary: binary_detection(&args),
         display_prefix: cwd_rel.to_path_buf(),
+        stats: args.stats,
     };
     // rg's nothing-searched heuristic: with the implicit path scope, an
     // empty walked pool (ignore rules or filters ate everything) warns on
