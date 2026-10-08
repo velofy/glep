@@ -480,6 +480,12 @@ fn stats_block_appended() {
     let dir = corpus();
     let out = glep(dir.path())
         .args(["--stats", "hello"])
+fn encoding_flag_transcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lat.txt"), b"caf\xe9 test\n").unwrap();
+    std::fs::write(dir.path().join("a.txt"), "caf ascii\n").unwrap();
+    let out = glep(dir.path())
+        .args(["-E", "latin1", "café"])
         .assert()
         .success()
         .get_output()
@@ -526,6 +532,15 @@ fn multiple_e_patterns_union() {
         .assert()
         .success()
         .stdout("src/lib.rs\n");
+    assert!(s.contains("lat.txt:1:café test"));
+    // 'café' (decoded side) does not appear in a.txt's "caf ascii"
+    assert!(!s.contains("a.txt"));
+    // unknown label errors
+    glep(dir.path())
+        .args(["-E", "bogus-enc", "x"])
+        .assert()
+        .failure()
+        .code(2);
 }
 
 #[test]

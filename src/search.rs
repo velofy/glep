@@ -41,6 +41,12 @@ pub struct SearchOpts {
     pub with_filename: bool,
     /// Print the rg-style stats block after results (rg --stats).
     pub stats: bool,
+    /// rg --multiline-dotall: `.` matches `\n` at the matcher level.
+    pub multiline_dotall: bool,
+    /// -E/--encoding label, resolved once in `run`.
+    pub encoding: Option<String>,
+    /// rg --line-buffered: flush after every record.
+    pub line_buffered: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -142,6 +148,9 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     if opts.multiline {
         b.multi_line(true);
     }
+    if opts.multiline_dotall {
+        b.dot_matches_new_line(true);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -197,14 +206,21 @@ fn search_one(
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
+    encoding: Option<grep_searcher::Encoding>,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     let mut searcher = SearcherBuilder::new()
         .binary_detection(opts.binary.clone())
+    let mut builder = SearcherBuilder::new();
+    builder
+        .binary_detection(BinaryDetection::quit(0))
         .line_number(true)
         .before_context(opts.before)
         .after_context(opts.after)
-        .multi_line(opts.multiline)
-        .build();
+        .multi_line(opts.multiline);
+    if let Some(enc) = &encoding {
+        builder.encoding(Some(enc.clone()));
+    }
+    let mut searcher = builder.build();
     let full = root.join(rel);
     // Paths print relative to the user's cwd, not the index root: strip
     // the scope prefix (no-op when the search ran at the root itself).
@@ -349,6 +365,15 @@ pub fn run(
     // closure (grep_regex::RegexMatcher is Sync). This also validates the
     // pattern before I/O, matching prior behavior.
     let matcher = build_matcher(pattern, opts)?;
+    // Resolve the -E label up front so a bad label errors before any I/O
+    // (the reference exits 2 on an unknown encoding).
+    let encoding = match &opts.encoding {
+        Some(label) => Some(
+            grep_searcher::Encoding::new(label)
+                .map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
+        ),
+        None => None,
+    };
     let mut found = false;
     let separate =
         (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
@@ -359,7 +384,7 @@ pub fn run(
         let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
             .enumerate()
-            .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
+            .map(|(i, rel)| match search_one(&matcher, root, rel, opts, encoding.clone()) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
@@ -385,6 +410,9 @@ pub fn run(
                         writeln!(out, "--")?;
                     }
                     out.write_all(&buf)?;
+                    if opts.line_buffered {
+                        out.flush()?;
+                    }
                     printed_any = true;
                 }
             }
@@ -483,6 +511,9 @@ mod tests {
             include_zero: false,
             with_filename: true,
             stats: false,
+            multiline_dotall: false,
+            encoding: None,
+            line_buffered: false,
         }
     }
 
