@@ -128,6 +128,10 @@ fn parity_with_ripgrep() {
         // --sort path still applies, so the harness's fixed rg flag set
         // composes cleanly with --files --no-ignore for both tools.
         &["--no-ignore", "--files"],
+        // --passthru: all lines of all searched files print
+        &["--passthru", "answer"],
+        // --no-unicode: \w narrows to ASCII
+        &["--no-unicode", "\\w+", "-l"],
     ];
     for args in patterns {
         let (g, gc) = glep_out(dir.path(), args);

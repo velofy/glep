@@ -43,6 +43,12 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// Print every line (matches still marked), rg --passthru
+    #[arg(long)]
+    pub passthru: bool,
+    /// Disable unicode mode in the regex (rg --no-unicode)
+    #[arg(long)]
+    pub no_unicode: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -166,6 +172,8 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        passthru: args.passthru,
+        unicode: !args.no_unicode,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -257,7 +265,14 @@ pub fn run() -> anyhow::Result<i32> {
         Some(p) => p,
         None => anyhow::bail!("a pattern is required (or --files)"),
     };
-    let query_plan = plan::build(&pattern, args.fixed_strings, args.ignore_case);
+    // --passthru prints every line of every *searched* file, so index
+    // narrowing would silently drop files whose lines must still appear:
+    // it forces a full scan.
+    let query_plan = if args.passthru {
+        crate::plan::Plan::All
+    } else {
+        plan::build(&pattern, args.fixed_strings, args.ignore_case)
+    };
     timings.stage("plan");
     let mut files = idx.candidates(&query_plan, args.ignore_case, args.hidden);
     files.extend(extra);
@@ -277,6 +292,8 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        passthru: args.passthru,
+        unicode: !args.no_unicode,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

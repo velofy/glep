@@ -13,6 +13,10 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// --passthru: emit all lines, not just matches/context.
+    pub passthru: bool,
+    /// --no-unicode: matcher-level unicode off (\w, ., classes).
+    pub unicode: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -114,6 +118,9 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     if opts.multiline {
         b.multi_line(true);
     }
+    if !opts.unicode {
+        b.unicode(false);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -173,6 +180,7 @@ fn search_one(
         .before_context(opts.before)
         .after_context(opts.after)
         .multi_line(opts.multiline)
+        .passthru(opts.passthru)
         .build();
     let full = root.join(rel);
     if opts.count {
@@ -255,11 +263,18 @@ pub fn run(
             if let Some(s) = &stats {
                 merge_stats(&mut total_stats, s);
             }
-            if matched {
-                found = true;
+            // Write any produced output, not just matches: --passthru
+            // emits every line including non-matching ones, so a
+            // no-match file can still produce bytes.
+            if matched || !buf.is_empty() {
+                if matched {
+                    found = true;
+                }
                 let global_i = base + i;
                 if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
+                    if matched {
+                        writeln!(out, "{}", files[global_i].display())?;
+                    }
                 } else {
                     if separate && printed_any {
                         writeln!(out, "--")?;
@@ -316,6 +331,8 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            passthru: false,
+            unicode: true,
         }
     }
 
