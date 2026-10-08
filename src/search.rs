@@ -13,6 +13,8 @@ pub struct SearchOpts {
     pub json: bool,
     pub count: bool,
     pub multiline: bool,
+    /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
+    pub pcre2: bool,
 }
 
 // --- rg-compatible --json closing `summary` event -------------------------
@@ -97,6 +99,20 @@ fn merge_stats(total: &mut grep_printer::Stats, other: &grep_printer::Stats) {
     total.add_matches(other.matches());
 }
 
+fn build_pcre2_matcher(
+    pattern: &str,
+    opts: &SearchOpts,
+) -> anyhow::Result<grep_pcre2::RegexMatcher> {
+    let mut b = grep_pcre2::RegexMatcherBuilder::new();
+    b.fixed_strings(opts.fixed)
+        .caseless(opts.case_insensitive)
+        .jit_if_available(true);
+    if opts.multiline {
+        b.multi_line(true);
+    }
+    Ok(b.build(pattern)?)
+}
+
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
@@ -131,13 +147,13 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
-struct CountSink<'a> {
-    matcher: &'a grep_regex::RegexMatcher,
+struct CountSink<'a, M: grep_matcher::Matcher> {
+    matcher: &'a M,
     multiline: bool,
     count: u64,
 }
 
-impl grep_searcher::Sink for CountSink<'_> {
+impl<M: grep_matcher::Matcher> grep_searcher::Sink for CountSink<'_, M> {
     type Error = std::io::Error;
     fn matched(
         &mut self,
@@ -145,14 +161,13 @@ impl grep_searcher::Sink for CountSink<'_> {
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
         if self.multiline {
-            use grep_matcher::Matcher;
             let mut n = 0u64;
             self.matcher
                 .find_iter(m.bytes(), |_| {
                     n += 1;
                     true
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             self.count += n.max(1);
         } else {
             self.count += 1;
@@ -161,8 +176,8 @@ impl grep_searcher::Sink for CountSink<'_> {
     }
 }
 
-fn search_one(
-    matcher: &grep_regex::RegexMatcher,
+fn search_one<M: grep_matcher::Matcher>(
+    matcher: &M,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
@@ -225,13 +240,29 @@ pub fn run(
     opts: &SearchOpts,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
+    // Two monomorphized paths — one per engine. Sinks and the searcher are
+    // generic over Matcher; only the builder differs.
+    if opts.pcre2 {
+        let matcher = build_pcre2_matcher(pattern, opts)?;
+        return run_impl(&matcher, root, files, opts, out);
+    }
+    let matcher = build_matcher(pattern, opts)?;
+    run_impl(&matcher, root, files, opts, out)
+}
+
+fn run_impl<M: grep_matcher::Matcher + Sync>(
+    matcher: &M,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
     // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
     let start = Instant::now();
     // Build the matcher once up front; shared by reference across the rayon
     // closure (grep_regex::RegexMatcher is Sync). This also validates the
     // pattern before I/O, matching prior behavior.
-    let matcher = build_matcher(pattern, opts)?;
     let mut found = false;
     let separate =
         (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
@@ -242,7 +273,7 @@ pub fn run(
         let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
             .par_iter()
             .enumerate()
-            .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
+            .map(|(i, rel)| match search_one(matcher, root, rel, opts) {
                 Ok((buf, matched, stats)) => (i, buf, matched, stats),
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
@@ -316,6 +347,7 @@ mod tests {
             json: false,
             count: false,
             multiline: false,
+            pcre2: false,
         }
     }
 

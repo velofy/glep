@@ -476,6 +476,27 @@ fn json_mode_emits_rg_summary_event() {
 }
 
 #[test]
+fn pcre2_lookaround_and_backref() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("p.txt"), "fooxbar\nfooy\nlook(ahead)\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "aa bb aa\ncc dd\n").unwrap();
+    // lookahead: foo followed by x
+    let out = glep(dir.path()).args(["-P", "foo(?=x)", "-l"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("p.txt"), "{s}");
+    assert!(!s.contains("b.txt"), "{s}");
+    // backreference: repeated word
+    let out = glep(dir.path())
+        .args(["-P", "(\\w+) \\w+ \\1", "-l"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("b.txt"), "{s}");
+    // invalid under -P surfaces an error (not a silent miss)
+    glep(dir.path()).args(["-P", "("]).assert().failure();
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);

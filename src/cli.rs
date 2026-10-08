@@ -43,6 +43,9 @@ pub struct Args {
     /// Allow matches to span multiple lines (patterns may contain \n)
     #[arg(short = 'U', long)]
     pub multiline: bool,
+    /// PCRE2 regex engine (lookaround, backrefs, etc.)
+    #[arg(short = 'P', long = "pcre2")]
+    pub pcre2: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
     #[arg(long)]
@@ -166,6 +169,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        pcre2: args.pcre2,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -277,6 +281,7 @@ pub fn run() -> anyhow::Result<i32> {
         json: args.json,
         count: args.count,
         multiline: args.multiline,
+        pcre2: args.pcre2,
     };
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
