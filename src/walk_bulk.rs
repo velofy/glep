@@ -441,29 +441,6 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &Os
     }
 }
 
-/// Bound on how many levels above the sweep root to look for ancestor
-/// `.gitignore` files when no `.git` directory brackets the search. The
-/// real `ignore` crate (via `parents(true)`) walks all the way to the
-/// filesystem root regardless of git; capping here trades a little fidelity
-/// for a sweep root outside any repo (e.g. a plain checkout-less directory)
-/// for not doing an unbounded stat() climb on every single sweep. A sweep
-/// root inside a real repo isn't affected: the walk stops at the git root.
-pub(crate) const ANCESTOR_GITIGNORE_CAP: usize = 10;
-
-/// Walk up from `start` (inclusive) looking for the nearest ancestor
-/// directory containing a `.git` entry, directory or gitlink file. `start`
-/// should already be canonicalized so `.parent()` walks real directories.
-pub(crate) fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = Some(start);
-    while let Some(dir) = cur {
-        if dir.join(".git").symlink_metadata().is_ok() {
-            return Some(dir.to_path_buf());
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
 /// Follow a `.git` gitdir-pointer file (a worktree's `gitdir: <path>`
 /// marker) to the real git directory, then follow *that* directory's own
 /// `commondir` file if present, since `info/exclude` lives in the common
@@ -596,7 +573,7 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
     let canon_root = sweep_root
         .canonicalize()
         .unwrap_or_else(|_| sweep_root.to_path_buf());
-    let git_root = find_git_root(&canon_root);
+    let git_root = crate::walk::find_git_root(&canon_root);
 
     if let Some(ref gitroot) = git_root {
         if let Some(gi) = load_git_exclude(gitroot)? {
@@ -617,7 +594,7 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
             if hit_git_root {
                 break;
             }
-            if git_root.is_none() && depth >= ANCESTOR_GITIGNORE_CAP {
+            if git_root.is_none() && depth >= crate::walk::ANCESTOR_GITIGNORE_CAP {
                 break;
             }
             cur = dir.parent();

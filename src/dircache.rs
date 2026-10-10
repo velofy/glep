@@ -134,7 +134,7 @@ pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
         v.push(stat_src(p));
     }
     let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let git_root = crate::walk_bulk::find_git_root(&canon);
+    let git_root = crate::walk::find_git_root(&canon);
     if let Some(gr) = &git_root {
         v.push(stat_src(gr.join(".git/info/exclude")));
     }
@@ -148,8 +148,7 @@ pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
             ancestors.push(dir.to_path_buf());
             let hit_git_root = git_root.as_deref() == Some(dir);
             depth += 1;
-            if hit_git_root
-                || (git_root.is_none() && depth >= crate::walk_bulk::ANCESTOR_GITIGNORE_CAP)
+            if hit_git_root || (git_root.is_none() && depth >= crate::walk::ANCESTOR_GITIGNORE_CAP)
             {
                 break;
             }

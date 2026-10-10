@@ -50,6 +50,27 @@ pub fn path_is_hidden(rel: &Path) -> bool {
     })
 }
 
+/// Bound on how many levels above the sweep root to look for ancestor
+/// `.gitignore` files when no `.git` directory brackets the search
+/// (mirrors the bulk walker's cap; see walk_bulk.rs for the rationale).
+pub(crate) const ANCESTOR_GITIGNORE_CAP: usize = 10;
+
+/// Walk up from `start` (inclusive) looking for the nearest ancestor
+/// directory containing a `.git` entry, directory or gitlink file.
+/// Shared by the bulk walker's ancestor-matcher seeding and the listing
+/// cache's ignore-source fingerprint, so the two can never disagree about
+/// where the git root is.
+pub(crate) fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// Builds one `Collector` per worker thread, each with its own local buffer.
 struct CollectorBuilder<'a> {
     root: &'a Path,
