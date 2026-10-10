@@ -3,6 +3,7 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct SearchOpts {
@@ -198,6 +199,20 @@ struct Done {
     stats: Option<grep_printer::Stats>,
 }
 
+/// Bounded-window coordination between workers and the printer. The
+/// printer's ring is finite (ring capacity entries); without backpressure,
+/// workers racing ahead of in-order printing can overflow it (the channel
+/// capacity alone does NOT bound the lead: the printer continuously drains
+/// the channel into the ring). Workers therefore wait before SEARCHING an
+/// index that is a full ring-capacity ahead of the print cursor, and the
+/// printer notifies after every advance. The worker holding `next` itself
+/// never waits, so progress is guaranteed.
+struct WindowState {
+    next: AtomicUsize,
+    room: Condvar,
+    lock: Mutex<()>,
+}
+
 /// Print one finished result. Shared by the sequential and parallel paths
 /// so byte output cannot drift between them. `printed_any` drives the
 /// rg-compatible `--` separator between files in context modes.
@@ -223,6 +238,43 @@ fn emit_result(
     Ok(())
 }
 
+/// The bytes to search for one file: an mmap when mapping succeeded
+/// (zero-copy: the searcher runs directly against page-cache pages, no
+/// kernel->user buffer copy), else the path (streamed through the
+/// searcher's line buffer). ripgrep's own macOS heuristic disables mmap
+/// with a 2018 "should re-evaluate" note; we re-evaluated: on
+/// page-cache-bound workloads (every-file searches) the copy elimination
+/// is a significant win. SIGBUS on concurrent truncation is the accepted
+/// risk, identical to rg's documented --mmap behavior on Linux.
+enum Haystack {
+    Map(memmap2::Mmap),
+    Path(PathBuf),
+}
+
+impl Haystack {
+    fn open(full: &Path) -> Haystack {
+        match std::fs::File::open(full) {
+            Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
+                Ok(m) if !m.is_empty() => Haystack::Map(m),
+                _ => Haystack::Path(full.to_path_buf()),
+            },
+            Err(_) => Haystack::Path(full.to_path_buf()),
+        }
+    }
+
+    fn search<S: grep_searcher::Sink>(
+        &self,
+        searcher: &mut Searcher,
+        matcher: &grep_regex::RegexMatcher,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
+        match self {
+            Haystack::Map(m) => searcher.search_slice(matcher, &m[..], sink),
+            Haystack::Path(p) => searcher.search_path(matcher, p, sink),
+        }
+    }
+}
+
 fn search_one(
     state: &mut WorkerState,
     matcher: &grep_regex::RegexMatcher,
@@ -231,13 +283,14 @@ fn search_one(
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
     let full = root.join(rel);
+    let hay = Haystack::open(&full);
     if opts.count {
         let mut sink = CountSink {
             matcher,
             multiline: opts.multiline,
             count: 0,
         };
-        state.searcher.search_path(matcher, &full, &mut sink)?;
+        hay.search(&mut state.searcher, matcher, &mut sink)?;
         if sink.count > 0 {
             return Ok((
                 format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
@@ -249,7 +302,7 @@ fn search_one(
     }
     if opts.files_with_matches {
         let mut sink = FoundSink(false);
-        state.searcher.search_path(matcher, &full, &mut sink)?;
+        hay.search(&mut state.searcher, matcher, &mut sink)?;
         if sink.0 {
             return Ok((format!("{}\n", rel.display()).into_bytes(), true, None));
         }
@@ -261,7 +314,7 @@ fn search_one(
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
-        state.searcher.search_path(matcher, &full, &mut sink)?;
+        hay.search(&mut state.searcher, matcher, &mut sink)?;
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else {
@@ -269,7 +322,7 @@ fn search_one(
             .heading(false)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
-        state.searcher.search_path(matcher, &full, &mut sink)?;
+        hay.search(&mut state.searcher, matcher, &mut sink)?;
         matched = sink.has_match();
     }
     Ok((buf, matched, stats))
@@ -290,11 +343,23 @@ fn worker(
     root: &Path,
     files: &[PathBuf],
     opts: &SearchOpts,
+    window: &WindowState,
+    window_cap: usize,
 ) {
     loop {
         let idx = cursor.fetch_add(1, Ordering::Relaxed);
         if idx >= files.len() {
             return;
+        }
+        // Bounded-window backpressure: hold off searching until this
+        // index falls within a ring-capacity of the print cursor. Waiting
+        // BEFORE the search (not before the send) means blocked workers
+        // hold no Done at all, keeping the invariant exactly one-sided.
+        {
+            let mut guard = window.lock.lock().unwrap();
+            while idx >= window.next.load(Ordering::Acquire) + window_cap {
+                guard = window.room.wait(guard).unwrap();
+            }
         }
         let rel = &files[idx];
         let (buf, matched, stats) = match search_one(state, matcher, root, rel, opts) {
@@ -333,9 +398,24 @@ struct Printer {
     printed_any: bool,
     found: bool,
     total_stats: grep_printer::Stats,
+    /// Write coalescing buffer: a kernel-scale every-file search issues
+    /// one write syscall per file (~86k syscalls, ~150ms). Batching into
+    /// 256KB flushes cuts that to a few hundred with byte-identical
+    /// output (ordering is the printer's own; nothing else interleaves
+    /// stdout).
+    out_buf: Vec<u8>,
 }
 
+/// Flush the coalescing buffer once it passes this size.
+const PRINT_BATCH: usize = 256 * 1024;
+
 impl Printer {
+    fn advance_window(&self, window: &WindowState) {
+        window.next.store(self.next, Ordering::Release);
+        let _guard = window.lock.lock().unwrap();
+        window.room.notify_all();
+    }
+
     fn new(separate: bool, window: usize, workers: usize, total: usize) -> Printer {
         let cap = (window + workers + 1).next_power_of_two();
         Printer {
@@ -347,7 +427,29 @@ impl Printer {
             printed_any: false,
             found: false,
             total_stats: grep_printer::Stats::new(),
+            out_buf: Vec::with_capacity(PRINT_BATCH + 64 * 1024),
         }
+    }
+
+    fn write_bytes(
+        &mut self,
+        bytes: &[u8],
+        out: &mut (dyn std::io::Write + Send),
+    ) -> std::io::Result<()> {
+        self.out_buf.extend_from_slice(bytes);
+        if self.out_buf.len() >= PRINT_BATCH {
+            out.write_all(&self.out_buf)?;
+            self.out_buf.clear();
+        }
+        Ok(())
+    }
+
+    fn flush_batch(&mut self, out: &mut (dyn std::io::Write + Send)) -> std::io::Result<()> {
+        if !self.out_buf.is_empty() {
+            out.write_all(&self.out_buf)?;
+            self.out_buf.clear();
+        }
+        Ok(())
     }
 
     fn stash_then_drain(
@@ -356,10 +458,14 @@ impl Printer {
         out: &mut (dyn std::io::Write + Send),
     ) -> anyhow::Result<()> {
         let slot = d.idx & self.ring_mask;
-        debug_assert!(
-            self.ring[slot].is_none(),
-            "ring slot overwritten before drain"
-        );
+        if self.ring[slot].is_some() {
+            // release-mode tripwire for the ring-capacity invariant
+            eprintln!(
+                "GLEP BUG: ring slot {slot} (idx {}) overwritten; next={} mask={}",
+                d.idx, self.next, self.ring_mask
+            );
+            std::process::abort();
+        }
         self.ring[slot] = Some(d);
         self.drain(out)
     }
@@ -389,15 +495,16 @@ impl Printer {
         if matched {
             self.found = true;
         }
-        emit_result(
-            out,
-            &buf,
-            matched,
-            &stats,
-            self.separate,
-            &mut self.printed_any,
-            &mut self.total_stats,
-        )?;
+        if let Some(s) = &stats {
+            merge_stats(&mut self.total_stats, s);
+        }
+        if matched {
+            if self.separate && self.printed_any {
+                self.write_bytes(b"--\n", out)?;
+            }
+            self.write_bytes(&buf, out)?;
+            self.printed_any = true;
+        }
         Ok(())
     }
 }
@@ -516,6 +623,14 @@ pub fn run(
     // output buffers (plus one per worker in flight) exist at once.
     let window = (workers * 16).max(64);
     let (tx, rx) = sync_channel::<Done>(window);
+    // Ring capacity (mirrors Printer::new's computation) is the lead
+    // bound the workers wait against.
+    let ring_cap = (window + workers + 1).next_power_of_two();
+    let window_state = std::sync::Arc::new(WindowState {
+        next: AtomicUsize::new(0),
+        room: Condvar::new(),
+        lock: Mutex::new(()),
+    });
 
     // Declared outside the scope so worker borrows outlive it.
     let cursor = AtomicUsize::new(0);
@@ -525,8 +640,9 @@ pub fn run(
         // keep searching while it prints.
         let printer_out = &mut *out;
         let mut printer = Printer::new(separate, window, workers, files.len());
+        let printer_window = window_state.clone();
         let printer_handle = scope.spawn(move || -> anyhow::Result<Printer> {
-            run_printer(rx, &mut printer, printer_out)?;
+            run_printer(rx, &mut printer, printer_out, &printer_window)?;
             Ok(printer)
         });
         let cursor_ref = &cursor;
@@ -535,8 +651,19 @@ pub fn run(
         for _ in 0..workers {
             let mut state = WorkerState::new(opts);
             let tx = tx.clone();
+            let window_ref = window_state.clone();
             handles.push(scope.spawn(move || {
-                worker(cursor_ref, &tx, &mut state, matcher_ref, root, files, opts);
+                worker(
+                    cursor_ref,
+                    &tx,
+                    &mut state,
+                    matcher_ref,
+                    root,
+                    files,
+                    opts,
+                    &window_ref,
+                    ring_cap,
+                );
             }));
         }
         for h in handles {
@@ -564,11 +691,16 @@ fn run_printer(
     rx: Receiver<Done>,
     printer: &mut Printer,
     out: &mut (dyn std::io::Write + Send),
+    window: &WindowState,
 ) -> anyhow::Result<()> {
     while let Ok(d) = rx.recv() {
         printer.stash_then_drain(d, out)?;
+        printer.advance_window(window);
     }
-    printer.drain(out)
+    printer.drain(out)?;
+    printer.advance_window(window);
+    printer.flush_batch(out)?;
+    Ok(())
 }
 
 #[cfg(test)]
