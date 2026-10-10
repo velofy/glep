@@ -4,7 +4,7 @@ use std::time::UNIX_EPOCH;
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkState};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileMeta {
     /// Relative to the sweep root.
     pub path: PathBuf,
@@ -78,7 +78,7 @@ impl ParallelVisitor for Collector<'_> {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
         match entry {
             Ok(e) => {
-                if e.file_type().map_or(false, |t| t.is_file()) {
+                if e.file_type().is_some_and(|t| t.is_file()) {
                     if let Ok(md) = e.metadata() {
                         let mtime_ns = md
                             .modified()
@@ -135,6 +135,16 @@ impl Drop for Collector<'_> {
 /// stderr, so a bug in the macOS-only fast path can never surface as a
 /// hard failure, only as a missed speedup for that one sweep.
 pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
+    let mut v = sweep_unsorted(root)?;
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
+/// Same sweep as [`sweep`] but without the final path sort. Callers that
+/// classify results by hash map (the freshness diff in `Index::update`)
+/// never need the sort, and sorting 86k paths costs ~30ms on a
+/// kernel-scale tree — pure overhead on every default-mode query.
+pub fn sweep_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     #[cfg(target_os = "macos")]
     {
         if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
@@ -146,14 +156,23 @@ pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
             }
         }
     }
-    sweep_walker(root)
+    sweep_walker_unsorted(root)
 }
 
 /// Portable, non-macOS-specific sweep: `ignore::WalkParallel` plus a
 /// `stat()`-class metadata() call per file. This is the sole implementation
 /// on non-macOS platforms, and the fallback / correctness reference on
 /// macOS (see `sweep` above and the differential tests below).
+#[cfg(test)]
 fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
+    // Sorted variant, the correctness reference for the bulk-path
+    // differential tests below.
+    let mut v = sweep_walker_unsorted(root)?;
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(v)
+}
+
+fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",
@@ -257,7 +276,12 @@ mod tests {
         // see Index::candidates/live_files). ignored.log stays excluded via
         // its own *.log rule, and .glep/ stays hard-excluded regardless.
         assert_eq!(paths, vec![p(".gitignore"), p("b.txt"), p("src/a.rs")]);
-        let by_path = |name: &str| metas.iter().find(|m| m.path == PathBuf::from(name)).unwrap();
+        let by_path = |name: &str| {
+            metas
+                .iter()
+                .find(|m| m.path == PathBuf::from(name))
+                .unwrap()
+        };
         assert!(by_path(".gitignore").hidden);
         assert!(!by_path("b.txt").hidden);
         assert!(!by_path("src/a.rs").hidden);
@@ -279,7 +303,10 @@ mod tests {
         let err = sweep_unfiltered(&missing, false).unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("{}: No such file or directory (os error 2)", missing.display())
+            format!(
+                "{}: No such file or directory (os error 2)",
+                missing.display()
+            )
         );
     }
 
@@ -297,8 +324,10 @@ mod tests {
         std::fs::write(dir.path().join(".glep/manifest.bin"), "x").unwrap();
 
         let metas = sweep_unfiltered(dir.path(), false).unwrap();
-        let paths: Vec<String> =
-            metas.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
+        let paths: Vec<String> = metas
+            .iter()
+            .map(|m| m.path.to_string_lossy().into_owned())
+            .collect();
         // Both the gitignore'd and the .ignore'd file must be present: this
         // is the whole point of --no-ignore. .gitignore/.ignore themselves
         // are hidden (dot-prefixed) and include_hidden is false here, so
@@ -320,8 +349,10 @@ mod tests {
         std::fs::write(dir.path().join(".glep/manifest.bin"), "x").unwrap();
 
         let without_hidden = sweep_unfiltered(dir.path(), false).unwrap();
-        let paths: Vec<String> =
-            without_hidden.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
+        let paths: Vec<String> = without_hidden
+            .iter()
+            .map(|m| m.path.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(paths, vec!["plain.txt"]);
         // With include_hidden = false, the walker itself dropped the hidden
         // entry, so nothing left over is flagged hidden either: callers
@@ -329,14 +360,20 @@ mod tests {
         assert!(without_hidden.iter().all(|m| !m.hidden));
 
         let with_hidden = sweep_unfiltered(dir.path(), true).unwrap();
-        let mut paths2: Vec<String> =
-            with_hidden.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
+        let mut paths2: Vec<String> = with_hidden
+            .iter()
+            .map(|m| m.path.to_string_lossy().into_owned())
+            .collect();
         paths2.sort();
         assert_eq!(paths2, vec![".dotfile", "plain.txt"]);
         assert!(!paths2.iter().any(|p| p.contains(".git")));
         assert!(!paths2.iter().any(|p| p.contains(".glep")));
-        let by_path =
-            |name: &str| with_hidden.iter().find(|m| m.path == PathBuf::from(name)).unwrap();
+        let by_path = |name: &str| {
+            with_hidden
+                .iter()
+                .find(|m| m.path == PathBuf::from(name))
+                .unwrap()
+        };
         assert!(by_path(".dotfile").hidden);
         assert!(!by_path("plain.txt").hidden);
     }
@@ -367,8 +404,16 @@ mod tests {
             std::fs::write(dir.path().join("skip.log"), "gitignored at root").unwrap();
             std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
             std::fs::write(dir.path().join(".hidden_file"), "dotfile, now swept").unwrap();
-            std::fs::write(dir.path().join(".hidden_dir/inside.txt"), "hidden dir contents").unwrap();
-            std::fs::write(dir.path().join(".github/workflows/x.yml"), "nested under a hidden dir").unwrap();
+            std::fs::write(
+                dir.path().join(".hidden_dir/inside.txt"),
+                "hidden dir contents",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join(".github/workflows/x.yml"),
+                "nested under a hidden dir",
+            )
+            .unwrap();
 
             std::fs::write(dir.path().join("sub/normal.txt"), "normal sub file").unwrap();
             std::fs::write(dir.path().join("sub/local.txt"), "ignored only under sub/").unwrap();
@@ -390,7 +435,10 @@ mod tests {
 
             let walker_paths: Vec<_> = walker.iter().map(|m| m.path.clone()).collect();
             let bulk_paths: Vec<_> = bulk.iter().map(|m| m.path.clone()).collect();
-            assert_eq!(walker_paths, bulk_paths, "sweep_bulk and sweep_walker disagree on file set");
+            assert_eq!(
+                walker_paths, bulk_paths,
+                "sweep_bulk and sweep_walker disagree on file set"
+            );
 
             // Sanity: gitignore scoping actually took effect (root pattern
             // applies everywhere, nested pattern applies only under sub/),
@@ -427,13 +475,22 @@ mod tests {
                 // sweep's own logic, so a naive basename-only check (which
                 // would wrongly say ci.yml-under-.github is not hidden)
                 // gets caught.
-                let should_be_hidden =
-                    w.path.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
-                assert_eq!(w.hidden, should_be_hidden, "hidden flag wrong for {:?}", w.path);
+                let should_be_hidden = w
+                    .path
+                    .components()
+                    .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+                assert_eq!(
+                    w.hidden, should_be_hidden,
+                    "hidden flag wrong for {:?}",
+                    w.path
+                );
             }
             // Full-struct equality (path, mtime_ns, size, hidden all at
             // once), strictly in addition to the per-field checks above.
-            assert_eq!(walker, bulk, "full FileMeta vectors must match exactly, hidden flags included");
+            assert_eq!(
+                walker, bulk,
+                "full FileMeta vectors must match exactly, hidden flags included"
+            );
         }
 
         /// The resolution check above (exact mtime_ns equality) is the
@@ -503,8 +560,10 @@ mod tests {
         use super::*;
 
         fn paths_of(metas: &[FileMeta]) -> Vec<String> {
-            let mut v: Vec<String> =
-                metas.iter().map(|m| m.path.to_string_lossy().into_owned()).collect();
+            let mut v: Vec<String> = metas
+                .iter()
+                .map(|m| m.path.to_string_lossy().into_owned())
+                .collect();
             v.sort();
             v
         }
@@ -517,7 +576,8 @@ mod tests {
             let dispatched_paths = paths_of(&dispatched);
             let walked_paths = paths_of(&walked);
             assert_eq!(
-                dispatched_paths, walked_paths,
+                dispatched_paths,
+                walked_paths,
                 "sweep() and sweep_walker() disagree on file set for {}",
                 root.display()
             );

@@ -66,7 +66,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn meta(p: &str) -> FileMeta {
-        FileMeta { path: PathBuf::from(p), mtime_ns: 42, size: 7, hidden: false }
+        FileMeta {
+            path: PathBuf::from(p),
+            mtime_ns: 42,
+            size: 7,
+            hidden: false,
+        }
     }
 
     #[test]

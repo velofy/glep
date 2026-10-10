@@ -1,7 +1,8 @@
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, SearcherBuilder};
-use rayon::prelude::*;
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 pub struct SearchOpts {
@@ -152,7 +153,7 @@ impl grep_searcher::Sink for CountSink<'_> {
                     n += 1;
                     true
                 })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             self.count += n.max(1);
         } else {
             self.count += 1;
@@ -161,19 +162,74 @@ impl grep_searcher::Sink for CountSink<'_> {
     }
 }
 
+/// Per-thread search state: one `Searcher` reused across every file this
+/// worker touches. `grep_searcher::Searcher` holds its decode/line buffers
+/// in RefCells precisely so a single instance can be reused across files;
+/// rebuilding it per file (the old design) threw that reuse away and paid
+/// a fresh allocation plus cold buffers per file. ripgrep itself clones
+/// one SearchWorker per walker thread and reuses it for the whole run.
+struct WorkerState {
+    searcher: Searcher,
+}
+
+impl WorkerState {
+    fn new(opts: &SearchOpts) -> WorkerState {
+        // Line-number tracking is only needed by the printing sinks; rg
+        // itself searches without line numbers unless output needs them.
+        // -l/-c modes skip the bookkeeping entirely.
+        let need_line_numbers = !opts.files_with_matches && !opts.count;
+        let searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(0))
+            .line_number(need_line_numbers)
+            .before_context(opts.before)
+            .after_context(opts.after)
+            .multi_line(opts.multiline)
+            .build();
+        WorkerState { searcher }
+    }
+}
+
+/// One completed file: the file's index, its rendered output buffer,
+/// whether it matched, and (json mode only) its per-file stats.
+struct Done {
+    idx: usize,
+    buf: Vec<u8>,
+    matched: bool,
+    stats: Option<grep_printer::Stats>,
+}
+
+/// Print one finished result. Shared by the sequential and parallel paths
+/// so byte output cannot drift between them. `printed_any` drives the
+/// rg-compatible `--` separator between files in context modes.
+fn emit_result(
+    out: &mut (dyn std::io::Write + Send),
+    buf: &[u8],
+    matched: bool,
+    stats: &Option<grep_printer::Stats>,
+    separate: bool,
+    printed_any: &mut bool,
+    total_stats: &mut grep_printer::Stats,
+) -> std::io::Result<()> {
+    if let Some(s) = stats {
+        merge_stats(total_stats, s);
+    }
+    if matched {
+        if separate && *printed_any {
+            writeln!(out, "--")?;
+        }
+        out.write_all(buf)?;
+        *printed_any = true;
+    }
+    Ok(())
+}
+
 fn search_one(
+    state: &mut WorkerState,
     matcher: &grep_regex::RegexMatcher,
     root: &Path,
     rel: &Path,
     opts: &SearchOpts,
 ) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let mut searcher = SearcherBuilder::new()
-        .binary_detection(BinaryDetection::quit(0))
-        .line_number(true)
-        .before_context(opts.before)
-        .after_context(opts.after)
-        .multi_line(opts.multiline)
-        .build();
     let full = root.join(rel);
     if opts.count {
         let mut sink = CountSink {
@@ -181,7 +237,7 @@ fn search_one(
             multiline: opts.multiline,
             count: 0,
         };
-        searcher.search_path(matcher, &full, &mut sink)?;
+        state.searcher.search_path(matcher, &full, &mut sink)?;
         if sink.count > 0 {
             return Ok((
                 format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
@@ -193,8 +249,11 @@ fn search_one(
     }
     if opts.files_with_matches {
         let mut sink = FoundSink(false);
-        searcher.search_path(matcher, &full, &mut sink)?;
-        return Ok((Vec::new(), sink.0, None));
+        state.searcher.search_path(matcher, &full, &mut sink)?;
+        if sink.0 {
+            return Ok((format!("{}\n", rel.display()).into_bytes(), true, None));
+        }
+        return Ok((Vec::new(), false, None));
     }
     let mut buf = Vec::new();
     let matched;
@@ -202,7 +261,7 @@ fn search_one(
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_path(matcher, &full, &mut sink)?;
+        state.searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else {
@@ -210,88 +269,306 @@ fn search_one(
             .heading(false)
             .build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, rel);
-        searcher.search_path(matcher, &full, &mut sink)?;
+        state.searcher.search_path(matcher, &full, &mut sink)?;
         matched = sink.has_match();
     }
     Ok((buf, matched, stats))
 }
 
+/// Worker loop: claim indices from the shared cursor, search each file with
+/// the thread-local reusable state, and send the finished result to the
+/// printer thread. Errors from individual files keep rg's behavior: warn on
+/// stderr, treat as unmatched, keep going (and still send the result so
+/// in-order printing never stalls). The bounded channel blocks a worker
+/// only when the printer is a full window behind — bounded memory, and it
+/// never blocks the *other* workers.
+fn worker(
+    cursor: &AtomicUsize,
+    tx: &SyncSender<Done>,
+    state: &mut WorkerState,
+    matcher: &grep_regex::RegexMatcher,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+) {
+    loop {
+        let idx = cursor.fetch_add(1, Ordering::Relaxed);
+        if idx >= files.len() {
+            return;
+        }
+        let rel = &files[idx];
+        let (buf, matched, stats) = match search_one(state, matcher, root, rel, opts) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("glep: {}: {}", rel.display(), e);
+                (Vec::new(), false, None)
+            }
+        };
+        if tx
+            .send(Done {
+                idx,
+                buf,
+                matched,
+                stats,
+            })
+            .is_err()
+        {
+            return; // printer gone: nothing left to do
+        }
+    }
+}
+
+/// Printer-thread state: a bounded ring of finished-but-not-yet-printed
+/// results plus the running cursor of the next index to emit. Ring safety:
+/// at most `window + workers` results can exist outside the printer at
+/// once (the bounded channel holds `window`; each worker holds one more
+/// mid-send), so the ring is sized accordingly and a slot is only reused
+/// after its occupant was printed.
+struct Printer {
+    next: usize,
+    ring: Vec<Option<Done>>,
+    ring_mask: usize,
+    total: usize,
+    separate: bool,
+    printed_any: bool,
+    found: bool,
+    total_stats: grep_printer::Stats,
+}
+
+impl Printer {
+    fn new(separate: bool, window: usize, workers: usize, total: usize) -> Printer {
+        let cap = (window + workers + 1).next_power_of_two();
+        Printer {
+            next: 0,
+            ring: (0..cap).map(|_| None).collect(),
+            ring_mask: cap - 1,
+            total,
+            separate,
+            printed_any: false,
+            found: false,
+            total_stats: grep_printer::Stats::new(),
+        }
+    }
+
+    fn stash_then_drain(
+        &mut self,
+        d: Done,
+        out: &mut (dyn std::io::Write + Send),
+    ) -> anyhow::Result<()> {
+        let slot = d.idx & self.ring_mask;
+        debug_assert!(
+            self.ring[slot].is_none(),
+            "ring slot overwritten before drain"
+        );
+        self.ring[slot] = Some(d);
+        self.drain(out)
+    }
+
+    /// Emit every result that is now consecutively available, in index
+    /// order. Called after each stash and once more at channel close.
+    fn drain(&mut self, out: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
+        while self.next < self.total {
+            let d = match self.ring[self.next & self.ring_mask].take() {
+                Some(d) => d,
+                None => break,
+            };
+            self.emit(d, out)?;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, d: Done, out: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
+        let Done {
+            idx,
+            buf,
+            matched,
+            stats,
+        } = d;
+        debug_assert_eq!(idx, self.next, "printer must emit in order");
+        self.next += 1;
+        if matched {
+            self.found = true;
+        }
+        emit_result(
+            out,
+            &buf,
+            matched,
+            &stats,
+            self.separate,
+            &mut self.printed_any,
+            &mut self.total_stats,
+        )?;
+        Ok(())
+    }
+}
+
+fn finish_json(
+    out: &mut (dyn std::io::Write + Send),
+    total_stats: &mut grep_printer::Stats,
+    elapsed: Duration,
+) -> anyhow::Result<()> {
+    // Per design: both `elapsed_total` and `stats.elapsed` are filled
+    // from this single measured wall-clock duration for the whole run,
+    // rather than trying to reproduce rg's internal split between
+    // "time summing individual per-file searches" (its `stats.elapsed`)
+    // and "total process wall time" (its `elapsed_total`). Both fields
+    // are masked out of tests/json_parity.rs's comparison, so this
+    // simplification is safe; `merge_stats` above deliberately never
+    // touches `elapsed`, so this is the only place it's set.
+    total_stats.add_elapsed(elapsed);
+    let event = SummaryEvent {
+        kind: "summary",
+        data: SummaryData {
+            elapsed_total: NiceDuration::from(elapsed),
+            stats: total_stats.clone(),
+        },
+    };
+    writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    Ok(())
+}
+
+/// Thread-safe stdout adapter: `StdoutLock` guards are not `Send`, but
+/// `run` hands the writer to worker threads. `Stdout` itself is `Sync`;
+/// locking per write call is fine here because the pipeline already emits
+/// one buffered write per file.
+pub struct StdoutOut;
+
+impl std::io::Write for StdoutOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stdout().lock().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().lock().flush()
+    }
+}
+
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
 /// in input order for determinism. Returns true if anything matched.
+///
+/// Parallel design (v2): workers pull file indices off a shared atomic
+/// cursor — no per-chunk barriers like the old `chunks(128)` loop, so one
+/// slow file never stalls the whole fleet. A dedicated printer thread
+/// receives results over a bounded channel and emits them strictly in
+/// index order (a classic in-order completion queue), so stdout stays
+/// byte-identical to `rg --sort path`-style deterministic output while the
+/// search itself runs at rg's unordered parallel throughput. No worker
+/// ever holds a lock while writing to stdout. Each worker owns one
+/// reusable `Searcher` (buffers included), mirroring ripgrep's per-thread
+/// SearchWorker reuse.
 pub fn run(
     pattern: &str,
     root: &Path,
     files: &[PathBuf],
     opts: &SearchOpts,
-    out: &mut dyn std::io::Write,
+    out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
     // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
     let start = Instant::now();
-    // Build the matcher once up front; shared by reference across the rayon
-    // closure (grep_regex::RegexMatcher is Sync). This also validates the
+    // Build the matcher once up front; shared by reference across the
+    // workers (grep_regex::RegexMatcher is Sync). This also validates the
     // pattern before I/O, matching prior behavior.
     let matcher = build_matcher(pattern, opts)?;
-    let mut found = false;
-    let separate =
-        (opts.before > 0 || opts.after > 0) && !opts.files_with_matches && !opts.json && !opts.count;
-    let mut printed_any = false;
-    let mut base = 0usize;
-    let mut total_stats = grep_printer::Stats::new();
-    for chunk in files.chunks(128) {
-        let mut results: Vec<(usize, Vec<u8>, bool, Option<grep_printer::Stats>)> = chunk
-            .par_iter()
-            .enumerate()
-            .map(|(i, rel)| match search_one(&matcher, root, rel, opts) {
-                Ok((buf, matched, stats)) => (i, buf, matched, stats),
+    let separate = (opts.before > 0 || opts.after > 0)
+        && !opts.files_with_matches
+        && !opts.json
+        && !opts.count;
+
+    if files.len() <= 32 {
+        // Small workloads: stay on this thread, one reusable searcher,
+        // zero synchronization. This is the agent-small-repo fast path.
+        let mut state = WorkerState::new(opts);
+        let mut found = false;
+        let mut printed_any = false;
+        let mut total_stats = grep_printer::Stats::new();
+        for rel in files {
+            let (buf, matched, stats) = match search_one(&mut state, &matcher, root, rel, opts) {
+                Ok(r) => r,
                 Err(e) => {
                     eprintln!("glep: {}: {}", rel.display(), e);
-                    (i, Vec::new(), false, None)
+                    (Vec::new(), false, None)
                 }
-            })
-            .collect();
-        results.sort_by_key(|(i, _, _, _)| *i);
-        for (i, buf, matched, stats) in results {
-            if let Some(s) = &stats {
-                merge_stats(&mut total_stats, s);
-            }
+            };
+            emit_result(
+                out,
+                &buf,
+                matched,
+                &stats,
+                separate,
+                &mut printed_any,
+                &mut total_stats,
+            )?;
             if matched {
                 found = true;
-                let global_i = base + i;
-                if opts.files_with_matches {
-                    writeln!(out, "{}", files[global_i].display())?;
-                } else {
-                    if separate && printed_any {
-                        writeln!(out, "--")?;
-                    }
-                    out.write_all(&buf)?;
-                    printed_any = true;
-                }
             }
         }
-        base += chunk.len();
+        if opts.json {
+            finish_json(out, &mut total_stats, start.elapsed())?;
+        }
+        return Ok(found);
     }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(files.len());
+    // The channel capacity is the memory bound: at most this many file
+    // output buffers (plus one per worker in flight) exist at once.
+    let window = (workers * 16).max(64);
+    let (tx, rx) = sync_channel::<Done>(window);
+
+    // Declared outside the scope so worker borrows outlive it.
+    let cursor = AtomicUsize::new(0);
+    let mut printer_result = None;
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        // Printer thread: the only writer to `out`; workers are free to
+        // keep searching while it prints.
+        let printer_out = &mut *out;
+        let mut printer = Printer::new(separate, window, workers, files.len());
+        let printer_handle = scope.spawn(move || -> anyhow::Result<Printer> {
+            run_printer(rx, &mut printer, printer_out)?;
+            Ok(printer)
+        });
+        let cursor_ref = &cursor;
+        let matcher_ref = &matcher;
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let mut state = WorkerState::new(opts);
+            let tx = tx.clone();
+            handles.push(scope.spawn(move || {
+                worker(cursor_ref, &tx, &mut state, matcher_ref, root, files, opts);
+            }));
+        }
+        for h in handles {
+            h.join().expect("search worker panicked");
+        }
+        // All workers are done (their sender clones dropped); drop OUR
+        // sender so the printer's recv loop terminates after draining,
+        // then collect the printer's final state.
+        drop(tx);
+        printer_result = Some(printer_handle.join().expect("printer thread panicked")?);
+        Ok(())
+    })?;
+    let mut printer = printer_result.expect("printer state collected");
+
     if opts.json {
-        // Per design: both `elapsed_total` and `stats.elapsed` are filled
-        // from this single measured wall-clock duration for the whole run,
-        // rather than trying to reproduce rg's internal split between
-        // "time summing individual per-file searches" (its `stats.elapsed`)
-        // and "total process wall time" (its `elapsed_total`). Both fields
-        // are masked out of tests/json_parity.rs's comparison, so this
-        // simplification is safe; `merge_stats` above deliberately never
-        // touches `elapsed`, so this is the only place it's set.
-        let elapsed = start.elapsed();
-        total_stats.add_elapsed(elapsed);
-        let event = SummaryEvent {
-            kind: "summary",
-            data: SummaryData {
-                elapsed_total: NiceDuration::from(elapsed),
-                stats: total_stats,
-            },
-        };
-        writeln!(out, "{}", serde_json::to_string(&event)?)?;
+        finish_json(out, &mut printer.total_stats, start.elapsed())?;
     }
-    Ok(found)
+    Ok(printer.found)
+}
+
+/// Printer loop: receive results until the channel closes (all senders
+/// dropped), then drain anything still buffered so no tail results are
+/// lost, and emit everything strictly in index order.
+fn run_printer(
+    rx: Receiver<Done>,
+    printer: &mut Printer,
+    out: &mut (dyn std::io::Write + Send),
+) -> anyhow::Result<()> {
+    while let Ok(d) = rx.recv() {
+        printer.stash_then_drain(d, out)?;
+    }
+    printer.drain(out)
 }
 
 #[cfg(test)]
@@ -362,5 +639,129 @@ mod tests {
         o.case_insensitive = true;
         let mut out = Vec::new();
         assert!(run("HELLO", dir.path(), &files, &o, &mut out).unwrap());
+    }
+
+    /// The parallel path (files.len() > 32) must produce byte-identical
+    /// output to the sequential path: build 100 files with a known match
+    /// pattern and compare against the expected ordered bytes.
+    #[test]
+    fn parallel_output_matches_expected_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut expect = String::new();
+        for i in 0..100 {
+            let name = format!("f{:03}.txt", i);
+            let content = if i % 3 == 0 {
+                format!("line one\nneedle here {}\nline three\n", i)
+            } else {
+                format!("file {} has no matches\n", i)
+            };
+            std::fs::write(dir.path().join(&name), content).unwrap();
+            let expect_name = name.clone();
+            files.push(PathBuf::from(name));
+            if i % 3 == 0 {
+                expect.push_str(&format!("{}:2:needle here {}\n", expect_name, i));
+            }
+        }
+        let mut out = Vec::new();
+        assert!(run("needle", dir.path(), &files, &opts(), &mut out).unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), expect);
+    }
+
+    /// -l through the parallel path must print one path per matched file,
+    /// in order.
+    #[test]
+    fn parallel_files_with_matches_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut expect = String::new();
+        for i in 0..80 {
+            let name = format!("h{:03}.txt", i);
+            let content = if i % 7 == 0 { "has needle\n" } else { "nope\n" };
+            std::fs::write(dir.path().join(&name), content).unwrap();
+            let expect_name = name.clone();
+            files.push(PathBuf::from(name));
+            if i % 7 == 0 {
+                expect.push_str(&expect_name);
+                expect.push('\n');
+            }
+        }
+        let mut o = opts();
+        o.files_with_matches = true;
+        let mut out = Vec::new();
+        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), expect);
+    }
+
+    /// -c through the parallel path: per-file counts, ordered.
+    #[test]
+    fn parallel_count_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut expect = String::new();
+        for i in 0..64 {
+            let name = format!("k{:03}.txt", i);
+            let n = i % 4; // 0..=3 matches
+            let content: String = std::iter::repeat("needle line\n")
+                .take(n)
+                .collect::<Vec<_>>()
+                .join("");
+            std::fs::write(dir.path().join(&name), content).unwrap();
+            let expect_name = name.clone();
+            files.push(PathBuf::from(name));
+            if n > 0 {
+                expect.push_str(&format!("{}:{}\n", expect_name, n));
+            }
+        }
+        let mut o = opts();
+        o.count = true;
+        let mut out = Vec::new();
+        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
+        assert_eq!(String::from_utf8(out).unwrap(), expect);
+    }
+
+    /// Context mode through the parallel path must reproduce the exact
+    /// `rg --sort path -n -C1` byte stream (including `-path-line-`
+    /// context lines and `--` separators between files).
+    #[test]
+    fn parallel_context_matches_rg_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..60 {
+            let name = format!("g{:02}.txt", i);
+            let content = if i % 5 == 0 {
+                format!("before\nneedle {}\nafter\n", i)
+            } else {
+                format!("no match {}\nnothing\n", i)
+            };
+            std::fs::write(dir.path().join(&name), content).unwrap();
+            files.push(PathBuf::from(name));
+        }
+        let mut o = opts();
+        o.before = 1;
+        o.after = 1;
+        let mut out = Vec::new();
+        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
+
+        // Ground truth: real rg with sorted output in the same tree.
+        let rg = std::process::Command::new("rg")
+            .arg("-n")
+            .arg("--sort")
+            .arg("path")
+            .arg("-C")
+            .arg("1")
+            .arg("needle")
+            .current_dir(dir.path())
+            .output()
+            .expect("rg must be installed for parity tests");
+        assert!(
+            rg.status.success(),
+            "rg failed: {}",
+            String::from_utf8_lossy(&rg.stderr)
+        );
+        assert_eq!(
+            out, rg.stdout,
+            "glep parallel -C1 output must match rg --sort path -C1"
+        );
     }
 }

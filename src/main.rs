@@ -1,4 +1,5 @@
 mod cli;
+mod dircache;
 mod index;
 mod plan;
 mod search;

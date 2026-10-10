@@ -1,11 +1,11 @@
-use crate::index::Index;
 use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use crate::index::Index;
 use crate::timing::Timings;
 use crate::{plan, search, walk};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "glep", version, about = "Indexed grep + glob for AI agents")]
 pub struct Args {
     /// Pattern, or the subcommands: index, status
@@ -127,6 +127,96 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args) -> anyhow::Result<()> {
 /// in walk.rs), so the result is not re-filtered by hidden here. The
 /// existing positional-path/glob/type filters (`apply_filters`, already
 /// normalized by the caller) and exit-code conventions are unchanged.
+/// Print `files` one per line, buffered: stdout is a LineWriter, so a
+/// per-path println! costs one flush syscall per line (27k syscalls on a
+/// kernel-scale .c listing). Build the whole block and write it once.
+fn print_paths_batched(files: &[PathBuf]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(files.len() * 48);
+    for f in files {
+        // Raw bytes: Path::display().to_string() goes through the fmt
+        // machinery per path (~0.7µs each, ~20ms for a kernel-scale .c
+        // listing); the bytes are identical for the paths we emit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            buf.extend_from_slice(f.as_os_str().as_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            let s = f.display().to_string();
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf.push(b'\n');
+    }
+    std::io::stdout().write_all(&buf)?;
+    Ok(())
+}
+
+/// macOS-only fast listing via the dir-mtime cache (see dircache.rs):
+/// load the cached tree, verify the ignore-source fingerprint, run the
+/// pruned walk (zero-clone: cache-hit entries borrow the loaded tree),
+/// filter the result with `keep`, save the rebuilt tree if anything
+/// changed, and return the matching paths (unsorted; caller sorts).
+/// None = cache miss for any reason: caller falls back to the full
+/// freshness-sweep path. Filtering inside keeps the loaded tree's
+/// ownership local to this function.
+#[cfg(target_os = "macos")]
+fn listing_via_cache<F>(
+    root: &Path,
+    index_dir: &Path,
+    keep: F,
+    timings: &mut Timings,
+) -> Option<Vec<PathBuf>>
+where
+    F: Fn(&crate::walk::FileMeta) -> bool + Sync,
+{
+    let t0 = std::time::Instant::now();
+    let tree = crate::dircache::DirTree::load(index_dir)?;
+    let t1 = std::time::Instant::now();
+    if !tree.fingerprint_matches(root) {
+        return None;
+    }
+    let outcome = crate::walk_bulk::sweep_bulk_listing(root, Some(&tree.root)).ok()?;
+    if outcome.aborted {
+        return None;
+    }
+    let t_cmp = std::time::Instant::now();
+    let changed = outcome.tree != tree.root;
+    if std::env::var_os("GLEP_TIMING").is_some() {
+        eprintln!(
+            "glep timing: tree compare {:.1}ms ({changed})",
+            t_cmp.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if changed {
+        let updated = crate::dircache::DirTree {
+            schema: crate::dircache::SCHEMA,
+            fingerprint: tree.fingerprint.clone(),
+            root: outcome.tree,
+        };
+        let _ = updated.save(index_dir);
+    }
+    // Parallel filter: 86k globset matches on a kernel-scale tree cost
+    // ~15ms serial, ~2ms across the pool.
+    use rayon::prelude::*;
+    let matched: Vec<PathBuf> = outcome
+        .files
+        .par_iter()
+        .filter(|m| keep(m))
+        .map(|m| m.path.clone())
+        .collect();
+    timings.stage("listing_cache_walk");
+    if std::env::var_os("GLEP_TIMING").is_some() {
+        eprintln!(
+            "glep timing: cache load {:.1}ms, pruned walk+filter {:.1}ms",
+            t1.duration_since(t0).as_secs_f64() * 1000.0,
+            t1.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Some(matched)
+}
+
 fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Result<i32> {
     let mut files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden)?
         .into_iter()
@@ -141,9 +231,7 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
             files.retain(|f| glob.is_match(f));
         }
         apply_filters(&mut files, args)?;
-        for f in &files {
-            println!("{}", f.display());
-        }
+        print_paths_batched(&files)?;
         timings.finish();
         return Ok(if files.is_empty() { 1 } else { 0 });
     }
@@ -167,9 +255,8 @@ fn run_no_ignore(root: &Path, args: &Args, timings: &mut Timings) -> anyhow::Res
         count: args.count,
         multiline: args.multiline,
     };
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let found = search::run(&pattern, root, &files, &opts, &mut lock)?;
+    let mut out = search::StdoutOut;
+    let found = search::run(&pattern, root, &files, &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
     Ok(if found { 0 } else { 1 })
@@ -193,19 +280,22 @@ pub fn run() -> anyhow::Result<i32> {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;
-                eprintln!("glep: indexed {} files", idx.manifest.live_entries().count());
+                eprintln!(
+                    "glep: indexed {} files",
+                    idx.manifest.live_entries().count()
+                );
                 return Ok(0);
             }
             Some("status") => {
                 let mut idx = Index::open_or_build(&root, args.max_filesize)?;
-                if !idx.read_only { idx.update(args.max_filesize, 0)?; }
+                if !idx.read_only {
+                    idx.update(args.max_filesize, 0)?;
+                }
                 let live = idx.manifest.live_entries().count();
                 let skipped = idx
                     .manifest
                     .live_entries()
-                    .filter(|e| {
-                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0
-                    })
+                    .filter(|e| e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0)
                     .count();
                 println!("files: {live}");
                 println!("skipped (binary/oversized): {skipped}");
@@ -222,8 +312,45 @@ pub fn run() -> anyhow::Result<i32> {
         return run_no_ignore(&root, &args, &mut timings);
     }
 
+    // Dir-mtime cached listing (macOS only), consulted BEFORE even
+    // opening the index: this path needs no manifest, no postings, no
+    // freshness sweep — just the cache and the pruned walk. The index
+    // opens below only on cache miss.
+    #[cfg(target_os = "macos")]
+    if args.files {
+        // Hidden flag + positional pattern slot as a glob.
+        let hidden = args.hidden;
+        let mut glob_matcher = None;
+        if let Some(g) = args.pattern.clone() {
+            glob_matcher = Some(build_glob(&g)?);
+        }
+        let keep = move |m: &crate::walk::FileMeta| -> bool {
+            if !hidden && m.hidden {
+                return false;
+            }
+            match &glob_matcher {
+                Some(g) => g.is_match(&m.path),
+                None => true,
+            }
+        };
+        if let Some(mut files) = listing_via_cache(&root, &root.join(".glep"), keep, &mut timings) {
+            let args2 = Args {
+                pattern: None,
+                ..args.clone()
+            };
+            apply_filters(&mut files, &args2)?;
+            use rayon::prelude::*;
+            files.par_sort();
+            print_paths_batched(&files)?;
+            timings.stage("listing_cache");
+            timings.finish();
+            return Ok(if files.is_empty() { 1 } else { 0 });
+        }
+    }
+
     let mut idx = Index::open_or_build(&root, args.max_filesize)?;
     timings.stage("index_open");
+
     let mut extra = idx.update_timed(args.max_filesize, args.ttl, &mut timings)?;
     // `extra` is the read-only-mode live-scan fallback: files discovered by
     // this sweep that couldn't be written into the index because another
@@ -236,7 +363,7 @@ pub fn run() -> anyhow::Result<i32> {
 
     if args.files {
         let mut files = idx.live_files(args.hidden);
-        files.extend(extra);
+        files.extend(extra.clone());
         files.sort();
         files.dedup();
         // With --files the pattern slot is the glob.
@@ -244,12 +371,28 @@ pub fn run() -> anyhow::Result<i32> {
             let glob = build_glob(g)?;
             files.retain(|f| glob.is_match(f));
         }
-        let args2 = Args { pattern: None, ..args };
+        let args2 = Args {
+            pattern: None,
+            ..args
+        };
         apply_filters(&mut files, &args2)?;
-        for f in &files {
-            println!("{}", f.display());
-        }
+        print_paths_batched(&files)?;
         timings.finish();
+        // Rebuild the listing cache from the authoritative sweep (macOS
+        // only; skip when the read-only fallback contributed files, they
+        // are not part of a cacheable coherent tree view).
+        #[cfg(target_os = "macos")]
+        {
+            if extra.is_empty() {
+                let listing = idx.live_file_metas(true);
+                let tree = crate::dircache::build_from_listing(
+                    &root,
+                    &listing,
+                    crate::dircache::source_fingerprint(&root),
+                );
+                let _ = tree.save(&idx.dir);
+            }
+        }
         return Ok(if files.is_empty() { 1 } else { 0 });
     }
 
@@ -278,9 +421,8 @@ pub fn run() -> anyhow::Result<i32> {
         count: args.count,
         multiline: args.multiline,
     };
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let found = search::run(&pattern, &root, &files, &opts, &mut lock)?;
+    let mut out = search::StdoutOut;
+    let found = search::run(&pattern, &root, &files, &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
     Ok(if found { 0 } else { 1 })
