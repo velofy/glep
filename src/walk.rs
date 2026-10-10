@@ -218,6 +218,23 @@ fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 /// rg-speed cost, every time, by design), not the hot path that fast path
 /// exists to speed up.
 pub fn sweep_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+    // macOS fast path: getattrlistbulk with every ignore source absent
+    // (one bulk stat per directory instead of the walker's per-file
+    // metadata). Same kill-switch and fallback posture as `sweep`.
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+            match crate::walk_bulk::sweep_bulk_unfiltered(root, include_hidden) {
+                Ok(mut v) => {
+                    v.sort_by(|a, b| a.path.cmp(&b.path));
+                    return Ok(v);
+                }
+                Err(e) => {
+                    eprintln!("glep: bulk sweep failed ({e}), falling back to walker sweep");
+                }
+            }
+        }
+    }
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",

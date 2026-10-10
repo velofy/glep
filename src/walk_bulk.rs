@@ -1192,3 +1192,103 @@ fn emit_cached<'a>(n: &'a crate::dircache::DirNode, out: &mut Vec<std::borrow::C
         emit_cached(s, out);
     }
 }
+
+// ---------------------------------------------------------------------
+// --no-ignore bulk sweep: same getattrlistbulk traversal with EVERY
+// ignore source deliberately absent (no matcher stack, no .gitignore
+// handling, no divergence abort). The only filtering left is the hard
+// .git/.glep exclusion and, when include_hidden is false, dot-prefixed
+// entries — mirroring `walk::sweep_unfiltered`'s walker configuration
+// (.ignore(false) .git_ignore(false) .git_global(false) .git_exclude(false)
+// .parents(false) .hidden(!include_hidden)). The old path paid the
+// `ignore` crate's per-file DirEntry metadata on top of the search; this
+// collapses discovery to one bulk stat per directory.
+// ---------------------------------------------------------------------
+
+struct UnfilteredCtx {
+    include_hidden: bool,
+    files: Vec<Mutex<Vec<FileMeta>>>,
+    fatal: Mutex<Option<anyhow::Error>>,
+}
+
+pub fn sweep_bulk_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
+    anyhow::ensure!(
+        root.is_dir(),
+        "{}: No such file or directory (os error 2)",
+        root.display()
+    );
+    let num_slots = rayon::current_num_threads().max(1);
+    let ctx = UnfilteredCtx {
+        include_hidden,
+        files: (0..num_slots).map(|_| Mutex::new(Vec::new())).collect(),
+        fatal: Mutex::new(None),
+    };
+    rayon::scope(|scope| {
+        scan_unfiltered(scope, root, root.to_path_buf(), &ctx);
+    });
+    if let Some(e) = ctx.fatal.lock().unwrap().take() {
+        return Err(e);
+    }
+    let mut all: Vec<FileMeta> = Vec::new();
+    for buf in &ctx.files {
+        all.extend(buf.lock().unwrap().iter().cloned());
+    }
+    Ok(all)
+}
+
+fn scan_unfiltered<'a>(
+    scope: &rayon::Scope<'a>,
+    root: &'a Path,
+    dir: PathBuf,
+    ctx: &'a UnfilteredCtx,
+) {
+    let scan = match bulk_scan_dir(&dir) {
+        Ok(s) => s,
+        Err(ScanError::Soft(msg)) => {
+            eprintln!("glep: {msg}");
+            return;
+        }
+        Err(ScanError::Fatal(e)) => {
+            let mut slot = ctx.fatal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(e);
+            }
+            return;
+        }
+    };
+    let slot_idx = rayon::current_thread_index().unwrap_or(0) % ctx.files.len().max(1);
+    {
+        let mut out = ctx.files[slot_idx].lock().unwrap();
+        for entry in &scan.files {
+            // Hidden gating only; ignore rules are entirely absent in this
+            // mode, and .git/.glep are hard-excluded below either way.
+            if !ctx.include_hidden && entry.name.as_encoded_bytes().first() == Some(&b'.') {
+                continue;
+            }
+            if is_hard_excluded(&entry.name) {
+                continue;
+            }
+            let abs = dir.join(&entry.name);
+            let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
+            let hidden = crate::walk::path_is_hidden(&rel);
+            out.push(FileMeta {
+                path: rel,
+                mtime_ns: entry.mtime_ns,
+                size: entry.size,
+                hidden,
+            });
+        }
+    }
+    for sub in scan.subdirs {
+        if !ctx.include_hidden && sub.name.as_encoded_bytes().first() == Some(&b'.') {
+            continue;
+        }
+        if is_hard_excluded(&sub.name) {
+            continue;
+        }
+        let abs = dir.join(&sub.name);
+        scope.spawn(|scope| {
+            scan_unfiltered(scope, root, abs, ctx);
+        });
+    }
+}
