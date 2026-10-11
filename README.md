@@ -14,7 +14,7 @@
 
 Documentation: **https://velofy.co/glep/**
 
-ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers rare-pattern queries in 28 to 113 ms on a Linux-kernel-sized tree where ripgrep — at its fastest, default parallel mode — takes 2.1 s, with text output byte-compatible with ripgrep's, enforced by a differential harness in CI. No daemon. Every mode beats or ties rg at its fastest: listings too (`--files` outruns both `rg --files` and `fd`).
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
 
 ## Install
 
@@ -88,20 +88,20 @@ Stick with rg / fd for:
 
 ## Numbers
 
-Linux kernel 6.12 checkout: 86,605 files, ~1.6 GB. Apple Silicon macOS, hyperfine, warm filesystem cache. **rg is measured at its default parallel mode — its fastest** — not the ~4x-slower single-threaded `--sort path` variant the byte-parity harnesses use.
+Linux kernel 6.12 source tree (a tarball extract, not a git checkout): 86,604 files, 86,218 of them searched, 1.6 GB. Apple M3 Pro, macOS, glep 0.3.1 (the code on this branch), rg 15.0 and fd 10.4 at their default parallelism, hyperfine means of 5 to 10 runs after warmup, warm filesystem cache, with other work running on the machine. glep's numbers did not move between sessions. rg's full scan did, from 1.3 s on its best run to 3.5 s under load, so the rg column shows the observed spread and every ratio is a lower bound, rounded down: indexed rows are compared against rg's fastest full scan (1.3 s), full-scan rows against the row's own fastest rg run.
 
-| Scenario | glep | glep --ttl | ripgrep | vs rg |
+| Scenario | glep | glep --ttl 60 | ripgrep | glep vs rg (lower bound) |
 |---|---|---|---|---|
-| Rare pattern | 113 ms | 28 ms | 2.09 s | **18x / 74x** |
-| Rare, files-with-matches (`-l`) | 104 ms | — | 2.23 s | **21x** |
-| Rare, case-insensitive (`-i`) | 115 ms | — | 2.13 s | **18x** |
-| Rare, multiline (`-U`) | — | 111 ms | 2.07 s | **19x** |
-| Rare, context (`-C 2`) | — | 22 ms | 2.45 s | **110x** |
-| Common pattern (`static`) | 1.50 s | 0.97-1.01 s | 1.95-2.35 s | **1.3-2.3x** |
-| Single char, no trigram (`q`) | — | 2.0 s | 1.98-2.3 s | parity to 1.1x |
-| List all .c files (`--files`) | 64-76 ms | 64 ms | rg 74-84 ms, fd 89 ms | **1.1-1.2x vs both** |
+| Rare pattern (46 lines in 11 files) | 172 ms | 21 ms | 1.3 to 3.5 s | 7x / 61x |
+| Rare pattern with `-l`, `-i`, `-U` or `-C 2` | 171 to 177 ms | 20 to 27 ms | 2.9 to 3.7 s under load | 7x / 48x |
+| Common pattern (`EXPORT_SYMBOL_GPL`, 20k lines in 3.5k files) | 234 ms | 81 ms | 2.6 to 3.7 s under load | 5x / 16x |
+| Very common pattern (`static`, 831k lines in 40k files) | 1.69 s | 1.37 s | 2.5 to 3.4 s | 1.5x / 1.8x |
+| Single char `q` (no trigram, full scan) | 3.36 s | 3.13 s | 2.8 to 3.3 s | 0.8x / 0.8x |
+| List all .c files (`--files`, 34,657 files) | 195 ms | 45 ms | rg --files 71 ms, fd 74 ms | 0.3x / 1.5x |
 
-Index build (one-time): 24 s. Index size: 154 MB (~10% of corpus) plus a 7 MB listing cache. Every mode beats or ties rg at rg's fastest. Patterns shorter than 3 bytes (or otherwise trigram-free, like `.*`) cannot be narrowed by any trigram index, so glep matches rg's full-scan speed there and still edges it via the mmap + worker-pool scanner. Default glep pays the self-healing freshness sweep (one bulk-stat per directory) on each query; `--ttl` amortizes it across read bursts; `--files` answers from the dir-mtime listing cache — interior directories re-verified, unchanged leaf directories pruned — without opening the index. Details: [Benchmarks](https://velofy.co/glep/benchmarks/).
+Index build (one-time): 28 s. Index size: 154 MB, about 10% of the corpus. Default glep pays the self-healing freshness sweep on each query: on macOS one bulk attribute call per directory, elsewhere a stat per file. `--ttl` skips the sweep inside a read burst, which is the 20 to 81 ms column. Patterns shorter than three bytes, or otherwise trigram-free like `.*`, cannot be narrowed by any trigram index, so glep falls back to a full parallel scan and runs at ripgrep speed (the `q` row). Listings read the manifest after the sweep, so `--files` only beats `rg --files` and `fd` inside a `--ttl` window. On a small 86-file Python repository both tools answer in single-digit milliseconds (glep 4.5 ms, rg 7.0 ms; `--files` 3.4 ms against `rg --files` 4.9 ms and `fd` 7.5 ms), so the index pays off at scale, not on small trees.
+
+A perf branch not yet on main (worker-pool search with one reusable searcher per thread, zero-copy mmap verification, parallel freshness diff, dir-mtime listing cache) was measured in the same sessions on the same corpus: rare pattern 97 ms (24 ms with `--ttl`), common pattern 152 ms (76 ms), `static` 1.50 s (1.28 s), `--files` 61 ms with or without `--ttl`, ahead of `rg --files` (71 ms) and `fd` (74 ms). This table will be updated when it lands. Details: [Benchmarks](https://velofy.co/glep/benchmarks/).
 
 ## Documentation
 
@@ -125,6 +125,8 @@ cargo build
 PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
 PATH="$PWD/target/debug:$PATH" cursor/hooks/test_hook.sh
 ```
+
+Benchmarks: `bench/bench.sh /path/to/big/repo 'pattern' ['*.rs']` needs hyperfine and rg on PATH; fd is optional. For one pattern it runs the plain, `-l`, `-i`, `-U` and `-C 2` rows of the Numbers table plus the listing row.
 
 CI also rejects em dash and en dash characters anywhere in the repository.
 
