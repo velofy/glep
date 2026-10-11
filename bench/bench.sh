@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Compare glep vs rg (content) and fd (listing) on a target directory.
+# Compare glep vs rg at rg's FASTEST (default parallel mode, no --sort) on a
+# target directory. rg --sort path is ~4x slower than rg's default and is
+# only needed for byte-parity harnesses, not speed benches.
 # Usage: bench/bench.sh /path/to/big/repo 'some_pattern'
 set -euo pipefail
 TARGET="${1:?usage: bench.sh <dir> <pattern>}"
@@ -10,7 +12,11 @@ glep index
 hyperfine --warmup 2 \
   "glep '$PATTERN'" \
   "glep --ttl 60 '$PATTERN'" \
-  "rg -n --no-heading --color=never --sort path --no-require-git '$PATTERN'"
+  "glep --ttl 60 -l '$PATTERN'" \
+  "rg '$PATTERN'" \
+  "rg -l '$PATTERN'" \
+  "glep --ttl 60 -U '$PATTERN'" \
+  "rg -U '$PATTERN'"
 hyperfine --warmup 2 \
   "glep --files '**/*.rs'" \
-  "fd -e rs"
+  "rg --files -g '*.rs'"
