@@ -20,8 +20,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://anishfyi.github.io/glep/"
-Repository = "https://github.com/anishfyi/glep"
+Homepage = "https://velofy.co/glep/"
+Documentation = "https://velofy.co/glep/"
+Repository = "https://github.com/velofy/glep"
+Changelog = "https://velofy.co/glep/changelog/"
 
 [tool.maturin]
 bindings = "bin"

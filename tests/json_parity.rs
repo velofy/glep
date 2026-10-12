@@ -42,7 +42,11 @@ fn corpus() -> tempfile::TempDir {
         "# demo\nhello and goodbye\nfoo bar baz\n",
     )
     .unwrap();
-    std::fs::write(dir.path().join("notes.txt"), "hello there\ngeneral kenobi\n").unwrap();
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "hello there\ngeneral kenobi\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -160,11 +164,13 @@ fn json_summary_matches_rg_structurally() {
             "stats.matches diverged for {pattern:?}"
         );
         assert_eq!(
-            g_summary["data"]["stats"]["matched_lines"], r_summary["data"]["stats"]["matched_lines"],
+            g_summary["data"]["stats"]["matched_lines"],
+            r_summary["data"]["stats"]["matched_lines"],
             "stats.matched_lines diverged for {pattern:?}"
         );
         assert_eq!(
-            g_summary["data"]["stats"]["bytes_printed"], r_summary["data"]["stats"]["bytes_printed"],
+            g_summary["data"]["stats"]["bytes_printed"],
+            r_summary["data"]["stats"]["bytes_printed"],
             "stats.bytes_printed diverged for {pattern:?}"
         );
 
