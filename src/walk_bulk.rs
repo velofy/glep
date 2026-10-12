@@ -779,7 +779,7 @@ pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 // Produces the same file listing `sweep_bulk` would, but consults a
 // `DirNode` cache: interior directories are listed live (directory mtimes
 // never propagate upward, so only a leaf's own mtime certifies its whole
-// entry set — see dircache.rs), while each LEAF directory whose mtime
+// entry set, see dircache.rs), while each LEAF directory whose mtime
 // matches the parent's cached observation is emitted from cache without a
 // syscall. Runs sequentially; on heavy churn the RESCAN_BUDGET abort
 // hands off to the parallel full sweep, which also rebuilds the cache.
@@ -789,7 +789,7 @@ pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 struct ListingCtx<'a> {
     /// Per-worker output buffers (same pattern as `sweep_bulk`'s buffers):
     /// lock-free accumulation, merged once at the end. Entries from pruned
-    /// (cache-hit) subtrees are BORROWED from the cached tree — zero
+    /// (cache-hit) subtrees are BORROWED from the cached tree, zero
     /// clones for the 86k-file common case; only live-scanned entries are
     /// owned.
     files: Vec<Mutex<Vec<std::borrow::Cow<'a, FileMeta>>>>,
@@ -917,7 +917,7 @@ pub fn sweep_bulk_listing<'a>(
 
 /// Attach every completed node to its parent. Nodes are keyed by their
 /// own rel and processed deepest-first, each TAKEN OUT of the map and
-/// moved into its parent — no clones anywhere, so a parent always folds
+/// moved into its parent, no clones anywhere, so a parent always folds
 /// in its children's final assembled form. Siblings attach in rel order
 /// for deterministic trees.
 fn assemble_tree(pairs: Vec<(PathBuf, crate::dircache::DirNode)>) -> crate::dircache::DirNode {
@@ -1175,7 +1175,7 @@ fn emit_cached<'a>(n: &'a crate::dircache::DirNode, out: &mut Vec<std::borrow::C
 // ignore source deliberately absent (no matcher stack, no .gitignore
 // handling, no divergence abort). The only filtering left is the hard
 // .git/.glep exclusion and, when include_hidden is false, dot-prefixed
-// entries — mirroring `walk::sweep_unfiltered`'s walker configuration
+// entries, mirroring `walk::sweep_unfiltered`'s walker configuration
 // (.ignore(false) .git_ignore(false) .git_global(false) .git_exclude(false)
 // .parents(false) .hidden(!include_hidden)). The old path paid the
 // `ignore` crate's per-file DirEntry metadata on top of the search; this

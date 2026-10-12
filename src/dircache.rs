@@ -1,7 +1,7 @@
 //! Directory-mtime pruning cache for file-set queries (`--files`).
 //!
 //! A content query needs every file's current (mtime, size) so the
-//! freshness diff can reindex what changed — that costs a full bulk sweep
+//! freshness diff can reindex what changed, that costs a full bulk sweep
 //! (~100ms on a kernel-scale tree) and is inherent. A *listing* query only
 //! needs the SET of files to be fresh, and that set only changes via
 //! create/delete/rename, each of which bumps the mtime of the directory
@@ -18,8 +18,8 @@
 //!
 //!   1. L's mtime (observed in P's bulk listing) equals the cached value.
 //!      That certifies L's direct entry set is identical: any create,
-//!      delete or rename inside L — including adding or removing a
-//!      subdirectory, which would make L non-leaf — bumps L's mtime.
+//!      delete or rename inside L, including adding or removing a
+//!      subdirectory, which would make L non-leaf, bumps L's mtime.
 //!      In-place content edits never change the file set.
 //!   2. L's own `.gitignore` (mtime, size) is re-statted and matches the
 //!      cached values (only stat'ed when L recorded one): in-place

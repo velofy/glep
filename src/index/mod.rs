@@ -335,7 +335,7 @@ impl Index {
         let shard_mask = n_shards - 1;
         // Phase 0a: bucket live entries by path hash (serial, cheap push
         // per entry) so phase 0b can give each shard to exactly one
-        // thread — no concurrent HashMap mutation anywhere.
+        // thread, no concurrent HashMap mutation anywhere.
         let mut buckets: Vec<Vec<&manifest::FileEntry>> =
             (0..n_shards).map(|_| Vec::new()).collect();
         for e in self.manifest.live_entries() {

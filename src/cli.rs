@@ -314,7 +314,7 @@ pub fn run() -> anyhow::Result<i32> {
 
     // Dir-mtime cached listing (macOS only), consulted BEFORE even
     // opening the index: this path needs no manifest, no postings, no
-    // freshness sweep — just the cache and the pruned walk. The index
+    // freshness sweep, just the cache and the pruned walk. The index
     // opens below only on cache miss.
     #[cfg(target_os = "macos")]
     if args.files {

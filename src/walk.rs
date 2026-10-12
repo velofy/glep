@@ -164,7 +164,7 @@ pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 /// Same sweep as [`sweep`] but without the final path sort. Callers that
 /// classify results by hash map (the freshness diff in `Index::update`)
 /// never need the sort, and sorting 86k paths costs ~30ms on a
-/// kernel-scale tree — pure overhead on every default-mode query.
+/// kernel-scale tree, pure overhead on every default-mode query.
 pub fn sweep_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     #[cfg(target_os = "macos")]
     {

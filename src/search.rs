@@ -333,7 +333,7 @@ fn search_one(
 /// printer thread. Errors from individual files keep rg's behavior: warn on
 /// stderr, treat as unmatched, keep going (and still send the result so
 /// in-order printing never stalls). The bounded channel blocks a worker
-/// only when the printer is a full window behind — bounded memory, and it
+/// only when the printer is a full window behind, bounded memory, and it
 /// never blocks the *other* workers.
 fn worker(
     cursor: &AtomicUsize,
@@ -553,7 +553,7 @@ impl std::io::Write for StdoutOut {
 /// in input order for determinism. Returns true if anything matched.
 ///
 /// Parallel design (v2): workers pull file indices off a shared atomic
-/// cursor — no per-chunk barriers like the old `chunks(128)` loop, so one
+/// cursor, no per-chunk barriers like the old `chunks(128)` loop, so one
 /// slow file never stalls the whole fleet. A dedicated printer thread
 /// receives results over a bounded channel and emits them strictly in
 /// index order (a classic in-order completion queue), so stdout stays
