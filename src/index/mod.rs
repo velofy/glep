@@ -19,6 +19,12 @@ pub struct Index {
     delta: Option<Postings>,
     pub read_only: bool,
     lock: Option<std::fs::File>,
+    /// True once this process has made the manifest authoritative for the
+    /// WHOLE tree: a fresh build, or a full (unscoped, not ttl-skipped)
+    /// sweep whose results were written. Only then may derived state that
+    /// certifies the full listing (the macOS dir-mtime listing cache) be
+    /// rebuilt from the manifest.
+    swept_full: bool,
 }
 
 fn now_epoch() -> u64 {
@@ -131,6 +137,7 @@ impl Index {
             delta: None,
             read_only: false,
             lock,
+            swept_full: true,
         })
     }
 
@@ -163,6 +170,7 @@ impl Index {
                         delta,
                         read_only,
                         lock,
+                        swept_full: false,
                     });
                 }
                 Err(e) => {
@@ -238,17 +246,26 @@ impl Index {
     /// flagged `FLAG_HIDDEN` after narrowing by plan, so both the `All` and
     /// `Groups` arms (trigram postings carry no hidden bit of their own)
     /// are covered by one filter rather than two.
+    ///
+    /// Oversized files carry no trigram postings, so they can never be
+    /// narrowed by a plan; they are unconditional live-scan candidates in
+    /// both arms. `FLAG_SKIP_BINARY` files join them only when
+    /// `search_binary` is set (-a/--binary, --null-data, a non-UTF-8
+    /// -E): under the default quit detection a binary file can never emit
+    /// output, so excluding it is a pure win (rg walks the file and quits
+    /// at the first NUL instead; observably identical).
     pub fn candidates(
         &self,
         plan: &Plan,
         case_insensitive: bool,
         include_hidden: bool,
+        search_binary: bool,
     ) -> Vec<PathBuf> {
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
                 .manifest
                 .live_entries()
-                .filter(|e| e.flags & FLAG_SKIP_BINARY == 0)
+                .filter(|e| search_binary || e.flags & FLAG_SKIP_BINARY == 0)
                 .map(|e| e.id)
                 .collect(),
             Plan::Groups(groups) => {
@@ -268,11 +285,15 @@ impl Index {
                     }
                     union.extend(acc);
                 }
-                // Skip-flagged text files were never indexed; always scan them.
+                // Skip-flagged text files were never indexed; always scan
+                // them. Binary files too, when the caller can surface them.
                 union.extend(
                     self.manifest
                         .live_entries()
-                        .filter(|e| e.flags & FLAG_SKIP_TOO_LARGE != 0)
+                        .filter(|e| {
+                            e.flags & FLAG_SKIP_TOO_LARGE != 0
+                                || (search_binary && e.flags & FLAG_SKIP_BINARY != 0)
+                        })
                         .map(|e| e.id),
                 );
                 union.sort_unstable();
@@ -293,8 +314,28 @@ impl Index {
         paths
     }
 
+    /// Live entries whose names carry a compressed extension (`-z`).
+    /// Compressed files are always candidate-side (their indexed
+    /// trigrams are compressed bytes, useless for narrowing decoded
+    /// content), so all of them join the scan set when -z is active.
+    /// Currently only gzip is supported; other extensions get scanned
+    /// raw (binary-quit finds nothing, same as -z off).
+    pub fn zip_candidates(&self, include_hidden: bool) -> Vec<PathBuf> {
+        self.manifest
+            .live_entries()
+            .filter(|e| include_hidden || e.flags & FLAG_HIDDEN == 0)
+            .filter(|e| e.path.extension().is_some_and(|x| x == "gz"))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    /// See the `swept_full` field.
+    pub fn swept_full(&self) -> bool {
+        self.swept_full
+    }
+
     pub fn update(&mut self, max_filesize: u64, ttl_secs: u64) -> anyhow::Result<Vec<PathBuf>> {
-        self.update_impl(max_filesize, ttl_secs, None)
+        self.update_impl(max_filesize, ttl_secs, None, None)
     }
 
     /// Same as `update`, but records sweep_walk/sweep_diff/index_write
@@ -307,22 +348,57 @@ impl Index {
         ttl_secs: u64,
         timings: &mut Timings,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        self.update_impl(max_filesize, ttl_secs, Some(timings))
+        self.update_impl(max_filesize, ttl_secs, None, Some(timings))
+    }
+
+    /// Scoped update: like `update_timed` but sweeps only `scope`
+    /// subtrees (index-relative path filters). Manifest entries outside
+    /// the scope keep their existing data untouched: they can be stale,
+    /// but they are also never consulted by the scoped query. The global
+    /// sweep epoch is only bumped for unscoped (full) sweeps: a scoped
+    /// sweep must not suppress the freshness sweep a later unscoped
+    /// query needs (ttl correctness).
+    pub fn update_scoped(
+        &mut self,
+        max_filesize: u64,
+        ttl_secs: u64,
+        scope: &[PathBuf],
+        timings: &mut Timings,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        self.update_impl(max_filesize, ttl_secs, Some(scope), Some(timings))
     }
 
     fn update_impl(
         &mut self,
         max_filesize: u64,
         ttl_secs: u64,
+        scope: Option<&[PathBuf]>,
         mut timings: Option<&mut Timings>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
+        // The ttl only gates FULL sweeps: it marks "the whole tree was
+        // verified as of epoch". A scoped sweep leaves other subtrees
+        // unverified, so it neither honors nor sets the epoch.
+        let scope: Option<&[PathBuf]> =
+            scope.filter(|s| !s.is_empty() && !s.iter().any(|p| p.as_os_str().is_empty()));
+        let scoped = scope.is_some();
+        if !scoped
+            && ttl_secs > 0
+            && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs
+        {
             return Ok(Vec::new());
         }
-        let swept = walk::sweep_unsorted(&self.root)?;
+        let swept = match scope {
+            Some(s) => walk::sweep_scoped_unsorted(&self.root, s)?,
+            None => walk::sweep_unsorted(&self.root)?,
+        };
         if let Some(t) = &mut timings {
             t.stage("sweep_walk");
         }
+        // For a scoped sweep only manifest entries inside the scope are
+        // candidates for tombstoning or refresh; everything outside is
+        // untouched (it simply wasn't looked at).
+        let in_scope =
+            |p: &Path| -> bool { scope.is_none_or(|s| s.iter().any(|pre| p.starts_with(pre))) };
         // Parallel sharded diff (replaces the old two-HashMap serial pass,
         // ~28ms on a kernel-scale tree). Three phases:
         //   0. build live-id maps sharded by path hash, in parallel;
@@ -338,7 +414,7 @@ impl Index {
         // thread, no concurrent HashMap mutation anywhere.
         let mut buckets: Vec<Vec<&manifest::FileEntry>> =
             (0..n_shards).map(|_| Vec::new()).collect();
-        for e in self.manifest.live_entries() {
+        for e in self.manifest.live_entries().filter(|e| in_scope(&e.path)) {
             buckets[hash_path(&e.path) & shard_mask].push(e);
         }
         // Phase 0b: build each shard's lookup map in parallel.
@@ -392,6 +468,7 @@ impl Index {
             .filter(|e| {
                 e.flags & manifest::FLAG_DEAD == 0
                     && seen[e.id as usize].load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && in_scope(&e.path)
             })
             .map(|e| e.id)
             .collect();
@@ -406,13 +483,18 @@ impl Index {
             return Ok(fresh.into_iter().map(|m| m.path).collect());
         }
         if fresh.is_empty() && dead_ids.is_empty() {
-            self.manifest.last_sweep_epoch = now_epoch();
-            // The persisted epoch is consumed solely by ttl checks; skip the
-            // write when ttl is unused so a no-op query stays write-free. A
-            // later process may then see a slightly stale epoch, which can
-            // only cause an extra sweep, never a missed one.
-            if ttl_secs > 0 {
-                self.manifest.save(&self.dir.join("manifest.bin"))?;
+            // Only a full sweep may advance the freshness epoch.
+            if !scoped {
+                self.manifest.last_sweep_epoch = now_epoch();
+                self.swept_full = true;
+                // The persisted epoch is consumed solely by ttl checks; skip
+                // the write when ttl is unused so a no-op query stays
+                // write-free. A later process may then see a slightly stale
+                // epoch, which can only cause an extra sweep, never a
+                // missed one.
+                if ttl_secs > 0 {
+                    self.manifest.save(&self.dir.join("manifest.bin"))?;
+                }
             }
             if let Some(t) = &mut timings {
                 t.stage("index_write");
@@ -442,19 +524,25 @@ impl Index {
             ids.dedup();
         }
         postings::write(&self.dir.join("delta.bin"), &map, self.manifest.generation)?;
-        self.manifest.last_sweep_epoch = now_epoch();
+        if !scoped {
+            self.manifest.last_sweep_epoch = now_epoch();
+            self.swept_full = true;
+        }
         self.manifest.save(&self.dir.join("manifest.bin"))?;
         self.delta = Some(Postings::open(&self.dir.join("delta.bin"))?);
 
         // Compaction: delta grew past a tenth of main. Full rebuild is the
-        // simple, correct v1 compaction strategy.
+        // simple, correct v1 compaction strategy. Scoped updates skip the
+        // trigger: their delta contribution is bounded by the scope, and a
+        // rebuild would sweep the whole tree, defeating the point. The
+        // next full sweep still compacts.
         let main_size = std::fs::metadata(self.dir.join("postings.bin"))
             .map(|m| m.len())
             .unwrap_or(0);
         let delta_size = std::fs::metadata(self.dir.join("delta.bin"))
             .map(|m| m.len())
             .unwrap_or(0);
-        if main_size > 0 && delta_size > main_size / 10 {
+        if !scoped && main_size > 0 && delta_size > main_size / 10 {
             drop(self.lock.take()); // release before build re-acquires
             *self = Index::build(&self.root, max_filesize)?;
         }
@@ -565,11 +653,136 @@ mod tests {
     }
 
     #[test]
+    fn update_scoped_only_sweeps_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), "scopedneedle a").unwrap();
+        std::fs::write(other_dir.join("b.txt"), "scopedneedle b").unwrap();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+
+        // Change a file inside scope and outside scope.
+        std::fs::write(src_dir.join("a.txt"), "scopedneedle v2x a").unwrap();
+        std::fs::write(other_dir.join("b.txt"), "scopedneedle b v2x").unwrap();
+        std::fs::write(other_dir.join("c.txt"), "scopedneedle c new").unwrap();
+
+        let mut timings = Timings::new();
+        let scope = vec![std::path::PathBuf::from("src")];
+        idx.update_scoped(1_048_576, 0, &scope, &mut timings)
+            .unwrap();
+        // The in-scope change is now indexed (fresh files join the delta).
+        let plan = crate::plan::build("v2x a", true, false);
+        let c = idx.candidates(&plan, false, false, false);
+        assert_eq!(c, vec![std::path::PathBuf::from("src/a.txt")]);
+        // Out-of-scope changes were never looked at: b.txt's new
+        // contents are NOT a candidate (still stale, which is sound,
+        // since a scoped query never returns it anyway).
+        let plan2 = crate::plan::build("b v2x", true, false);
+        assert!(idx.candidates(&plan2, false, false, false).is_empty());
+        // A scoped sweep never certifies the whole tree.
+        drop(idx);
+        let mut reopened = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        reopened
+            .update_scoped(1_048_576, 0, &scope, &mut timings)
+            .unwrap();
+        assert!(!reopened.swept_full());
+    }
+
+    #[test]
+    fn update_scoped_tombstones_only_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::fs::write(dir.path().join("src/gone.txt"), "tombneedle").unwrap();
+        std::fs::write(dir.path().join("other/gone.txt"), "tombneedle").unwrap();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::remove_file(dir.path().join("src/gone.txt")).unwrap();
+        std::fs::remove_file(dir.path().join("other/gone.txt")).unwrap();
+        let mut timings = Timings::new();
+        idx.update_scoped(
+            1_048_576,
+            0,
+            &[std::path::PathBuf::from("src")],
+            &mut timings,
+        )
+        .unwrap();
+        let live = idx.live_files(false);
+        assert!(!live.contains(&std::path::PathBuf::from("src/gone.txt")));
+        // outside the scope: untouched (stale until the next full sweep)
+        assert!(live.contains(&std::path::PathBuf::from("other/gone.txt")));
+        idx.update(1_048_576, 0).unwrap();
+        assert!(!idx
+            .live_files(false)
+            .contains(&std::path::PathBuf::from("other/gone.txt")));
+    }
+
+    #[test]
+    fn update_scoped_respects_parent_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "*.ign\nignored_dir/\n").unwrap();
+        std::fs::write(src_dir.join("x.ign"), "no").unwrap();
+        std::fs::write(src_dir.join("x.txt"), "yes").unwrap();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let mut timings = Timings::new();
+        // A new ignored file inside scope must NOT appear (parent
+        // .gitignore still applies to the scoped subtree).
+        std::fs::write(src_dir.join("y.ign"), "new ignored").unwrap();
+        std::fs::write(src_dir.join("y.txt"), "new visible").unwrap();
+        idx.update_scoped(
+            1_048_576,
+            0,
+            &[std::path::PathBuf::from("src")],
+            &mut timings,
+        )
+        .unwrap();
+        // y.txt is indexed; the ignored y.ign was never swept.
+        let plan = crate::plan::build("new visible", true, false);
+        assert_eq!(
+            idx.candidates(&plan, false, false, false),
+            vec![std::path::PathBuf::from("src/y.txt")]
+        );
+        let plan2 = crate::plan::build("new ignored", true, false);
+        assert!(idx.candidates(&plan2, false, false, false).is_empty());
+        // An ignored directory named as the scope stays out of the index
+        // entirely: the scoped sweep is the full sweep restricted to the
+        // scope, never a walk rooted inside an ignored tree.
+        std::fs::create_dir_all(dir.path().join("ignored_dir")).unwrap();
+        std::fs::write(dir.path().join("ignored_dir/z.txt"), "inside ignored").unwrap();
+        idx.update_scoped(
+            1_048_576,
+            0,
+            &[std::path::PathBuf::from("ignored_dir")],
+            &mut timings,
+        )
+        .unwrap();
+        assert!(!idx
+            .live_files(true)
+            .iter()
+            .any(|p| p.starts_with("ignored_dir")));
+    }
+
+    #[test]
+    fn swept_full_tracks_authoritative_sweeps() {
+        let dir = corpus();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let mut idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(!idx.swept_full(), "an opened index is not yet verified");
+        idx.update(1_048_576, 3600).unwrap(); // within ttl: skipped
+        assert!(!idx.swept_full(), "a ttl-skipped sweep certifies nothing");
+        idx.update(1_048_576, 0).unwrap();
+        assert!(idx.swept_full());
+    }
+
+    #[test]
     fn candidates_narrow_by_trigram() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false, false);
+        let c = idx.candidates(&plan, false, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -578,8 +791,8 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("HELLO", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
-        let c = idx.candidates(&plan, true, false);
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
+        let c = idx.candidates(&plan, true, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
 
@@ -588,18 +801,24 @@ mod tests {
         let dir = corpus();
         let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
         let plan = crate::plan::build("hello", true, false);
-        let c = idx.candidates(&plan, false, false);
+        let c = idx.candidates(&plan, false, false, false);
         assert!(c.contains(&std::path::PathBuf::from("a.txt")));
         assert!(c.contains(&std::path::PathBuf::from("big.txt")));
+        // Binary files join only when the caller can surface them
+        // (-a/--binary); under quit detection they can never emit output.
         assert!(!c.contains(&std::path::PathBuf::from("bin.dat")));
+        let c = idx.candidates(&plan, false, false, true);
+        assert!(c.contains(&std::path::PathBuf::from("bin.dat")));
     }
 
     #[test]
     fn candidates_all_returns_live_non_binary() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let c = idx.candidates(&crate::plan::Plan::All, false, false);
+        let c = idx.candidates(&crate::plan::Plan::All, false, false, false);
         assert_eq!(c.len(), 3); // a.txt, b.txt, big.txt; bin.dat excluded
+        let c = idx.candidates(&crate::plan::Plan::All, false, false, true);
+        assert_eq!(c.len(), 4);
     }
 
     #[test]
@@ -612,12 +831,12 @@ mod tests {
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("freshneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan, false, false),
+            idx.candidates(&plan, false, false, false),
             vec![std::path::PathBuf::from("new.txt")]
         );
         let plan2 = crate::plan::build("changedneedle", true, false);
         assert_eq!(
-            idx.candidates(&plan2, false, false),
+            idx.candidates(&plan2, false, false, false),
             vec![std::path::PathBuf::from("a.txt")]
         );
     }
@@ -629,7 +848,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         idx.update(1_048_576, 0).unwrap();
         let plan = crate::plan::build("hello", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
     }
 
     #[test]
@@ -639,9 +858,9 @@ mod tests {
         std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
         idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
         let plan = crate::plan::build("ttlneedle", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
         idx.update(1_048_576, 0).unwrap(); // ttl 0: always sweeps
-        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false, false).len(), 1);
     }
 
     #[test]
@@ -654,7 +873,7 @@ mod tests {
         }
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         let plan = crate::plan::build("persistneedle", true, false);
-        assert_eq!(idx.candidates(&plan, false, false).len(), 1);
+        assert_eq!(idx.candidates(&plan, false, false, false).len(), 1);
     }
 
     #[test]
@@ -675,7 +894,7 @@ mod tests {
         );
         let plan = crate::plan::build("uniqtoken1999", true, false);
         assert_eq!(
-            idx.candidates(&plan, false, false),
+            idx.candidates(&plan, false, false, false),
             vec![std::path::PathBuf::from("bulk.txt")]
         );
     }
@@ -734,11 +953,11 @@ mod tests {
 
         let plan = crate::plan::build("hiddenneedle", true, false);
         assert!(
-            idx.candidates(&plan, false, false).is_empty(),
+            idx.candidates(&plan, false, false, false).is_empty(),
             "hidden file must not surface by default"
         );
         assert_eq!(
-            idx.candidates(&plan, false, true),
+            idx.candidates(&plan, false, true, false),
             vec![std::path::PathBuf::from(".secret.txt")]
         );
 
@@ -762,9 +981,9 @@ mod tests {
         idx.update(1_048_576, 0).unwrap();
 
         let plan = crate::plan::build("healneedle", true, false);
-        assert!(idx.candidates(&plan, false, false).is_empty());
+        assert!(idx.candidates(&plan, false, false, false).is_empty());
         assert_eq!(
-            idx.candidates(&plan, false, true),
+            idx.candidates(&plan, false, true, false),
             vec![std::path::PathBuf::from(".newhidden.txt")]
         );
     }

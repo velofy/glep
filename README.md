@@ -41,7 +41,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 - **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
-- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore`.
+- **Familiar flags:** ripgrep's own spellings, including `-i -S -F -w -x -v -l -c -o -q -U -e -f -g -t -T -C -A -B -m -M -n -N -a -z -P -E -L -u -0 -j -H -I -b` and `--json --stats --heading --column --vimgrep --trim --sort --sortr --count-matches --files-without-match --passthru --null-data --hidden --no-ignore --no-ignore-vcs --ignore-file --type-add --color --hyperlink-format`. Flags that change which files exist for a query (`--no-ignore`, `-L`, `--one-file-system` and friends) run as live scans that never touch the index.
 - **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface
@@ -52,10 +52,14 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 glep --json 'pattern'           # machine-readable output (includes rg's summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
+glep -w -x -S -v 'pattern'      # word, whole-line, smart-case, invert match
+glep -o -m 5 -M 120 -N ...      # only-matching, max count, max columns, no line numbers
+glep --heading -q 'pattern'     # grouped headings, or quiet exit-code-only
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
 glep -g '*.rs' -t rust ...      # glob and type filters
 glep --hidden 'TODO'            # include dotfiles (.git is always excluded)
 glep --no-ignore ...            # search ignored files too (live scan, index untouched)
+glep --no-index ...             # live walk + scan; never opens or writes the index
 glep --ttl 5 ...                # skip the freshness sweep within a read burst
 glep --max-filesize 2000000 ... # raise the 1MB index cap
 glep index                      # explicit (re)build; lazy on first query
@@ -64,9 +68,11 @@ glep status                     # index stats
 
 `--no-ignore` always pays a full scan: it bypasses the index entirely, so gitignored trees never enter it. It costs the same as `rg --no-ignore`, every time.
 
+The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory.
+
 With an explicit path argument, `bytes_printed` in the JSON summary can differ from rg's (rg prints `./`-prefixed paths; glep prints them bare).
 
-Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`). The index lives in `.glep/` in the directory you run glep from, so run it from the project root.
+Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`).
 
 ## When to use it
 

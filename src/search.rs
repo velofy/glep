@@ -1,7 +1,8 @@
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -10,12 +11,169 @@ pub struct SearchOpts {
     pub case_insensitive: bool,
     pub fixed: bool,
     pub files_with_matches: bool,
+    /// --files-without-match: emit names of files with NO match.
+    pub files_without_match: bool,
     pub before: usize,
     pub after: usize,
     pub json: bool,
     pub count: bool,
+    /// rg --count-matches: count match occurrences, not lines.
+    pub count_matches: bool,
     pub multiline: bool,
+    /// quit: stop at the first NUL byte (default, rg). convert: NULs become
+    /// line terminators and a match yields the printer's binary notice
+    /// (rg --binary). none: binary files are plain text (rg -a).
+    pub binary: BinaryDetection,
+    /// Index-relative prefix to strip from paths for display. Results
+    /// always print relative to the cwd the user ran in, which may be a
+    /// subdirectory of the discovered index root; "" means no stripping.
+    pub display_prefix: PathBuf,
+    /// First-match column per line (rg --column); implied by --vimgrep.
+    pub column: bool,
+    /// Byte offset of each printed line (rg -b).
+    pub byte_offset: bool,
+    /// One output line per match (rg --vimgrep = column + per_match +
+    /// per_match_one_line + forced filename).
+    pub vimgrep: bool,
+    /// Strip leading whitespace on matched lines (rg --trim).
+    pub trim: bool,
+    /// Replaces the `:` between path and line fields (rg -0/--null).
+    pub path_terminator: Option<u8>,
+    /// Replaces `/` inside printed paths (rg --path-separator).
+    pub path_separator: Option<u8>,
+    /// With count, emit `path:0` for searched-but-unmatched files
+    /// (rg --include-zero).
+    pub include_zero: bool,
+    /// Print the path field; rg suppresses it for a single file operand.
+    pub with_filename: bool,
+    /// Print the rg-style stats block after results (rg --stats).
+    pub stats: bool,
+    /// rg --multiline-dotall: `.` matches `\n` at the matcher level.
+    pub multiline_dotall: bool,
+    /// -E/--encoding label, resolved once in `run`.
+    pub encoding: Option<String>,
+    /// rg --line-buffered: flush after every record.
+    pub line_buffered: bool,
+    /// --color always: emit ANSI colors (rg's default spec set plus any
+    /// --colors overrides). auto/never resolve to false here: tty
+    /// detection happens in cli.
+    pub color: bool,
+    /// Extra UserColorSpec strings from --colors, parsed once per run.
+    pub color_specs: Vec<String>,
+    /// --passthru: emit all lines, not just matches/context.
+    pub passthru: bool,
+    /// --no-unicode: matcher-level unicode off (\w, ., classes).
+    pub unicode: bool,
+    /// --null-data: NUL is the line terminator (searcher + matcher).
+    pub null_data: bool,
+    /// --dfa-size-limit (None = default)
+    pub dfa_size_limit: Option<usize>,
+    /// --regex-size-limit
+    pub regex_size_limit: Option<usize>,
+    /// --field-match-separator (bytes between fields on match lines)
+    pub field_match_separator: Option<Vec<u8>>,
+    /// --field-context-separator (bytes between fields on context lines)
+    pub field_context_separator: Option<Vec<u8>>,
+    /// --context-separator ("" = none)
+    pub context_separator: Option<Vec<u8>>,
+    /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
+    pub pcre2: bool,
+    /// -z: decompress .gz files via flate2 and search the decoded stream.
+    pub search_zip: bool,
+    /// -M preview: a truncated long line ends with a `[... N more matches]`
+    /// marker instead of the bare omission.
+    pub max_columns_preview: bool,
+    /// rg --stop-on-nonmatch: stop reading a file at the first
+    /// non-matching line that follows a match (a per-file searcher
+    /// setting, exactly like rg).
+    pub stop_on_nonmatch: bool,
+    /// rg --no-messages: suppress per-file nonfatal warnings.
+    pub no_messages: bool,
+    /// OSC8 hyperlink format for emitted paths (rg --hyperlink-format).
+    pub hyperlink_format: Option<String>,
+    /// Hostname variable inside hyperlink formats (rg --hostname-bin).
+    pub hostname_bin: Option<String>,
+    /// Worker thread count (rg -j); None or 0 means one per core.
+    pub threads: Option<usize>,
+    pub word: bool,
+    pub line_regexp: bool,
+    pub smart_case: bool,
+    pub invert: bool,
+    pub max_count: Option<u64>,
+    pub max_columns: Option<u64>,
+    pub line_number: bool,
+    pub heading: bool,
+    pub only_matching: bool,
+    pub quiet: bool,
 }
+
+impl Default for SearchOpts {
+    /// rg's defaults: line numbers on, filenames on, quit-at-NUL binary
+    /// detection, unicode on, everything else off.
+    fn default() -> SearchOpts {
+        SearchOpts {
+            case_insensitive: false,
+            fixed: false,
+            files_with_matches: false,
+            files_without_match: false,
+            before: 0,
+            after: 0,
+            json: false,
+            count: false,
+            count_matches: false,
+            multiline: false,
+            binary: BinaryDetection::quit(b'\x00'),
+            display_prefix: PathBuf::new(),
+            column: false,
+            byte_offset: false,
+            vimgrep: false,
+            trim: false,
+            path_terminator: None,
+            path_separator: None,
+            include_zero: false,
+            with_filename: true,
+            stats: false,
+            multiline_dotall: false,
+            encoding: None,
+            line_buffered: false,
+            color: false,
+            color_specs: Vec::new(),
+            passthru: false,
+            unicode: true,
+            null_data: false,
+            dfa_size_limit: None,
+            regex_size_limit: None,
+            field_match_separator: None,
+            field_context_separator: None,
+            context_separator: None,
+            pcre2: false,
+            search_zip: false,
+            max_columns_preview: false,
+            stop_on_nonmatch: false,
+            no_messages: false,
+            hyperlink_format: None,
+            hostname_bin: None,
+            threads: None,
+            word: false,
+            line_regexp: false,
+            smart_case: false,
+            invert: false,
+            max_count: None,
+            max_columns: None,
+            line_number: true,
+            heading: false,
+            only_matching: false,
+            quiet: false,
+        }
+    }
+}
+
+/// Workloads of at most this many files are searched on the calling
+/// thread with one reusable searcher and zero synchronization (the
+/// agent-small-repo fast path); anything larger goes through the worker
+/// pool and the in-order printer thread. Tests that want the pool path
+/// use a corpus larger than this.
+pub const SMALL_WORKLOAD: usize = 32;
 
 // --- rg-compatible --json closing `summary` event -------------------------
 //
@@ -40,9 +198,8 @@ pub struct SearchOpts {
 // it. `grep_printer::JSONBuilder` (grep-printer 0.2.x) has no `.stats(bool)`
 // toggle to enable/disable stats collection like `StandardBuilder`/
 // `SummaryBuilder` do; the JSON sink always tracks `Stats` internally, and
-// `JSONSink::stats()` is unconditionally available after a search. So step
-// 1's ".stats(true) on the JSON printer builder" doesn't apply here: nothing
-// to opt into, we just harvest `sink.stats()` per file below.
+// `JSONSink::stats()` is unconditionally available after a search. So
+// there is nothing to opt into, we just harvest `sink.stats()` per file.
 //
 // `NiceDuration` (the `{secs,nanos,human}` shape used for both `elapsed` and
 // `elapsed_total`) is `pub(crate)` inside grep-printer, so it can't be
@@ -99,10 +256,43 @@ fn merge_stats(total: &mut grep_printer::Stats, other: &grep_printer::Stats) {
     total.add_matches(other.matches());
 }
 
+fn build_pcre2_matcher(
+    pattern: &str,
+    opts: &SearchOpts,
+) -> anyhow::Result<grep_pcre2::RegexMatcher> {
+    // Mirrors rg's own PCRE2 configuration (multi_line always on so ^/$
+    // anchor per line; case/boundary modes; utf+ucp unless --no-unicode).
+    let mut b = grep_pcre2::RegexMatcherBuilder::new();
+    b.multi_line(true)
+        .fixed_strings(opts.fixed)
+        .caseless(opts.case_insensitive)
+        .case_smart(opts.smart_case)
+        .word(opts.word)
+        .whole_line(opts.line_regexp)
+        .jit_if_available(true);
+    if opts.unicode {
+        b.utf(true).ucp(true);
+    }
+    if opts.multiline {
+        b.dotall(opts.multiline_dotall);
+    }
+    Ok(b.build(pattern)?)
+}
+
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
     let mut b = RegexMatcherBuilder::new();
     b.case_insensitive(opts.case_insensitive);
+    // -S: case sensitivity is resolved by the matcher from the pattern AST
+    // (an inline (?i) beats everything), same as rg.
+    b.case_smart(opts.smart_case);
     b.fixed_strings(opts.fixed);
+    b.word(opts.word);
+    // -x maps to grep-regex's whole_line, the same knob rg uses for
+    // --line-regexp. It wraps the HIR in line anchors after -F literals and
+    // smart-case resolution are applied. rg treats -w/-x as last-wins
+    // (enforced via clap overrides_with in cli.rs); if both were ever set,
+    // whole_line would subsume word anyway.
+    b.whole_line(opts.line_regexp);
     // rg's -U maps to: searcher.multi_line(true) so matches may span lines,
     // plus a matcher built without a line-terminator restriction so a
     // literal \n in the pattern is allowed to compile and match. We never
@@ -115,6 +305,23 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     // just at the start of the whole file).
     if opts.multiline {
         b.multi_line(true);
+    }
+    if opts.multiline_dotall {
+        b.dot_matches_new_line(true);
+    }
+    if !opts.unicode {
+        b.unicode(false);
+    }
+    if opts.null_data {
+        // NUL is the record separator: the matcher must know so `.`
+        // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
+        b.line_terminator(Some(0));
+    }
+    if let Some(d) = opts.dfa_size_limit {
+        b.dfa_size_limit(d);
+    }
+    if let Some(s) = opts.regex_size_limit {
+        b.size_limit(s);
     }
     Ok(b.build(pattern)?)
 }
@@ -133,70 +340,478 @@ impl grep_searcher::Sink for FoundSink {
     }
 }
 
-struct CountSink<'a> {
-    matcher: &'a grep_regex::RegexMatcher,
-    multiline: bool,
+struct CountSink<'a, M: Matcher> {
+    matcher: &'a M,
+    /// Run `find_iter` on each matched line to count real occurrences:
+    /// needed by --count-matches, -U (a match may span lines), -o (rg -o
+    /// -c counts occurrences), -v (each non-matching line counts once via
+    /// the max(1) floor), and --stats (true occurrence count).
+    occurrences_mode: bool,
+    /// What -c prints: occurrences in occurrence-mode, matched lines else.
     count: u64,
+    /// True match occurrences, for --stats.
+    occurrences: u64,
+    /// When -c counts occurrences: count_matches || multiline || only_matching.
+    count_occurrences: bool,
 }
 
-impl grep_searcher::Sink for CountSink<'_> {
+impl<'a, M: Matcher> CountSink<'a, M> {
+    fn new(matcher: &'a M, opts: &SearchOpts) -> CountSink<'a, M> {
+        let count_occurrences = opts.count_matches || opts.multiline || opts.only_matching;
+        CountSink {
+            matcher,
+            occurrences_mode: count_occurrences || opts.stats,
+            count: 0,
+            occurrences: 0,
+            count_occurrences,
+        }
+    }
+}
+
+impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
     type Error = std::io::Error;
     fn matched(
         &mut self,
         _: &grep_searcher::Searcher,
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        if self.multiline {
-            use grep_matcher::Matcher;
+        if self.occurrences_mode {
             let mut n = 0u64;
             self.matcher
                 .find_iter(m.bytes(), |_| {
                     n += 1;
                     true
                 })
-                .map_err(std::io::Error::other)?;
-            self.count += n.max(1);
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Under -v the sink is invoked on non-matching lines: the
+            // matcher finds 0 occurrences but the line still counts once.
+            let n = n.max(1);
+            self.occurrences += n;
+            self.count += if self.count_occurrences { n } else { 1 };
         } else {
             self.count += 1;
+            self.occurrences += 1;
         }
         Ok(true)
     }
 }
 
-/// Per-thread search state: one `Searcher` reused across every file this
-/// worker touches. `grep_searcher::Searcher` holds its decode/line buffers
-/// in RefCells precisely so a single instance can be reused across files;
-/// rebuilding it per file (the old design) threw that reuse away and paid
-/// a fresh allocation plus cold buffers per file. ripgrep itself clones
-/// one SearchWorker per walker thread and reuses it for the whole run.
+/// Hostname for `{host}` hyperlink variables: same lookup the reference
+/// uses (gethostname); None when undiscoverable.
+fn hostname() -> Option<String> {
+    hostname::get()
+        .ok()
+        .map(|h| h.to_string_lossy().into_owned())
+}
+
+/// The StandardBuilder config shared by the no-color and ANSI paths.
+/// Built once per worker and reused for every file (building a printer
+/// from it only clones the config).
+fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder {
+    let mut b = grep_printer::StandardBuilder::new();
+    b.heading(opts.heading)
+        .path(opts.with_filename)
+        .column(opts.column || opts.vimgrep)
+        .byte_offset(opts.byte_offset)
+        .trim_ascii(opts.trim)
+        .per_match(opts.vimgrep)
+        .per_match_one_line(opts.vimgrep)
+        .only_matching(opts.only_matching)
+        .max_columns(opts.max_columns)
+        .max_columns_preview(opts.max_columns_preview)
+        .path_terminator(opts.path_terminator)
+        .separator_path(opts.path_separator)
+        .stats(opts.stats);
+    if let Some(fmt) = &opts.hyperlink_format {
+        if let Ok(hf) = fmt.parse::<grep_printer::HyperlinkFormat>() {
+            let mut env = grep_printer::HyperlinkEnvironment::new();
+            env.host(opts.hostname_bin.clone().or_else(hostname));
+            b.hyperlink(hf.into_config(env));
+        }
+    }
+    if let Some(s) = &opts.field_match_separator {
+        b.separator_field_match(s.clone());
+    }
+    if let Some(s) = &opts.field_context_separator {
+        b.separator_field_context(s.clone());
+    }
+    if let Some(s) = &opts.context_separator {
+        b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
+    }
+    if opts.color {
+        let mut all = grep_printer::default_color_specs();
+        for s in &opts.color_specs {
+            if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
+                all.push(spec);
+            }
+        }
+        b.color_specs(grep_printer::ColorSpecs::new(&all));
+    }
+    b
+}
+
+/// Per-thread search state: one `Searcher` (and one configured printer
+/// builder) reused across every file this worker touches.
+/// `grep_searcher::Searcher` holds its decode/line buffers in RefCells
+/// precisely so a single instance can be reused across files; rebuilding it
+/// per file threw that reuse away and paid a fresh allocation plus cold
+/// buffers per file. ripgrep itself clones one SearchWorker per walker
+/// thread and reuses it for the whole run.
 struct WorkerState {
     searcher: Searcher,
+    printer: grep_printer::StandardBuilder,
 }
 
 impl WorkerState {
-    fn new(opts: &SearchOpts) -> WorkerState {
+    fn new(opts: &SearchOpts, encoding: Option<&grep_searcher::Encoding>) -> WorkerState {
         // Line-number tracking is only needed by the printing sinks; rg
         // itself searches without line numbers unless output needs them.
-        // -l/-c modes skip the bookkeeping entirely.
-        let need_line_numbers = !opts.files_with_matches && !opts.count;
-        let searcher = SearcherBuilder::new()
-            .binary_detection(BinaryDetection::quit(0))
+        // -l/-c/-q modes skip the bookkeeping entirely.
+        let need_line_numbers = opts.line_number
+            && !opts.files_with_matches
+            && !opts.files_without_match
+            && !opts.count
+            && !opts.count_matches
+            && !opts.quiet;
+        // --null-data makes NUL a record separator, so it can't stay a
+        // binary-detection signal: the searcher treats the file as text.
+        let detection = if opts.null_data {
+            BinaryDetection::none()
+        } else {
+            opts.binary.clone()
+        };
+        let mut sb = SearcherBuilder::new();
+        sb.binary_detection(detection)
             .line_number(need_line_numbers)
+            .invert_match(opts.invert)
+            .max_matches(opts.max_count)
             .before_context(opts.before)
             .after_context(opts.after)
             .multi_line(opts.multiline)
-            .build();
-        WorkerState { searcher }
+            .passthru(opts.passthru)
+            .stop_on_nonmatch(opts.stop_on_nonmatch);
+        if let Some(enc) = encoding {
+            sb.encoding(Some(enc.clone()));
+        }
+        if opts.null_data {
+            sb.line_terminator(grep_matcher::LineTerminator::byte(0));
+        }
+        WorkerState {
+            searcher: sb.build(),
+            printer: standard_printer_builder(opts),
+        }
     }
 }
 
-/// One completed file: the file's index, its rendered output buffer,
-/// whether it matched, and (json mode only) its per-file stats.
-struct Done {
-    idx: usize,
+/// The bytes to search for one file: an mmap when mapping succeeded
+/// (zero-copy: the searcher runs directly against page-cache pages, no
+/// kernel->user buffer copy), else the path (streamed through the
+/// searcher's line buffer). ripgrep's own macOS heuristic disables mmap
+/// with a 2018 "should re-evaluate" note; we re-evaluated: on
+/// page-cache-bound workloads (every-file searches) the copy elimination
+/// is a significant win. SIGBUS on concurrent truncation is the accepted
+/// risk, identical to rg's documented --mmap behavior on Linux.
+///
+/// Modes whose bytes are not the file's own bytes take a reader instead:
+/// `-z` decodes a gzip stream. `--binary` (convert detection) also reads
+/// through the line buffer, which is what rewrites NULs and detects
+/// binary data past the first buffer exactly like rg's default reader.
+enum Haystack {
+    Map(memmap2::Mmap),
+    Path(PathBuf),
+    Gz(PathBuf),
+}
+
+impl Haystack {
+    fn open(full: &Path, rel: &Path, opts: &SearchOpts) -> Haystack {
+        if opts.search_zip && rel.extension().is_some_and(|x| x == "gz") {
+            return Haystack::Gz(full.to_path_buf());
+        }
+        if opts.binary.convert_byte().is_some() && !opts.null_data {
+            return Haystack::Path(full.to_path_buf());
+        }
+        match std::fs::File::open(full) {
+            Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
+                Ok(m) if !m.is_empty() => Haystack::Map(m),
+                _ => Haystack::Path(full.to_path_buf()),
+            },
+            Err(_) => Haystack::Path(full.to_path_buf()),
+        }
+    }
+
+    fn search<M: Matcher, S: grep_searcher::Sink>(
+        &self,
+        searcher: &mut Searcher,
+        matcher: &M,
+        sink: S,
+    ) -> Result<(), S::Error> {
+        match self {
+            Haystack::Map(m) => searcher.search_slice(matcher, &m[..], sink),
+            Haystack::Path(p) => searcher.search_path(matcher, p, sink),
+            Haystack::Gz(p) => {
+                use grep_searcher::SinkError;
+                let file = std::fs::File::open(p).map_err(S::Error::error_io)?;
+                let dec = flate2::read::GzDecoder::new(file);
+                searcher.search_reader(matcher, dec, sink)
+            }
+        }
+    }
+
+    fn is_stream(&self) -> bool {
+        matches!(self, Haystack::Gz(_))
+    }
+}
+
+/// Write `rel` honoring --path-separator (components rejoined by the
+/// custom byte).
+fn write_path(out: &mut Vec<u8>, rel: &Path, sep: Option<u8>) {
+    match sep {
+        None => out.extend_from_slice(rel.as_os_str().as_encoded_bytes()),
+        Some(sep) => {
+            let mut first = true;
+            for c in rel.components() {
+                if !first {
+                    out.push(sep);
+                }
+                first = false;
+                out.extend_from_slice(c.as_os_str().as_encoded_bytes());
+            }
+        }
+    }
+}
+
+/// Stats for paths searched in count/-l modes: occurrences, matched
+/// lines, one search, bytes from the file size (a decoded stream has no
+/// stat()able size, so it reports 0 bytes searched).
+fn file_stats(full: Option<&Path>, matched_lines: u64, matches: u64) -> grep_printer::Stats {
+    let mut s = grep_printer::Stats::new();
+    s.add_searches(1);
+    s.add_searches_with_match(u64::from(matched_lines > 0));
+    s.add_matched_lines(matched_lines);
+    s.add_matches(matches);
+    if let Some(full) = full {
+        if let Ok(m) = std::fs::metadata(full) {
+            s.add_bytes_searched(m.len());
+        }
+    }
+    s
+}
+
+/// One finished file: its rendered output, whether it matched, and its
+/// stats when the mode tracks them.
+struct FileResult {
     buf: Vec<u8>,
     matched: bool,
     stats: Option<grep_printer::Stats>,
+}
+
+impl FileResult {
+    fn empty() -> FileResult {
+        FileResult {
+            buf: Vec::new(),
+            matched: false,
+            stats: None,
+        }
+    }
+}
+
+/// Display form of an index-relative path: relative to the directory the
+/// user ran from (`cwd_rel` inside the index tree). Paths under the cwd
+/// just lose the prefix; paths reached through a `..` operand climb with
+/// `..` components, so every printed path opens from the cwd.
+pub(crate) fn display_rel<'a>(p: &'a Path, cwd_rel: &Path) -> std::borrow::Cow<'a, Path> {
+    if cwd_rel.as_os_str().is_empty() {
+        return std::borrow::Cow::Borrowed(p);
+    }
+    if let Ok(rest) = p.strip_prefix(cwd_rel) {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    let mut cwd_it = cwd_rel.components().peekable();
+    let mut p_it = p.components().peekable();
+    while let (Some(a), Some(b)) = (cwd_it.peek(), p_it.peek()) {
+        if a != b {
+            break;
+        }
+        cwd_it.next();
+        p_it.next();
+    }
+    let mut out = PathBuf::new();
+    for _ in cwd_it {
+        out.push("..");
+    }
+    for c in p_it {
+        out.push(c.as_os_str());
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+fn display_path<'a>(rel: &'a Path, opts: &SearchOpts) -> std::borrow::Cow<'a, Path> {
+    // Paths print relative to the user's cwd, not the index root.
+    display_rel(rel, &opts.display_prefix)
+}
+
+fn search_one<M: Matcher>(
+    state: &mut WorkerState,
+    matcher: &M,
+    root: &Path,
+    rel: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<FileResult> {
+    let full = root.join(rel);
+    let display = display_path(rel, opts);
+    let display: &Path = &display;
+    let hay = Haystack::open(&full, rel, opts);
+    let stat_path = if hay.is_stream() {
+        None
+    } else {
+        Some(full.as_path())
+    };
+    let searcher = &mut state.searcher;
+    if opts.quiet {
+        // -q: nothing is written; the exit code carries the answer. Under
+        // --json rg still emits the closing summary, so each file runs
+        // through the JSON sink into a scratch buffer to harvest stats.
+        if opts.json {
+            let mut scratch = Vec::new();
+            let mut printer = grep_printer::JSONBuilder::new().build(&mut scratch);
+            let mut sink = printer.sink_with_path(matcher, display);
+            hay.search(searcher, matcher, &mut sink)?;
+            // -q printed nothing: bytes_printed stays 0, like rg's summary.
+            let s = sink.stats();
+            let mut stats = grep_printer::Stats::new();
+            stats.add_searches(s.searches());
+            stats.add_searches_with_match(s.searches_with_match());
+            stats.add_bytes_searched(s.bytes_searched());
+            stats.add_matched_lines(s.matched_lines());
+            stats.add_matches(s.matches());
+            return Ok(FileResult {
+                buf: Vec::new(),
+                matched: sink.has_match(),
+                stats: Some(stats),
+            });
+        }
+        let mut sink = FoundSink(false);
+        hay.search(searcher, matcher, &mut sink)?;
+        return Ok(FileResult {
+            buf: Vec::new(),
+            matched: sink.0,
+            stats: None,
+        });
+    }
+    if opts.count || opts.count_matches {
+        let mut sink = CountSink::new(matcher, opts);
+        hay.search(searcher, matcher, &mut sink)?;
+        let stats = opts
+            .stats
+            .then(|| file_stats(stat_path, sink.count, sink.occurrences));
+        if sink.count > 0 || opts.include_zero {
+            // `path` + field terminator (`:` normally, NUL under --null) +
+            // count; bare `N` when the path is suppressed. The record end
+            // is NUL under --null-data.
+            let mut line = Vec::with_capacity(display.as_os_str().len() + 12);
+            if opts.with_filename {
+                write_path(&mut line, display, opts.path_separator);
+                line.push(opts.path_terminator.unwrap_or(b':'));
+            }
+            line.extend_from_slice(sink.count.to_string().as_bytes());
+            line.push(if opts.null_data { b'\0' } else { b'\n' });
+            return Ok(FileResult {
+                buf: line,
+                matched: sink.count > 0,
+                stats,
+            });
+        }
+        return Ok(FileResult {
+            buf: Vec::new(),
+            matched: false,
+            stats,
+        });
+    }
+    if opts.files_with_matches || opts.files_without_match {
+        let (matched, stats) = if opts.stats {
+            // --stats needs real counts: run the count sink instead of
+            // the early-exit one.
+            let mut sink = CountSink {
+                matcher,
+                occurrences_mode: true,
+                count: 0,
+                occurrences: 0,
+                count_occurrences: false,
+            };
+            hay.search(searcher, matcher, &mut sink)?;
+            (
+                sink.count > 0,
+                Some(file_stats(stat_path, sink.count, sink.occurrences)),
+            )
+        } else {
+            let mut sink = FoundSink(false);
+            hay.search(searcher, matcher, &mut sink)?;
+            (sink.0, None)
+        };
+        let mut buf = Vec::new();
+        if matched && opts.files_with_matches {
+            write_path(&mut buf, display, opts.path_separator);
+            buf.push(opts.path_terminator.unwrap_or(b'\n'));
+        }
+        return Ok(FileResult {
+            buf,
+            matched,
+            stats,
+        });
+    }
+    let mut buf = Vec::new();
+    let matched;
+    let stats;
+    if opts.json {
+        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, display);
+        hay.search(searcher, matcher, &mut sink)?;
+        matched = sink.has_match();
+        stats = Some(sink.stats().clone());
+    } else if opts.color {
+        let mut printer = state.printer.build(termcolor::Ansi::new(&mut buf));
+        let mut sink = printer.sink_with_path(matcher, display);
+        hay.search(searcher, matcher, &mut sink)?;
+        matched = sink.has_match();
+        stats = sink.stats().cloned();
+    } else {
+        let mut printer = state.printer.build_no_color(&mut buf);
+        let mut sink = printer.sink_with_path(matcher, display);
+        hay.search(searcher, matcher, &mut sink)?;
+        matched = sink.has_match();
+        stats = sink.stats().cloned();
+    }
+    Ok(FileResult {
+        buf,
+        matched,
+        stats,
+    })
+}
+
+/// Run `search_one`, turning a per-file error into rg's warn-and-continue
+/// behavior: report on stderr (unless --no-messages), treat as unmatched.
+fn search_one_or_warn<M: Matcher>(
+    state: &mut WorkerState,
+    matcher: &M,
+    root: &Path,
+    rel: &Path,
+    opts: &SearchOpts,
+) -> FileResult {
+    match search_one(state, matcher, root, rel, opts) {
+        Ok(r) => r,
+        Err(e) => {
+            if !opts.no_messages {
+                eprintln!("glep: {}: {}", rel.display(), e);
+            }
+            FileResult::empty()
+        }
+    }
+}
+
+/// One completed file: the file's index plus its result.
+struct Done {
+    idx: usize,
+    res: FileResult,
 }
 
 /// Bounded-window coordination between workers and the printer. The
@@ -213,191 +828,29 @@ struct WindowState {
     lock: Mutex<()>,
 }
 
-/// Print one finished result. Shared by the sequential and parallel paths
-/// so byte output cannot drift between them. `printed_any` drives the
-/// rg-compatible `--` separator between files in context modes.
-fn emit_result(
-    out: &mut (dyn std::io::Write + Send),
-    buf: &[u8],
-    matched: bool,
-    stats: &Option<grep_printer::Stats>,
-    separate: bool,
-    printed_any: &mut bool,
-    total_stats: &mut grep_printer::Stats,
-) -> std::io::Result<()> {
-    if let Some(s) = stats {
-        merge_stats(total_stats, s);
-    }
-    if matched {
-        if separate && *printed_any {
-            writeln!(out, "--")?;
-        }
-        out.write_all(buf)?;
-        *printed_any = true;
-    }
-    Ok(())
-}
+/// Flush the coalescing buffer once it passes this size.
+const PRINT_BATCH: usize = 256 * 1024;
 
-/// The bytes to search for one file: an mmap when mapping succeeded
-/// (zero-copy: the searcher runs directly against page-cache pages, no
-/// kernel->user buffer copy), else the path (streamed through the
-/// searcher's line buffer). ripgrep's own macOS heuristic disables mmap
-/// with a 2018 "should re-evaluate" note; we re-evaluated: on
-/// page-cache-bound workloads (every-file searches) the copy elimination
-/// is a significant win. SIGBUS on concurrent truncation is the accepted
-/// risk, identical to rg's documented --mmap behavior on Linux.
-enum Haystack {
-    Map(memmap2::Mmap),
-    Path(PathBuf),
-}
-
-impl Haystack {
-    fn open(full: &Path) -> Haystack {
-        match std::fs::File::open(full) {
-            Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
-                Ok(m) if !m.is_empty() => Haystack::Map(m),
-                _ => Haystack::Path(full.to_path_buf()),
-            },
-            Err(_) => Haystack::Path(full.to_path_buf()),
-        }
-    }
-
-    fn search<S: grep_searcher::Sink>(
-        &self,
-        searcher: &mut Searcher,
-        matcher: &grep_regex::RegexMatcher,
-        sink: &mut S,
-    ) -> Result<(), S::Error> {
-        match self {
-            Haystack::Map(m) => searcher.search_slice(matcher, &m[..], sink),
-            Haystack::Path(p) => searcher.search_path(matcher, p, sink),
-        }
-    }
-}
-
-fn search_one(
-    state: &mut WorkerState,
-    matcher: &grep_regex::RegexMatcher,
-    root: &Path,
-    rel: &Path,
-    opts: &SearchOpts,
-) -> anyhow::Result<(Vec<u8>, bool, Option<grep_printer::Stats>)> {
-    let full = root.join(rel);
-    let hay = Haystack::open(&full);
-    if opts.count {
-        let mut sink = CountSink {
-            matcher,
-            multiline: opts.multiline,
-            count: 0,
-        };
-        hay.search(&mut state.searcher, matcher, &mut sink)?;
-        if sink.count > 0 {
-            return Ok((
-                format!("{}:{}\n", rel.display(), sink.count).into_bytes(),
-                true,
-                None,
-            ));
-        }
-        return Ok((Vec::new(), false, None));
-    }
-    if opts.files_with_matches {
-        let mut sink = FoundSink(false);
-        hay.search(&mut state.searcher, matcher, &mut sink)?;
-        if sink.0 {
-            return Ok((format!("{}\n", rel.display()).into_bytes(), true, None));
-        }
-        return Ok((Vec::new(), false, None));
-    }
-    let mut buf = Vec::new();
-    let matched;
-    let mut stats = None;
-    if opts.json {
-        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
-        hay.search(&mut state.searcher, matcher, &mut sink)?;
-        matched = sink.has_match();
-        stats = Some(sink.stats().clone());
-    } else {
-        let mut printer = grep_printer::StandardBuilder::new()
-            .heading(false)
-            .build_no_color(&mut buf);
-        let mut sink = printer.sink_with_path(matcher, rel);
-        hay.search(&mut state.searcher, matcher, &mut sink)?;
-        matched = sink.has_match();
-    }
-    Ok((buf, matched, stats))
-}
-
-/// Worker loop: claim indices from the shared cursor, search each file with
-/// the thread-local reusable state, and send the finished result to the
-/// printer thread. Errors from individual files keep rg's behavior: warn on
-/// stderr, treat as unmatched, keep going (and still send the result so
-/// in-order printing never stalls). The bounded channel blocks a worker
-/// only when the printer is a full window behind, bounded memory, and it
-/// never blocks the *other* workers.
-fn worker(
-    cursor: &AtomicUsize,
-    tx: &SyncSender<Done>,
-    state: &mut WorkerState,
-    matcher: &grep_regex::RegexMatcher,
-    root: &Path,
-    files: &[PathBuf],
-    opts: &SearchOpts,
-    window: &WindowState,
-    window_cap: usize,
-) {
-    loop {
-        let idx = cursor.fetch_add(1, Ordering::Relaxed);
-        if idx >= files.len() {
-            return;
-        }
-        // Bounded-window backpressure: hold off searching until this
-        // index falls within a ring-capacity of the print cursor. Waiting
-        // BEFORE the search (not before the send) means blocked workers
-        // hold no Done at all, keeping the invariant exactly one-sided.
-        {
-            let mut guard = window.lock.lock().unwrap();
-            while idx >= window.next.load(Ordering::Acquire) + window_cap {
-                guard = window.room.wait(guard).unwrap();
-            }
-        }
-        let rel = &files[idx];
-        let (buf, matched, stats) = match search_one(state, matcher, root, rel, opts) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("glep: {}: {}", rel.display(), e);
-                (Vec::new(), false, None)
-            }
-        };
-        if tx
-            .send(Done {
-                idx,
-                buf,
-                matched,
-                stats,
-            })
-            .is_err()
-        {
-            return; // printer gone: nothing left to do
-        }
-    }
-}
-
-/// Printer-thread state: a bounded ring of finished-but-not-yet-printed
-/// results plus the running cursor of the next index to emit. Ring safety:
-/// at most `window + workers` results can exist outside the printer at
-/// once (the bounded channel holds `window`; each worker holds one more
-/// mid-send), so the ring is sized accordingly and a slot is only reused
-/// after its occupant was printed.
+/// In-order output state, shared by the on-thread small path and the
+/// printer thread so byte output cannot drift between them. Results are
+/// emitted strictly in file-index order; `separate` drives the
+/// rg-compatible group separator (`--` in context modes, a blank line
+/// under --heading, or --context-separator's bytes).
 struct Printer {
     next: usize,
-    ring: Vec<Option<Done>>,
+    ring: Vec<Option<FileResult>>,
     ring_mask: usize,
     total: usize,
     separate: bool,
+    heading: bool,
+    context_separator: Option<Vec<u8>>,
+    line_buffered: bool,
     printed_any: bool,
     found: bool,
     total_stats: grep_printer::Stats,
+    /// --files-without-match: which file indices matched (the complement
+    /// over the universe prints after the search).
+    matched_idx: Option<Vec<bool>>,
     /// Write coalescing buffer: a kernel-scale every-file search issues
     /// one write syscall per file (~86k syscalls, ~150ms). Batching into
     /// 256KB flushes cuts that to a few hundred with byte-identical
@@ -406,29 +859,41 @@ struct Printer {
     out_buf: Vec<u8>,
 }
 
-/// Flush the coalescing buffer once it passes this size.
-const PRINT_BATCH: usize = 256 * 1024;
-
 impl Printer {
-    fn advance_window(&self, window: &WindowState) {
-        window.next.store(self.next, Ordering::Release);
-        let _guard = window.lock.lock().unwrap();
-        window.room.notify_all();
-    }
-
-    fn new(separate: bool, window: usize, workers: usize, total: usize) -> Printer {
-        let cap = (window + workers + 1).next_power_of_two();
+    fn new(opts: &SearchOpts, ring_cap: usize, total: usize) -> Printer {
+        let cap = ring_cap.max(1).next_power_of_two();
+        let separate = (opts.heading || opts.before > 0 || opts.after > 0)
+            && !opts.files_with_matches
+            && !opts.files_without_match
+            && !opts.json
+            && !opts.count
+            && !opts.count_matches
+            && !opts.quiet;
         Printer {
             next: 0,
             ring: (0..cap).map(|_| None).collect(),
             ring_mask: cap - 1,
             total,
             separate,
+            heading: opts.heading,
+            context_separator: opts.context_separator.clone(),
+            line_buffered: opts.line_buffered,
             printed_any: false,
             found: false,
             total_stats: grep_printer::Stats::new(),
-            out_buf: Vec::with_capacity(PRINT_BATCH + 64 * 1024),
+            matched_idx: opts.files_without_match.then(|| vec![false; total]),
+            out_buf: Vec::with_capacity(if total > SMALL_WORKLOAD {
+                PRINT_BATCH + 64 * 1024
+            } else {
+                0
+            }),
         }
+    }
+
+    fn advance_window(&self, window: &WindowState) {
+        window.next.store(self.next, Ordering::Release);
+        let _guard = window.lock.lock().unwrap();
+        window.room.notify_all();
     }
 
     fn write_bytes(
@@ -436,6 +901,10 @@ impl Printer {
         bytes: &[u8],
         out: &mut (dyn std::io::Write + Send),
     ) -> std::io::Result<()> {
+        if self.line_buffered {
+            out.write_all(bytes)?;
+            return out.flush();
+        }
         self.out_buf.extend_from_slice(bytes);
         if self.out_buf.len() >= PRINT_BATCH {
             out.write_all(&self.out_buf)?;
@@ -466,7 +935,7 @@ impl Printer {
             );
             std::process::abort();
         }
-        self.ring[slot] = Some(d);
+        self.ring[slot] = Some(d.res);
         self.drain(out)
     }
 
@@ -474,42 +943,67 @@ impl Printer {
     /// order. Called after each stash and once more at channel close.
     fn drain(&mut self, out: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
         while self.next < self.total {
-            let d = match self.ring[self.next & self.ring_mask].take() {
-                Some(d) => d,
+            let res = match self.ring[self.next & self.ring_mask].take() {
+                Some(r) => r,
                 None => break,
             };
-            self.emit(d, out)?;
+            self.emit(res, out)?;
         }
         Ok(())
     }
 
-    fn emit(&mut self, d: Done, out: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
-        let Done {
-            idx,
+    fn emit(
+        &mut self,
+        res: FileResult,
+        out: &mut (dyn std::io::Write + Send),
+    ) -> anyhow::Result<()> {
+        let idx = self.next;
+        self.next += 1;
+        let FileResult {
             buf,
             matched,
             stats,
-        } = d;
-        debug_assert_eq!(idx, self.next, "printer must emit in order");
-        self.next += 1;
-        if matched {
-            self.found = true;
-        }
+        } = res;
         if let Some(s) = &stats {
             merge_stats(&mut self.total_stats, s);
         }
-        if matched {
-            if self.separate && self.printed_any {
-                self.write_bytes(b"--\n", out)?;
-            }
-            self.write_bytes(&buf, out)?;
-            self.printed_any = true;
+        if let Some(m) = &mut self.matched_idx {
+            m[idx] = matched;
         }
+        if matched {
+            self.found = true;
+        }
+        // Write any produced output, not just matches: --passthru emits
+        // every line including non-matching ones, and --include-zero -c
+        // emits `path:0` lines for searched files.
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.separate && self.printed_any {
+            match &self.context_separator {
+                // "" disables the separator entirely
+                Some(v) if v.is_empty() => {}
+                Some(v) => {
+                    let mut sep = v.clone();
+                    sep.push(b'\n');
+                    self.write_bytes(&sep, out)?;
+                }
+                None => {
+                    if self.heading {
+                        self.write_bytes(b"\n", out)?;
+                    } else {
+                        self.write_bytes(b"--\n", out)?;
+                    }
+                }
+            }
+        }
+        self.write_bytes(&buf, out)?;
+        self.printed_any = true;
         Ok(())
     }
 }
 
-fn finish_json(
+fn write_summary(
     out: &mut (dyn std::io::Write + Send),
     total_stats: &mut grep_printer::Stats,
     elapsed: Duration,
@@ -535,14 +1029,17 @@ fn finish_json(
 }
 
 /// Thread-safe stdout adapter: `StdoutLock` guards are not `Send`, but
-/// `run` hands the writer to worker threads. `Stdout` itself is `Sync`;
-/// locking per write call is fine here because the pipeline already emits
-/// one buffered write per file.
+/// `run` hands the writer to the printer thread. `Stdout` itself is
+/// `Sync`; locking per write call is fine here because the pipeline
+/// already coalesces output into large batched writes.
 pub struct StdoutOut;
 
 impl std::io::Write for StdoutOut {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         std::io::stdout().lock().write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        std::io::stdout().lock().write_all(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stdout().lock().flush()
@@ -550,8 +1047,32 @@ impl std::io::Write for StdoutOut {
 }
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
-/// in input order for determinism. Returns true if anything matched.
+/// in input order for determinism. Returns true if anything matched (for
+/// --files-without-match: if any file was listed).
 ///
+/// `universe` is --files-without-match's domain: the full live, filtered
+/// file set. Files that were narrowed out by the index can't contain the
+/// pattern, so they are "without match" by construction and print
+/// without being searched; the index still narrows what is searched.
+pub fn run(
+    pattern: &str,
+    root: &Path,
+    files: &[PathBuf],
+    universe: Option<&[PathBuf]>,
+    opts: &SearchOpts,
+    out: &mut (dyn std::io::Write + Send),
+) -> anyhow::Result<bool> {
+    // Two monomorphized paths, one per engine. Sinks and the searcher are
+    // generic over Matcher; only the builder differs. Building the matcher
+    // up front also validates the pattern before any I/O.
+    if opts.pcre2 {
+        let matcher = build_pcre2_matcher(pattern, opts)?;
+        return run_impl(&matcher, root, files, universe, opts, out);
+    }
+    let matcher = build_matcher(pattern, opts)?;
+    run_impl(&matcher, root, files, universe, opts, out)
+}
+
 /// Parallel design (v2): workers pull file indices off a shared atomic
 /// cursor, no per-chunk barriers like the old `chunks(128)` loop, so one
 /// slow file never stalls the whole fleet. A dedicated printer thread
@@ -562,63 +1083,68 @@ impl std::io::Write for StdoutOut {
 /// ever holds a lock while writing to stdout. Each worker owns one
 /// reusable `Searcher` (buffers included), mirroring ripgrep's per-thread
 /// SearchWorker reuse.
-pub fn run(
-    pattern: &str,
+fn run_impl<M: Matcher + Sync>(
+    matcher: &M,
     root: &Path,
     files: &[PathBuf],
+    universe: Option<&[PathBuf]>,
     opts: &SearchOpts,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<bool> {
     // Times the whole run, used for the --json summary event's
-    // `elapsed_total` (and, per design, `stats.elapsed` too: see below).
+    // `elapsed_total` (and, per design, `stats.elapsed` too: see
+    // write_summary) and the --stats block.
     let start = Instant::now();
-    // Build the matcher once up front; shared by reference across the
-    // workers (grep_regex::RegexMatcher is Sync). This also validates the
-    // pattern before I/O, matching prior behavior.
-    let matcher = build_matcher(pattern, opts)?;
-    let separate = (opts.before > 0 || opts.after > 0)
-        && !opts.files_with_matches
-        && !opts.json
-        && !opts.count;
+    // Resolve the -E label up front so a bad label errors before any I/O
+    // (the reference exits 2 on an unknown encoding).
+    let encoding = match &opts.encoding {
+        Some(label) => {
+            Some(grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?)
+        }
+        None => None,
+    };
 
-    if files.len() <= 32 {
+    let mut printer = if files.len() <= SMALL_WORKLOAD {
         // Small workloads: stay on this thread, one reusable searcher,
         // zero synchronization. This is the agent-small-repo fast path.
-        let mut state = WorkerState::new(opts);
-        let mut found = false;
-        let mut printed_any = false;
-        let mut total_stats = grep_printer::Stats::new();
+        let mut state = WorkerState::new(opts, encoding.as_ref());
+        let mut printer = Printer::new(opts, files.len(), files.len());
         for rel in files {
-            let (buf, matched, stats) = match search_one(&mut state, &matcher, root, rel, opts) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("glep: {}: {}", rel.display(), e);
-                    (Vec::new(), false, None)
-                }
-            };
-            emit_result(
-                out,
-                &buf,
-                matched,
-                &stats,
-                separate,
-                &mut printed_any,
-                &mut total_stats,
-            )?;
-            if matched {
-                found = true;
+            let res = search_one_or_warn(&mut state, matcher, root, rel, opts);
+            let stop = opts.quiet && res.matched;
+            printer.emit(res, out)?;
+            if stop {
+                // -q: the first match settles the exit code.
+                break;
             }
         }
-        if opts.json {
-            finish_json(out, &mut total_stats, start.elapsed())?;
-        }
-        return Ok(found);
-    }
+        printer.flush_batch(out)?;
+        printer
+    } else {
+        run_pool(matcher, root, files, opts, encoding.as_ref(), out)?
+    };
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len());
+    finish(&mut printer, files, universe, opts, out, start)
+}
+
+/// The worker pool + in-order printer thread for workloads larger than
+/// `SMALL_WORKLOAD`. Returns the printer's final state (found flag,
+/// merged stats, matched indices).
+fn run_pool<M: Matcher + Sync>(
+    matcher: &M,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+    encoding: Option<&grep_searcher::Encoding>,
+    out: &mut (dyn std::io::Write + Send),
+) -> anyhow::Result<Printer> {
+    let parallelism = match opts.threads {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    };
+    let workers = parallelism.min(files.len()).max(1);
     // The channel capacity is the memory bound: at most this many file
     // output buffers (plus one per worker in flight) exist at once.
     let window = (workers * 16).max(64);
@@ -626,11 +1152,13 @@ pub fn run(
     // Ring capacity (mirrors Printer::new's computation) is the lead
     // bound the workers wait against.
     let ring_cap = (window + workers + 1).next_power_of_two();
-    let window_state = std::sync::Arc::new(WindowState {
+    let window_state = WindowState {
         next: AtomicUsize::new(0),
         room: Condvar::new(),
         lock: Mutex::new(()),
-    });
+    };
+    // -q: set by the first match; workers stop claiming new files.
+    let stop = AtomicBool::new(false);
 
     // Declared outside the scope so worker borrows outlive it.
     let cursor = AtomicUsize::new(0);
@@ -639,30 +1167,22 @@ pub fn run(
         // Printer thread: the only writer to `out`; workers are free to
         // keep searching while it prints.
         let printer_out = &mut *out;
-        let mut printer = Printer::new(separate, window, workers, files.len());
-        let printer_window = window_state.clone();
+        let mut printer = Printer::new(opts, ring_cap, files.len());
+        let printer_window = &window_state;
         let printer_handle = scope.spawn(move || -> anyhow::Result<Printer> {
-            run_printer(rx, &mut printer, printer_out, &printer_window)?;
+            run_printer(rx, &mut printer, printer_out, printer_window)?;
             Ok(printer)
         });
-        let cursor_ref = &cursor;
-        let matcher_ref = &matcher;
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let mut state = WorkerState::new(opts);
+            let mut state = WorkerState::new(opts, encoding);
             let tx = tx.clone();
-            let window_ref = window_state.clone();
+            let cursor = &cursor;
+            let window = &window_state;
+            let stop = &stop;
             handles.push(scope.spawn(move || {
                 worker(
-                    cursor_ref,
-                    &tx,
-                    &mut state,
-                    matcher_ref,
-                    root,
-                    files,
-                    opts,
-                    &window_ref,
-                    ring_cap,
+                    cursor, &tx, &mut state, matcher, root, files, opts, window, ring_cap, stop,
                 );
             }));
         }
@@ -676,12 +1196,59 @@ pub fn run(
         printer_result = Some(printer_handle.join().expect("printer thread panicked")?);
         Ok(())
     })?;
-    let mut printer = printer_result.expect("printer state collected");
+    Ok(printer_result.expect("printer state collected"))
+}
 
-    if opts.json {
-        finish_json(out, &mut printer.total_stats, start.elapsed())?;
+/// Worker loop: claim indices from the shared cursor, search each file with
+/// the thread-local reusable state, and send the finished result to the
+/// printer thread. Errors from individual files keep rg's behavior: warn on
+/// stderr, treat as unmatched, keep going (and still send the result so
+/// in-order printing never stalls). Every claimed index is always sent,
+/// even after a -q stop, so the printer's cursor can reach any index a
+/// waiting worker holds.
+#[allow(clippy::too_many_arguments)]
+fn worker<M: Matcher + Sync>(
+    cursor: &AtomicUsize,
+    tx: &SyncSender<Done>,
+    state: &mut WorkerState,
+    matcher: &M,
+    root: &Path,
+    files: &[PathBuf],
+    opts: &SearchOpts,
+    window: &WindowState,
+    window_cap: usize,
+    stop: &AtomicBool,
+) {
+    loop {
+        let idx = cursor.fetch_add(1, Ordering::Relaxed);
+        if idx >= files.len() {
+            return;
+        }
+        // Bounded-window backpressure: hold off searching until this
+        // index falls within a ring-capacity of the print cursor. Waiting
+        // BEFORE the search (not before the send) means blocked workers
+        // hold no result at all, keeping the invariant exactly one-sided.
+        {
+            let mut guard = window.lock.lock().unwrap();
+            while idx >= window.next.load(Ordering::Acquire) + window_cap {
+                guard = window.room.wait(guard).unwrap();
+            }
+        }
+        let res = if stop.load(Ordering::Relaxed) {
+            FileResult::empty()
+        } else {
+            search_one_or_warn(state, matcher, root, &files[idx], opts)
+        };
+        if opts.quiet && res.matched {
+            stop.store(true, Ordering::Relaxed);
+            // No new claims: everything below the cursor is already
+            // claimed and will be sent by its owner.
+            cursor.fetch_max(files.len(), Ordering::Relaxed);
+        }
+        if tx.send(Done { idx, res }).is_err() {
+            return; // printer gone: nothing left to do
+        }
     }
-    Ok(printer.found)
 }
 
 /// Printer loop: receive results until the channel closes (all senders
@@ -703,6 +1270,67 @@ fn run_printer(
     Ok(())
 }
 
+/// Everything printed after the per-file results: the
+/// --files-without-match complement, the --json summary event, and the
+/// --stats block.
+fn finish(
+    printer: &mut Printer,
+    files: &[PathBuf],
+    universe: Option<&[PathBuf]>,
+    opts: &SearchOpts,
+    out: &mut (dyn std::io::Write + Send),
+    start: Instant,
+) -> anyhow::Result<bool> {
+    let mut found = printer.found;
+    if opts.files_without_match {
+        found = false;
+        let matched: std::collections::HashSet<&Path> = printer
+            .matched_idx
+            .as_ref()
+            .map(|m| {
+                files
+                    .iter()
+                    .zip(m.iter())
+                    .filter(|(_, &hit)| hit)
+                    .map(|(p, _)| p.as_path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut buf = Vec::new();
+        for p in universe.unwrap_or(files) {
+            if !matched.contains(p.as_path()) {
+                found = true;
+                write_path(&mut buf, &display_path(p, opts), opts.path_separator);
+                buf.push(opts.path_terminator.unwrap_or(b'\n'));
+            }
+        }
+        out.write_all(&buf)?;
+    }
+    if opts.json {
+        write_summary(out, &mut printer.total_stats, start.elapsed())?;
+    } else if opts.stats && !opts.quiet {
+        // rg's stats block: a blank line then fixed-order counters.
+        // `bytes_printed` is whatever the printer tracked (standard mode);
+        // count/-l modes report 0 there like rg's non-printer paths.
+        let elapsed = start.elapsed();
+        let s = &printer.total_stats;
+        writeln!(
+            out,
+            "\n{} matches\n{} matched lines\n{} files contained matches\n{} files searched\n{} bytes printed\n{} bytes searched\n{:.6} seconds spent searching\n{:.6} seconds total",
+            s.matches(),
+            s.matched_lines(),
+            s.searches_with_match(),
+            s.searches(),
+            s.bytes_printed(),
+            s.bytes_searched(),
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64()
+        )?;
+    }
+    out.flush()?;
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,29 +1344,22 @@ mod tests {
     }
 
     fn opts() -> SearchOpts {
-        SearchOpts {
-            case_insensitive: false,
-            fixed: false,
-            files_with_matches: false,
-            before: 0,
-            after: 0,
-            json: false,
-            count: false,
-            multiline: false,
-        }
+        SearchOpts::default()
+    }
+
+    fn run_str(pattern: &str, root: &Path, files: &[PathBuf], o: &SearchOpts) -> (bool, String) {
+        let mut out = Vec::new();
+        let found = run(pattern, root, files, None, o, &mut out).unwrap();
+        (found, String::from_utf8(out).unwrap())
     }
 
     #[test]
     fn default_output_is_path_line_text() {
         let dir = corpus();
         let files = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
-        let mut out = Vec::new();
-        let found = run("hello", dir.path(), &files, &opts(), &mut out).unwrap();
+        let (found, out) = run_str("hello", dir.path(), &files, &opts());
         assert!(found);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "a.txt:1:one hello\na.txt:3:three hello\n"
-        );
+        assert_eq!(out, "a.txt:1:one hello\na.txt:3:three hello\n");
     }
 
     #[test]
@@ -747,18 +1368,16 @@ mod tests {
         let files = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
         let mut o = opts();
         o.files_with_matches = true;
-        let mut out = Vec::new();
-        let found = run("hello", dir.path(), &files, &o, &mut out).unwrap();
+        let (found, out) = run_str("hello", dir.path(), &files, &o);
         assert!(found);
-        assert_eq!(String::from_utf8(out).unwrap(), "a.txt\n");
+        assert_eq!(out, "a.txt\n");
     }
 
     #[test]
     fn no_match_returns_false() {
         let dir = corpus();
         let files = vec![PathBuf::from("a.txt")];
-        let mut out = Vec::new();
-        let found = run("absent_zz", dir.path(), &files, &opts(), &mut out).unwrap();
+        let (found, out) = run_str("absent_zz", dir.path(), &files, &opts());
         assert!(!found);
         assert!(out.is_empty());
     }
@@ -769,19 +1388,17 @@ mod tests {
         let files = vec![PathBuf::from("a.txt")];
         let mut o = opts();
         o.case_insensitive = true;
-        let mut out = Vec::new();
-        assert!(run("HELLO", dir.path(), &files, &o, &mut out).unwrap());
+        let (found, _) = run_str("HELLO", dir.path(), &files, &o);
+        assert!(found);
     }
 
-    /// The parallel path (files.len() > 32) must produce byte-identical
-    /// output to the sequential path: build 100 files with a known match
-    /// pattern and compare against the expected ordered bytes.
-    #[test]
-    fn parallel_output_matches_expected_order() {
+    /// A corpus strictly larger than SMALL_WORKLOAD so `run` takes the
+    /// worker-pool path. Every third file matches `needle`.
+    fn big_corpus(n: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
+        assert!(n > SMALL_WORKLOAD);
         let dir = tempfile::tempdir().unwrap();
         let mut files = Vec::new();
-        let mut expect = String::new();
-        for i in 0..100 {
+        for i in 0..n {
             let name = format!("f{:03}.txt", i);
             let content = if i % 3 == 0 {
                 format!("line one\nneedle here {}\nline three\n", i)
@@ -789,15 +1406,42 @@ mod tests {
                 format!("file {} has no matches\n", i)
             };
             std::fs::write(dir.path().join(&name), content).unwrap();
-            let expect_name = name.clone();
             files.push(PathBuf::from(name));
+        }
+        (dir, files)
+    }
+
+    /// The parallel path (files.len() > SMALL_WORKLOAD) must produce
+    /// byte-identical output to the sequential path: build 100 files with
+    /// a known match pattern and compare against the expected ordered bytes.
+    #[test]
+    fn parallel_output_matches_expected_order() {
+        let (dir, files) = big_corpus(100);
+        let mut expect = String::new();
+        for (i, f) in files.iter().enumerate() {
             if i % 3 == 0 {
-                expect.push_str(&format!("{}:2:needle here {}\n", expect_name, i));
+                expect.push_str(&format!("{}:2:needle here {}\n", f.display(), i));
             }
         }
-        let mut out = Vec::new();
-        assert!(run("needle", dir.path(), &files, &opts(), &mut out).unwrap());
-        assert_eq!(String::from_utf8(out).unwrap(), expect);
+        let (found, out) = run_str("needle", dir.path(), &files, &opts());
+        assert!(found);
+        assert_eq!(out, expect);
+    }
+
+    /// The same 100-file search through a 2-worker pool (-j 2) and through
+    /// one worker: identical bytes regardless of the worker count.
+    #[test]
+    fn parallel_output_independent_of_thread_count() {
+        let (dir, files) = big_corpus(100);
+        let mut o1 = opts();
+        o1.threads = Some(1);
+        let mut o2 = opts();
+        o2.threads = Some(2);
+        let (_, a) = run_str("needle", dir.path(), &files, &o1);
+        let (_, b) = run_str("needle", dir.path(), &files, &o2);
+        let (_, c) = run_str("needle", dir.path(), &files, &opts());
+        assert_eq!(a, b);
+        assert_eq!(a, c);
     }
 
     /// -l through the parallel path must print one path per matched file,
@@ -811,18 +1455,17 @@ mod tests {
             let name = format!("h{:03}.txt", i);
             let content = if i % 7 == 0 { "has needle\n" } else { "nope\n" };
             std::fs::write(dir.path().join(&name), content).unwrap();
-            let expect_name = name.clone();
-            files.push(PathBuf::from(name));
+            files.push(PathBuf::from(&name));
             if i % 7 == 0 {
-                expect.push_str(&expect_name);
+                expect.push_str(&name);
                 expect.push('\n');
             }
         }
         let mut o = opts();
         o.files_with_matches = true;
-        let mut out = Vec::new();
-        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
-        assert_eq!(String::from_utf8(out).unwrap(), expect);
+        let (found, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(found);
+        assert_eq!(out, expect);
     }
 
     /// -c through the parallel path: per-file counts, ordered.
@@ -834,22 +1477,96 @@ mod tests {
         for i in 0..64 {
             let name = format!("k{:03}.txt", i);
             let n = i % 4; // 0..=3 matches
-            let content: String = std::iter::repeat("needle line\n")
-                .take(n)
-                .collect::<Vec<_>>()
-                .join("");
+            let content: String = std::iter::repeat_n("needle line\n", n).collect();
             std::fs::write(dir.path().join(&name), content).unwrap();
-            let expect_name = name.clone();
-            files.push(PathBuf::from(name));
+            files.push(PathBuf::from(&name));
             if n > 0 {
-                expect.push_str(&format!("{}:{}\n", expect_name, n));
+                expect.push_str(&format!("{}:{}\n", name, n));
             }
         }
         let mut o = opts();
         o.count = true;
-        let mut out = Vec::new();
-        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
-        assert_eq!(String::from_utf8(out).unwrap(), expect);
+        let (found, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(found);
+        assert_eq!(out, expect);
+    }
+
+    /// --files-without-match through the parallel path: the complement,
+    /// in input order, and exit status true when anything was listed.
+    #[test]
+    fn parallel_files_without_match_ordered() {
+        let (dir, files) = big_corpus(70);
+        let mut o = opts();
+        o.files_without_match = true;
+        let (found, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(found);
+        let expect: String = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != 0)
+            .map(|(_, f)| format!("{}\n", f.display()))
+            .collect();
+        assert_eq!(out, expect);
+    }
+
+    /// -q through the parallel path: nothing printed, a match found, and
+    /// the run stops early without deadlocking the in-order printer.
+    #[test]
+    fn parallel_quiet_prints_nothing_and_finds() {
+        let (dir, files) = big_corpus(200);
+        let mut o = opts();
+        o.quiet = true;
+        let (found, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(found);
+        assert!(out.is_empty());
+        let (found, out) = run_str("zz_absent_zz", dir.path(), &files, &o);
+        assert!(!found);
+        assert!(out.is_empty());
+    }
+
+    /// --json -q through the parallel path: exactly one line, the summary.
+    #[test]
+    fn parallel_quiet_json_emits_only_summary() {
+        let (dir, files) = big_corpus(90);
+        let mut o = opts();
+        o.quiet = true;
+        o.json = true;
+        let (found, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(found);
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"type\":\"summary\""));
+    }
+
+    /// --heading through the parallel path: blank line between groups.
+    #[test]
+    fn parallel_heading_groups() {
+        let (dir, files) = big_corpus(40);
+        let mut o = opts();
+        o.heading = true;
+        let (_, out) = run_str("needle", dir.path(), &files, &o);
+        let mut expect = String::new();
+        for (i, f) in files.iter().enumerate().filter(|(i, _)| i % 3 == 0) {
+            if !expect.is_empty() {
+                expect.push('\n');
+            }
+            expect.push_str(&format!("{}\n2:needle here {}\n", f.display(), i));
+        }
+        assert_eq!(out, expect);
+    }
+
+    /// --stats through the parallel path: counters summed over every file.
+    #[test]
+    fn parallel_stats_totals() {
+        let (dir, files) = big_corpus(99);
+        let mut o = opts();
+        o.stats = true;
+        let (_, out) = run_str("needle", dir.path(), &files, &o);
+        assert!(
+            out.contains(
+                "\n33 matches\n33 matched lines\n33 files contained matches\n99 files searched\n"
+            ),
+            "{out}"
+        );
     }
 
     /// Context mode through the parallel path must reproduce the exact
@@ -873,7 +1590,7 @@ mod tests {
         o.before = 1;
         o.after = 1;
         let mut out = Vec::new();
-        assert!(run("needle", dir.path(), &files, &o, &mut out).unwrap());
+        assert!(run("needle", dir.path(), &files, None, &o, &mut out).unwrap());
 
         // Ground truth: real rg with sorted output in the same tree.
         let rg = std::process::Command::new("rg")

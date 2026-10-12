@@ -427,6 +427,21 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &Os
     if is_hard_excluded(name) {
         return true;
     }
+    matches!(
+        stack_verdict(stack, abs_path, is_dir),
+        ignore::Match::Ignore(_)
+    )
+}
+
+/// The stack's combined verdict for `abs_path`: deepest non-None wins
+/// (matchers were pushed shallowest to deepest). Returns the raw Match so
+/// the caller can distinguish Whitelist (rescues hidden-ness) from a
+/// plain no-match.
+fn stack_verdict<'a>(
+    stack: &'a [Arc<Gitignore>],
+    abs_path: &Path,
+    is_dir: bool,
+) -> ignore::Match<&'a ignore::gitignore::Glob> {
     let mut verdict = ignore::Match::None;
     for gi in stack {
         match gi.matched(abs_path, is_dir) {
@@ -434,10 +449,31 @@ fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &Os
             m => verdict = m,
         }
     }
-    match verdict {
-        ignore::Match::Ignore(_) => true,
-        ignore::Match::Whitelist(_) => false,
-        ignore::Match::None => false,
+    verdict
+}
+
+/// Effective hiddenness for a yielded file, mirroring the walker check:
+/// hidden iff some dot-prefixed prefix of `rel` did not earn a whitelist
+/// verdict from the ignore stack. A whitelisted `.github/` dir makes its
+/// children ordinary files; `.github/.env` still needs a rescue of its
+/// own. `rel` is the root-relative path. Non-dot paths short-circuit
+/// through the component scan without a matcher call.
+fn still_hidden(stack: &[Arc<Gitignore>], root: &Path, rel: &Path) -> bool {
+    let mut p = rel;
+    loop {
+        if p.file_name()
+            .is_some_and(|n| n.as_encoded_bytes().first() == Some(&b'.'))
+        {
+            let is_dir = p != rel;
+            let verdict = stack_verdict(stack, &root.join(p), is_dir);
+            if !verdict.is_whitelist() {
+                return true;
+            }
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => return false,
+        }
     }
 }
 
@@ -621,6 +657,19 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
     Ok(stack)
 }
 
+/// True when `rel` (root-relative) lies inside one of the scope prefixes.
+fn in_scope(rel: &Path, prefixes: &[PathBuf]) -> bool {
+    prefixes.iter().any(|p| rel.starts_with(p))
+}
+
+/// True when the directory `rel` must be descended for a scoped sweep:
+/// it is inside a prefix, or it is an ancestor of one.
+fn dir_in_scope(rel: &Path, prefixes: &[PathBuf]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| rel.starts_with(p) || p.starts_with(rel))
+}
+
 fn scan_recursive<'scope>(
     scope: &rayon::Scope<'scope>,
     root: &'scope Path,
@@ -628,6 +677,7 @@ fn scan_recursive<'scope>(
     matchers: Vec<Arc<Gitignore>>,
     buffers: &'scope [Mutex<Vec<FileMeta>>],
     fatal: &'scope Mutex<Option<anyhow::Error>>,
+    filter: Option<&'scope [PathBuf]>,
 ) {
     let scan = match bulk_scan_dir(&dir) {
         Ok(s) => s,
@@ -690,7 +740,12 @@ fn scan_recursive<'scope>(
             continue;
         }
         let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
-        let hidden = crate::walk::path_is_hidden(&rel);
+        if filter.is_some_and(|f| !in_scope(&rel, f)) {
+            continue;
+        }
+        // still_hidden is cheap for ordinary paths (a component scan);
+        // only dot-prefixed prefixes pay a matcher lookup.
+        let hidden = still_hidden(&stack, root, &rel);
         local_files.push(FileMeta {
             path: rel,
             mtime_ns: entry.mtime_ns,
@@ -711,9 +766,14 @@ fn scan_recursive<'scope>(
         if is_ignored(&stack, &abs, true, &name) {
             continue;
         }
+        if let Some(f) = filter {
+            if !dir_in_scope(abs.strip_prefix(root).unwrap_or(&abs), f) {
+                continue;
+            }
+        }
         let child_matchers = stack.clone(); // Vec<Arc<Gitignore>>: cheap, just Arc pointer copies
         scope.spawn(move |scope| {
-            scan_recursive(scope, root, abs, child_matchers, buffers, fatal);
+            scan_recursive(scope, root, abs, child_matchers, buffers, fatal, filter);
         });
     }
 }
@@ -736,6 +796,22 @@ fn scan_recursive<'scope>(
 /// `sweep_bulk` like any other fatal error, sending the whole sweep to the
 /// walker fallback.
 pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
+    sweep_bulk_filtered(root, None)
+}
+
+/// `sweep_bulk` restricted to `prefixes` (root-relative): the SAME walk
+/// from the root, with the same matcher stack, pruned to directories on
+/// the way to or inside a prefix and to files inside one. The result is
+/// exactly the full sweep's subset under the prefixes, so an ignored
+/// directory named as a prefix yields nothing (it never enters the index)
+/// and every ancestor `.gitignore` between the root and a prefix applies.
+/// A `.ignore`/`.rgignore` on the scanned path defers to the walker like
+/// the full sweep does. Unsorted, like `sweep_bulk`.
+pub fn sweep_bulk_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<FileMeta>> {
+    sweep_bulk_filtered(root, Some(prefixes))
+}
+
+fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",
@@ -756,6 +832,7 @@ pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
             seed_matchers,
             &buffers,
             &fatal,
+            filter,
         );
     });
 
@@ -1079,7 +1156,9 @@ fn scan_listing<'a, 'b>(
                 continue;
             }
             let crel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
-            let hidden = crate::walk::path_is_hidden(&crel);
+            // Same whitelist-aware rule as the sweep (and so the
+            // manifest's FLAG_HIDDEN): a `!` rule can un-hide a dotfile.
+            let hidden = still_hidden(&stack, root, &crel);
             let fm = FileMeta {
                 path: crel,
                 mtime_ns: entry.mtime_ns,
