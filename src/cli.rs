@@ -705,41 +705,109 @@ fn sort_is_path_order(args: &Args) -> bool {
     )
 }
 
-/// Sort the file list per --sort/--sortr. `files` arrives in path order,
-/// which `path` (and `none`) keep; timestamp fields stat each candidate
-/// (sets are usually small) and break ties by path; --sortr reverses.
+/// Walk positions in rg's own traversal order: rg sorts by timestamp with
+/// a stable sort over a single-threaded, UNSORTED walk (sorting forces
+/// one thread), so files with equal timestamps keep directory-entry order
+/// (readdir order: hash order on ext4/APFS, case-insensitive name order
+/// on NTFS). The same `ignore` walk over the same operands reproduces
+/// that order exactly; filtering never reorders survivors, so walking with
+/// glep's own ignore settings is enough to rank every candidate.
+fn walk_positions(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+) -> std::collections::HashMap<PathBuf, usize> {
+    let mut operands: Vec<PathBuf> = args.paths.iter().map(|p| root.join(p)).collect();
+    if operands.is_empty() {
+        operands.push(root.join(cwd_rel));
+    }
+    let mut wb = ignore::WalkBuilder::new(&operands[0]);
+    for op in &operands[1..] {
+        wb.add(op);
+    }
+    let respect = !args.no_ignore;
+    wb.require_git(false)
+        .hidden(false)
+        .ignore(respect && !args.no_ignore_dot)
+        .git_ignore(respect && !args.no_ignore_vcs)
+        .git_exclude(respect && !args.no_ignore_exclude)
+        .git_global(respect && !args.no_ignore_global)
+        .parents(respect && !args.no_ignore_parent)
+        .follow_links(args.follow)
+        .same_file_system(args.one_file_system)
+        .filter_entry(|e| e.file_name() != ".git" && e.file_name() != ".glep");
+    let mut pos = std::collections::HashMap::new();
+    for ent in wb.build().flatten() {
+        if ent.file_type().is_some_and(|t| t.is_dir()) {
+            continue;
+        }
+        let rel = ent
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(ent.path())
+            .to_path_buf();
+        let next = pos.len();
+        pos.entry(rel).or_insert(next);
+    }
+    pos
+}
+
+/// Sort the file list per --sort/--sortr, reproducing rg's ordering
+/// exactly. `files` arrives in path order. `path` ascending (and `none`,
+/// whose order rg leaves unspecified) keep it: Rust's component-wise Path
+/// order is rg's per-directory file-name order. `path` descending
+/// reverses it. Timestamp fields read live metadata (like rg) and break
+/// ties by rg's walk order (see `walk_positions`); a file whose timestamp
+/// cannot be read sorts last ascending and first descending, as in rg.
 fn apply_sort(
     files: &mut Vec<PathBuf>,
     args: &Args,
     root: &Path,
-    _cwd_rel: &Path,
+    cwd_rel: &Path,
 ) -> anyhow::Result<()> {
     let Some((mode, reverse)) = sort_request(args) else {
         return Ok(());
     };
     match mode {
-        "path" | "none" => {}
+        "none" => {}
+        "path" => {
+            if reverse {
+                files.reverse();
+            }
+        }
         "modified" | "accessed" | "created" => {
-            let key = |f: &PathBuf| -> u128 {
-                std::fs::metadata(root.join(f))
-                    .ok()
-                    .and_then(|m| match mode {
-                        "modified" => m.modified().ok(),
-                        "accessed" => m.accessed().ok(),
-                        _ => m.created().ok(),
-                    })
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            };
-            files.sort_by_cached_key(|f| (key(f), f.clone()));
+            let positions = walk_positions(root, cwd_rel, args);
+            let mut keyed: Vec<(Option<std::time::SystemTime>, usize, PathBuf)> = files
+                .drain(..)
+                .map(|f| {
+                    let t = std::fs::metadata(root.join(&f)).ok().and_then(|m| {
+                        match mode {
+                            "modified" => m.modified(),
+                            "accessed" => m.accessed(),
+                            _ => m.created(),
+                        }
+                        .ok()
+                    });
+                    let p = positions.get(&f).copied().unwrap_or(usize::MAX);
+                    (t, p, f)
+                })
+                .collect();
+            keyed.sort_by(|a, b| {
+                use std::cmp::Ordering;
+                let o = match (a.0, b.0) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                };
+                let o = if reverse { o.reverse() } else { o };
+                o.then(a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2))
+            });
+            files.extend(keyed.into_iter().map(|(_, _, f)| f));
         }
         other => {
             anyhow::bail!("{other}: unsupported sort field (path|modified|accessed|created|none)")
         }
-    }
-    if reverse {
-        files.reverse();
     }
     Ok(())
 }

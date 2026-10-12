@@ -353,3 +353,96 @@ fn parity_with_ripgrep() {
         assert_eq!(gc, rc, "exit code diverged for {:?}", args);
     }
 }
+
+/// Stamp every regular file under `dir` (except the index) with the same
+/// modification time, so timestamp sorts are decided entirely by their
+/// tie-break. Coarse filesystem clocks (Linux's jiffy-granular inode
+/// timestamps, NTFS) produce such ties naturally for files written in a
+/// burst, which is how the plain `--sort modified` case above diverged on
+/// Linux CI.
+fn stamp_all(dir: &Path, t: std::time::SystemTime) {
+    for ent in walkdir(dir) {
+        if ent.components().any(|c| c.as_os_str() == ".glep") {
+            continue;
+        }
+        let f = std::fs::File::options().write(true).open(&ent).unwrap();
+        f.set_modified(t).unwrap();
+    }
+}
+
+fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walkdir(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// rg sorts timestamp modes with a STABLE sort over its single-threaded,
+/// unsorted walk, so equal timestamps keep directory-entry order (hash
+/// order on ext4 and APFS, case-insensitive name order on NTFS), and
+/// --sortr reverses the timestamp comparison only, never the ties. glep
+/// must reproduce that exactly on every platform, for listings and for
+/// searches, on the small path and on the worker-pool path.
+#[test]
+fn sort_by_timestamp_ties_follow_rg_walk_order() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    // Enough extra files that searches take the worker-pool path, with
+    // names whose byte order, case-folded order and readdir order differ.
+    for i in 0..48 {
+        let name = match i % 4 {
+            0 => format!("Upper{i:02}.txt"),
+            1 => format!("lower{i:02}.txt"),
+            2 => format!("_under{i:02}.txt"),
+            _ => format!("sub{}/n{i:02}.txt", i % 3),
+        };
+        let p = dir.path().join(&name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("hello tie {i}\n")).unwrap();
+    }
+    let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    stamp_all(dir.path(), t0);
+    let cases: &[&[&str]] = &[
+        &["--sort", "modified", "-l", "hello"],
+        &["--sortr", "modified", "-l", "hello"],
+        &["--sort", "modified", "--files"],
+        &["--sortr", "modified", "--files"],
+        &["--sort", "modified", "hello"],
+        &["--sort", "modified", "-c", "hello"],
+        &["--sortr", "path", "-l", "hello"],
+        &["--sortr", "path", "--files"],
+        &["--sort", "path", "--files"],
+    ];
+    let check = |label: &str| {
+        for args in cases {
+            let (g, gc) = glep_out(dir.path(), args);
+            let (r, rc) = rg_out(dir.path(), args);
+            assert_eq!(g, r, "{label}: stdout diverged for {:?}", args);
+            assert_eq!(gc, rc, "{label}: exit code diverged for {:?}", args);
+        }
+    };
+    check("all timestamps tied");
+    // Now give a few files distinct, later timestamps: they must move to
+    // the end (or the front, reversed) while the rest keep walk order.
+    for (k, name) in ["lower01.txt", "README.md", "sub1/n07.txt"]
+        .iter()
+        .enumerate()
+    {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(name))
+            .unwrap();
+        f.set_modified(t0 + std::time::Duration::from_secs(100 - 10 * k as u64))
+            .unwrap();
+    }
+    check("partially tied");
+}
