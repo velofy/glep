@@ -89,12 +89,16 @@ impl Postings {
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
         let generation = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         anyhow::ensure!(mmap.len() >= HEADER + n * ENTRY, "truncated postings table");
-        let p = Self { mmap, n, generation };
+        let p = Self {
+            mmap,
+            n,
+            generation,
+        };
         let blob_len = p.mmap.len() - HEADER - n * ENTRY;
         for i in 0..n {
             let (_, off, len) = p.entry(i);
             anyhow::ensure!(
-                off.checked_add(len).map_or(false, |end| end <= blob_len),
+                off.checked_add(len).is_some_and(|end| end <= blob_len),
                 "postings table entry out of bounds"
             );
         }

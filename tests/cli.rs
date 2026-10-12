@@ -20,7 +20,11 @@ fn corpus() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "pub fn hello_world() {}\n").unwrap();
-    std::fs::write(dir.path().join("notes.txt"), "hello there\ngeneral kenobi\n").unwrap();
+    std::fs::write(
+        dir.path().join("notes.txt"),
+        "hello there\ngeneral kenobi\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -256,7 +260,10 @@ fn global_excludes_honored_identically_across_sweep_paths() {
     std::fs::remove_dir_all(dir.path().join(".glep")).ok();
     let walker = run(true);
     assert_eq!(bulk, walker);
-    assert!(!bulk.contains("old.bak"), "global excludes must hide old.bak");
+    assert!(
+        !bulk.contains("old.bak"),
+        "global excludes must hide old.bak"
+    );
 }
 
 #[test]
@@ -383,7 +390,10 @@ fn no_ignore_never_touches_the_index() {
         .args(["--no-ignore", "needle_no_ignore"])
         .assert()
         .success();
-    glep(dir.path()).args(["--no-ignore", "--files"]).assert().success();
+    glep(dir.path())
+        .args(["--no-ignore", "--files"])
+        .assert()
+        .success();
 
     let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
     let postings_after = std::fs::read(dir.path().join(".glep/postings.bin")).unwrap();
@@ -478,5 +488,8 @@ fn json_mode_emits_rg_summary_event() {
 #[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
-    glep(dir.path()).args(["-l", "--json", "hello"]).assert().code(2);
+    glep(dir.path())
+        .args(["-l", "--json", "hello"])
+        .assert()
+        .code(2);
 }
