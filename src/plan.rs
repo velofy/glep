@@ -40,7 +40,7 @@ type Dnf = Vec<Vec<Piece>>;
 
 /// Cap on expanded variants (class ranges, alternation products,
 /// repetition multiplicities). Past it the element degrades to
-/// `Boundary`, which is always sound — it just narrows less.
+/// `Boundary`, which is always sound: it just narrows less.
 const MAX_VARIANTS: usize = 64;
 
 fn anything() -> Dnf {
@@ -92,7 +92,7 @@ fn concat(dnfs: Vec<Dnf>) -> Dnf {
     for mut d in dnfs {
         if acc.len().saturating_mul(d.len()) > MAX_VARIANTS {
             // Product would explode past the cap: degrade THIS element to
-            // a boundary. The accumulated groups keep their literals —
+            // a boundary. The accumulated groups keep their literals:
             // sound, just less fused.
             d = anything();
         }
@@ -144,11 +144,11 @@ fn class_alts(class: &regex_syntax::hir::Class) -> Dnf {
 
 /// The required-literal analysis. Soundness invariant: for every string
 /// that can match `hir`, every literal in at least one returned group is
-/// a substring of it. Anything unrecognized is `Boundary` — conservative.
+/// a substring of it. Anything unrecognized is `Boundary`, conservatively.
 fn req(hir: &regex_syntax::hir::Hir) -> Dnf {
     use regex_syntax::hir::HirKind;
     match hir.kind() {
-        // Empty contributes nothing but is NOT a boundary — literals on
+        // Empty contributes nothing but is NOT a boundary: literals on
         // either side remain adjacent (`x(?:)y` is just "xy").
         HirKind::Empty => vec![Vec::new()],
         HirKind::Literal(l) => lit(l.0.to_vec()),
@@ -281,14 +281,15 @@ mod tests {
         assert!(matches!(build(".*", false, false), Plan::All));
         assert!(matches!(build("a", false, false), Plan::All));
         assert!(matches!(build("ab", true, false), Plan::All));
-        assert!(matches!(build("[", false, false), Plan::All)); // unparseable: fall back
-                                                                // `x?yz`: yz is required but too short for trigrams — vacuous.
+        // unparseable: fall back
+        assert!(matches!(build("[", false, false), Plan::All));
+        // `x?yz`: yz is required but too short for trigrams, so vacuous.
         assert!(matches!(build("x?yz", false, false), Plan::All));
     }
 
     #[test]
     fn anything_arm_still_contributes_required_tail() {
-        // `(foo|.*)bar`: every match ends in bar regardless of the arm —
+        // `(foo|.*)bar`: every match ends in bar regardless of the arm, so
         // narrowing on `bar` is sound.
         match build("(foo|.*)bar", false, false) {
             Plan::Groups(g) => {
@@ -320,7 +321,7 @@ mod tests {
 
     #[test]
     fn literals_split_across_boundary_both_required() {
-        // `abc\w+def`: every match contains abc AND def — one group, both lit
+        // `abc\w+def`: every match contains abc AND def: one group, both lit
         // sets (stronger than keeping only the prefix).
         match build("abc\\w+def", false, false) {
             Plan::Groups(g) => {

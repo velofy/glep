@@ -960,7 +960,7 @@ fn files_with_matches_conflicts_with_json() {
 fn binary_files_suppressed_by_default() {
     let dir = corpus();
     std::fs::write(dir.path().join("blob.bin"), b"aa\x00hello-bin\x00zz\n").unwrap();
-    // Default: no output, exit 1 — binary data suppresses the file.
+    // Default: no output, exit 1: binary data suppresses the file.
     glep(dir.path()).args(["hello-bin"]).assert().code(1);
     // -a searches it as text and prints the raw line.
     glep(dir.path())

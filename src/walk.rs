@@ -42,9 +42,9 @@ fn component_is_hidden(name: &std::ffi::OsStr) -> bool {
 /// True when any component of a sweep-relative path starts with '.', e.g.
 /// both `.env` and `.github/workflows/ci.yml` (the second via its `.github`
 /// ancestor, even though `ci.yml` itself is not dot-prefixed). This is the
-/// name-only half of the hidden rule; the second half — whether a `!`
+/// name-only half of the hidden rule; the second half (whether a `!`
 /// whitelist rule in an ignore file rescues a dot component, in which
-/// case the path isn't hidden at all — is `WhitelistChecker` below. The
+/// case the path isn't hidden at all) is `WhitelistChecker` below. The
 /// `ignore` crate applies its own leaf-name hidden check only when the
 /// ignore matchers return no verdict for a path, so a whitelisted
 /// `.clang-format` is an ordinary file; likewise a whitelisted `.github/`
@@ -95,7 +95,7 @@ struct DirMatchers {
 /// construction is free and every matcher load is lazily cached.
 /// Which ignore sources participate in this walk. `all()` is the
 /// default; each --no-ignore-* knob drops one source (its ignore AND
-/// whitelist rules both go inert — the crate has no notion of "whitelists
+/// whitelist rules both go inert: the crate has no notion of "whitelists
 /// in an inactive file").
 #[derive(Clone, Copy)]
 pub struct WalkFlags {
@@ -253,7 +253,7 @@ struct CollectorBuilder<'a> {
     /// False on the --no-ignore sweep: with ignore rules disabled there is
     /// no whitelist to consult, and hidden-ness is purely name-based.
     whitelists: bool,
-    /// Which ignore sources' `!` rules may rescue — mirrors the walker's
+    /// Which ignore sources' `!` rules may rescue; mirrors the walker's
     /// own toggles (a disabled source's whitelists go inert too).
     flags: WalkFlags,
 }
@@ -524,7 +524,7 @@ fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 /// Live, index-bypassing sweep for `-L/--follow`: identical filtering
 /// semantics to `sweep_walker` (gitignore/.ignore/global excludes apply,
 /// `.git`/`.glep` hard-excluded) but follows symlinks during traversal.
-/// Ignore rules are NOT bypassed here — `-L` only changes traversal.
+/// Ignore rules are NOT bypassed here: `-L` only changes traversal.
 ///
 /// Why this is a live-scan escape hatch and not an index mode: files
 /// reached THROUGH a symlinked directory are not in the manifest at all
@@ -562,7 +562,7 @@ pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
 
 /// `--require-git` on a non-repo tree: gitignore rules are inert so
 /// files that the index sweep skips (gitignored) can still appear in
-/// results — a live scan is the only sound option (the index doesn't
+/// results; a live scan is the only sound option (the index doesn't
 /// have them). `.ignore`/`.rgignore`/global excludes still apply; only
 /// the git-derived sources are switched off. `include_hidden` gates
 /// hidden entries the same as `sweep_unfiltered`.
@@ -783,7 +783,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("a.txt"), "x").unwrap();
         std::fs::write(root.join("b.txt"), "x").unwrap();
-        // parent ignore file ignoring a.txt — should NOT apply with parents off
+        // parent ignore file ignoring a.txt: should NOT apply with parents off
         std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
         let flags = crate::walk::WalkFlags::all();
         let on: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, true)
