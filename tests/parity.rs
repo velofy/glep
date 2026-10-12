@@ -34,7 +34,11 @@ fn corpus() -> tempfile::TempDir {
     // path end to end (see src/walk_bulk.rs's divergence trap) alongside
     // the .gitignore case above.
     std::fs::write(dir.path().join(".ignore"), "skipme2.txt\n").unwrap();
-    std::fs::write(dir.path().join("skipme2.txt"), "hello hidden via dot-ignore\n").unwrap();
+    std::fs::write(
+        dir.path().join("skipme2.txt"),
+        "hello hidden via dot-ignore\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("unicode.txt"),
         "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\nplain line\n",
@@ -48,8 +52,16 @@ fn corpus() -> tempfile::TempDir {
     // unambiguous, and neither is matched by the .gitignore/.ignore rules
     // above, so their visibility is governed purely by the hidden default.
     std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
-    std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: hiddentoken_ci\n").unwrap();
-    std::fs::write(dir.path().join(".hidden.txt"), "hiddentoken plain dotfile\n").unwrap();
+    std::fs::write(
+        dir.path().join(".github/workflows/ci.yml"),
+        "name: hiddentoken_ci\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".hidden.txt"),
+        "hiddentoken plain dotfile\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -69,7 +81,14 @@ fn glep_out(dir: &Path, args: &[&str]) -> (String, i32) {
 fn rg_out(dir: &Path, args: &[&str]) -> (String, i32) {
     let out = std::process::Command::new("rg")
         .current_dir(dir)
-        .args(["-n", "--no-heading", "--color=never", "--sort", "path", "--no-require-git"])
+        .args([
+            "-n",
+            "--no-heading",
+            "--color=never",
+            "--sort",
+            "path",
+            "--no-require-git",
+        ])
         .args(args)
         .output()
         .unwrap();
@@ -93,7 +112,7 @@ fn parity_with_ripgrep() {
         &["foo|goodbye"],
         &["^use "],
         &["hel.o"],
-        &["a"],          // falls back to All: still must match rg
+        &["a"], // falls back to All: still must match rg
         &["-l", "hello"],
         &["-C", "1", "answer"],
         &["zz_no_match_zz"],
