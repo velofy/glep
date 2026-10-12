@@ -212,6 +212,40 @@ pub struct Args {
     /// Trace-level debug output on stderr (rg --trace)
     #[arg(long)]
     pub trace: bool,
+    /// Replace matched text in output lines; capture groups resolve as
+    /// $1/${name} (rg -r/--replace)
+    #[arg(
+        short = 'r',
+        long = "replace",
+        value_name = "REPLACEMENT",
+        conflicts_with = "json"
+    )]
+    pub replace: Option<String>,
+    /// Search each file's preprocessor output instead of its contents
+    /// (rg --pre; the file path is the command's sole argument and the
+    /// file is also its stdin)
+    #[arg(long, value_name = "COMMAND")]
+    pub pre: Option<String>,
+    /// Apply --pre only to files matching this glob (rg --pre-glob)
+    #[arg(long, value_name = "GLOB", requires = "pre")]
+    pub pre_glob: Option<String>,
+    /// Treat \r\n as the line terminator (rg --crlf)
+    #[arg(long)]
+    pub crlf: bool,
+    /// Use memory-mapped IO when searching files (rg --mmap). Already
+    /// glep's default: files are searched straight from the page cache.
+    #[arg(long)]
+    pub mmap: bool,
+    /// Never use memory maps: read every file through the searcher's
+    /// buffer instead (rg --no-mmap)
+    #[arg(long, overrides_with = "mmap")]
+    pub no_mmap: bool,
+    /// Accepted for script compat; glep streams output either way
+    #[arg(long, hide = true)]
+    pub block_buffered: bool,
+    /// Generate shell completions or man page and exit (rg --generate)
+    #[arg(long, value_name = "KIND", value_parser = ["man", "complete-bash", "complete-zsh", "complete-fish", "complete-powershell"])]
+    pub generate: Option<String>,
     /// NUL is the line terminator (rg --null-data)
     #[arg(long = "null-data")]
     pub null_data: bool,
@@ -839,6 +873,15 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         hyperlink_format: args.hyperlink_format.clone(),
         hostname_bin: args.hostname_bin.clone(),
         threads: args.threads,
+        replace: args.replace.as_deref().map(|s| s.as_bytes().to_vec()),
+        pre: args.pre.clone(),
+        // validated in run(), so a parse failure cannot reach here
+        pre_glob: args
+            .pre_glob
+            .as_deref()
+            .and_then(|g| build_glob_icase(g, false).ok()),
+        crlf: args.crlf,
+        no_mmap: args.no_mmap,
     }
 }
 
@@ -1133,6 +1176,30 @@ pub fn run() -> anyhow::Result<i32> {
     }
 
     // Commands that print and exit before any tree work.
+    // --generate emits shell completions or a man page.
+    if let Some(kind) = &args.generate {
+        use clap::CommandFactory;
+        let mut cmd = Args::command();
+        let mut out = Vec::new();
+        match kind.as_str() {
+            "man" => {
+                let man = clap_mangen::Man::new(cmd);
+                man.render(&mut out)?;
+            }
+            sh => {
+                let shell = match sh {
+                    "complete-bash" => clap_complete::Shell::Bash,
+                    "complete-zsh" => clap_complete::Shell::Zsh,
+                    "complete-fish" => clap_complete::Shell::Fish,
+                    "complete-powershell" => clap_complete::Shell::PowerShell,
+                    _ => anyhow::bail!("unsupported --generate kind: {sh}"),
+                };
+                clap_complete::generate(shell, &mut cmd, "glep", &mut out);
+            }
+        }
+        std::io::stdout().write_all(&out)?;
+        return Ok(0);
+    }
     if args.type_list {
         let mut tb = ignore::types::TypesBuilder::new();
         tb.add_defaults();
@@ -1238,6 +1305,9 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
     validate_sort(&args)?;
+    if let Some(g) = &args.pre_glob {
+        build_glob_icase(g, false)?;
+    }
 
     // Subcommand-style words in the pattern slot.
     if args.regexp.is_empty() && args.pattern_files.is_empty() && !args.files && !args.no_ignore {
@@ -1415,6 +1485,8 @@ pub fn run() -> anyhow::Result<i32> {
     //  -c --include-zero : every walked file emits `path:0`
     //  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
     //  -P patterns may use pcre2-only syntax (parse failure means Plan::All)
+    //  --pre     : the searched stream is a subprocess's output, not the
+    //              file's bytes, so index trigrams can't narrow it.
     //  --files-without-match needs no special plan: narrowed-out files
     //    are listed from the universe without being searched
     let utf8_only = match &args.encoding {
@@ -1425,21 +1497,26 @@ pub fn run() -> anyhow::Result<i32> {
         None => true,
     };
     let plan_ic = args.ignore_case || args.smart_case;
-    let query_plan =
-        if args.invert_match || args.passthru || (args.count && args.include_zero) || !utf8_only {
-            crate::plan::Plan::All
-        } else {
-            plan::build(&pattern, effective_fixed, plan_ic)
-        };
+    let query_plan = if args.invert_match
+        || args.passthru
+        || (args.count && args.include_zero)
+        || !utf8_only
+        || args.pre.is_some()
+    {
+        crate::plan::Plan::All
+    } else {
+        plan::build(&pattern, effective_fixed, plan_ic)
+    };
     timings.stage("plan");
 
     // Binary-flagged files are candidates only when the mode can surface
     // them: -a/--binary, --null-data (NUL is a separator, not binary),
-    // and an explicit non-UTF-8 encoding (UTF-16 text is NUL-heavy until
-    // transcoded). Under quit detection they can never emit anything,
+    // an explicit non-UTF-8 encoding (UTF-16 text is NUL-heavy until
+    // transcoded), and --pre (a preprocessor turns a PDF into text). Under quit detection they can never emit anything,
     // and rg excludes them even under -c --include-zero (verified), so
     // they stay out.
-    let search_binary = args.text || args.binary || args.null_data || !utf8_only;
+    let search_binary =
+        args.text || args.binary || args.null_data || !utf8_only || args.pre.is_some();
     let mut files = idx.candidates(&query_plan, plan_ic, args.hidden, search_binary);
     if args.search_zip {
         files.extend(idx.zip_candidates(args.hidden));

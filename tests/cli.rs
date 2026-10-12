@@ -897,6 +897,55 @@ fn glob_case_insensitive() {
 }
 
 #[test]
+fn replace_rewrites_matched_text() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["-r", "[$0]", "hello"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("[hello]"), "{s}");
+}
+
+// `cat`/`echo` as preprocessors: Unix-only commands.
+#[cfg(unix)]
+#[test]
+fn pre_searches_command_output() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "nothing\n").unwrap();
+    // preprocessor output replaces the file's contents as the search stream
+    let out = glep(dir.path())
+        .args(["--pre", "cat", "nothing"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("a.txt"), "{s}");
+    let out = glep(dir.path())
+        .args(["--pre", "echo", "txt"]) // `echo a.txt` -> "a.txt" ~ "txt"
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("a.txt"), "{s}");
+}
+
+#[test]
+fn generate_completions_and_man() {
+    let dir = corpus();
+    let out = glep(dir.path())
+        .args(["--generate", "complete-bash"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("_glep"), "{s}");
+    let out = glep(dir.path())
+        .args(["--generate", "man"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains(".TH glep"), "{s}");
+}
+
+#[test]
 fn files_with_matches_conflicts_with_json() {
     let dir = corpus();
     glep(dir.path())

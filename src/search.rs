@@ -95,6 +95,20 @@ pub struct SearchOpts {
     pub hostname_bin: Option<String>,
     /// Worker thread count (rg -j); None or 0 means one per core.
     pub threads: Option<usize>,
+    /// -r: rewrite matched text in output lines (capture refs like $1
+    /// resolve; byte-level, applied by the printer).
+    pub replace: Option<Vec<u8>>,
+    /// --pre COMMAND: search `COMMAND <path>`'s stdout instead of the file
+    /// (subprocess per candidate; --pre-glob restricts which paths get it).
+    pub pre: Option<String>,
+    /// --pre-glob: only --pre-process files matching this glob.
+    pub pre_glob: Option<globset::GlobMatcher>,
+    /// --crlf: `\r\n` line terminators (matcher crlf mode plus the
+    /// searcher's CRLF line terminator, like rg). --null-data overrides it.
+    pub crlf: bool,
+    /// --no-mmap: read every file through the searcher's buffer instead of
+    /// searching a memory map (glep maps by default; --mmap is a no-op).
+    pub no_mmap: bool,
     pub word: bool,
     pub line_regexp: bool,
     pub smart_case: bool,
@@ -154,6 +168,11 @@ impl Default for SearchOpts {
             hyperlink_format: None,
             hostname_bin: None,
             threads: None,
+            replace: None,
+            pre: None,
+            pre_glob: None,
+            crlf: false,
+            no_mmap: false,
             word: false,
             line_regexp: false,
             smart_case: false,
@@ -276,6 +295,9 @@ fn build_pcre2_matcher(
     if opts.multiline {
         b.dotall(opts.multiline_dotall);
     }
+    if opts.crlf && !opts.null_data {
+        b.crlf(true);
+    }
     Ok(b.build(pattern)?)
 }
 
@@ -316,6 +338,9 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
         // NUL is the record separator: the matcher must know so `.`
         // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
         b.line_terminator(Some(0));
+    }
+    if opts.crlf && !opts.null_data {
+        b.crlf(true);
     }
     if let Some(d) = opts.dfa_size_limit {
         b.dfa_size_limit(d);
@@ -419,6 +444,7 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         .only_matching(opts.only_matching)
         .max_columns(opts.max_columns)
         .max_columns_preview(opts.max_columns_preview)
+        .replacement(opts.replace.clone())
         .path_terminator(opts.path_terminator)
         .separator_path(opts.path_separator)
         .stats(opts.stats);
@@ -495,6 +521,8 @@ impl WorkerState {
         }
         if opts.null_data {
             sb.line_terminator(grep_matcher::LineTerminator::byte(0));
+        } else if opts.crlf {
+            sb.line_terminator(grep_matcher::LineTerminator::crlf());
         }
         WorkerState {
             searcher: sb.build(),
@@ -513,21 +541,28 @@ impl WorkerState {
 /// risk, identical to rg's documented --mmap behavior on Linux.
 ///
 /// Modes whose bytes are not the file's own bytes take a reader instead:
-/// `-z` decodes a gzip stream. `--binary` (convert detection) also reads
-/// through the line buffer, which is what rewrites NULs and detects
+/// `--pre` searches a preprocessor's stdout and `-z` decodes a gzip
+/// stream. `--binary` (convert detection) and `--no-mmap` read the file
+/// through the line buffer, which is also what rewrites NULs and detects
 /// binary data past the first buffer exactly like rg's default reader.
-enum Haystack {
+enum Haystack<'a> {
     Map(memmap2::Mmap),
     Path(PathBuf),
     Gz(PathBuf),
+    Pre(&'a str, PathBuf),
 }
 
-impl Haystack {
-    fn open(full: &Path, rel: &Path, opts: &SearchOpts) -> Haystack {
+impl<'a> Haystack<'a> {
+    fn open(full: &Path, rel: &Path, opts: &'a SearchOpts) -> Haystack<'a> {
+        if let Some(cmd) = &opts.pre {
+            if opts.pre_glob.as_ref().is_none_or(|g| g.is_match(rel)) {
+                return Haystack::Pre(cmd, full.to_path_buf());
+            }
+        }
         if opts.search_zip && rel.extension().is_some_and(|x| x == "gz") {
             return Haystack::Gz(full.to_path_buf());
         }
-        if opts.binary.convert_byte().is_some() && !opts.null_data {
+        if opts.no_mmap || (opts.binary.convert_byte().is_some() && !opts.null_data) {
             return Haystack::Path(full.to_path_buf());
         }
         match std::fs::File::open(full) {
@@ -554,11 +589,35 @@ impl Haystack {
                 let dec = flate2::read::GzDecoder::new(file);
                 searcher.search_reader(matcher, dec, sink)
             }
+            Haystack::Pre(cmd, p) => {
+                // rg's contract: the path is the sole argument and the file
+                // is also the command's stdin.
+                use grep_searcher::SinkError;
+                let stdin = std::fs::File::open(p).map_err(S::Error::error_io)?;
+                let mut child = std::process::Command::new(cmd)
+                    .arg(p)
+                    .stdin(stdin)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| {
+                        S::Error::error_message(format!(
+                            "preprocessor command could not start: '{cmd}': {e}"
+                        ))
+                    })?;
+                let stdout = child.stdout.take().expect("piped stdout");
+                // search_reader consumes (and so closes) the pipe before
+                // the wait: a sink that stops early (-l, -q, -m) makes the
+                // child see EPIPE instead of blocking on a full pipe.
+                let r = searcher.search_reader(matcher, stdout, sink);
+                let _ = child.wait();
+                r
+            }
         }
     }
 
     fn is_stream(&self) -> bool {
-        matches!(self, Haystack::Gz(_))
+        matches!(self, Haystack::Gz(_) | Haystack::Pre(..))
     }
 }
 
