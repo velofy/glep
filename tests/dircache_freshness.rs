@@ -7,6 +7,9 @@
 //! answers it. Each test compares glep's cached-path listing against an
 //! authoritative sweep (GLEP_NO_DIRCACHE=1 forces the full path).
 
+// The dir-mtime listing cache only exists on macOS (see src/dircache.rs).
+#![cfg(target_os = "macos")]
+
 use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
