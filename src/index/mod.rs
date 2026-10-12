@@ -28,6 +28,16 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// Stable-enough path hash for sharding the freshness diff. Only ever
+/// used to pick a bucket; never persisted, so DefaultHasher's per-run
+/// seed is fine.
+fn hash_path(p: &Path) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.hash(&mut h);
+    h.finish() as usize
+}
+
 fn new_generation() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -64,9 +74,12 @@ fn index_file(
 impl Index {
     fn acquire_lock(dir: &Path) -> (Option<std::fs::File>, bool) {
         let lock_path = dir.join("lock");
+        // Lock file: create-or-open, never truncated (contents unused;
+        // the flock on the descriptor is the lock).
         match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
         {
             Ok(f) => match f.try_lock_exclusive() {
@@ -165,6 +178,22 @@ impl Index {
     /// component. `.git`/`.glep` never reach the manifest at all (hard
     /// sweep-time exclusion, see walk.rs), so there is no flag for those to
     /// check here.
+    /// Full FileMeta view of live entries (mtimes/sizes as of the last
+    /// sweep), for cache building. `hidden` is reconstructed from
+    /// FLAG_HIDDEN.
+    pub fn live_file_metas(&self, include_hidden: bool) -> Vec<crate::walk::FileMeta> {
+        self.manifest
+            .live_entries()
+            .filter(|e| include_hidden || e.flags & FLAG_HIDDEN == 0)
+            .map(|e| crate::walk::FileMeta {
+                path: e.path.clone(),
+                mtime_ns: e.mtime_ns,
+                size: e.size,
+                hidden: e.flags & FLAG_HIDDEN != 0,
+            })
+            .collect()
+    }
+
     pub fn live_files(&self, include_hidden: bool) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self
             .manifest
@@ -184,7 +213,10 @@ impl Index {
         };
         let mut ids = Vec::new();
         for t in tris {
-            for seg in [self.main.as_ref(), self.delta.as_ref()].into_iter().flatten() {
+            for seg in [self.main.as_ref(), self.delta.as_ref()]
+                .into_iter()
+                .flatten()
+            {
                 if let Some(v) = seg.lookup(t) {
                     ids.extend(v);
                 }
@@ -199,14 +231,19 @@ impl Index {
         self.manifest
             .entries
             .get(id as usize)
-            .map_or(false, |e| e.flags & FLAG_DEAD == 0)
+            .is_some_and(|e| e.flags & FLAG_DEAD == 0)
     }
 
     /// `include_hidden = false` (the default, matching rg) drops candidates
     /// flagged `FLAG_HIDDEN` after narrowing by plan, so both the `All` and
     /// `Groups` arms (trigram postings carry no hidden bit of their own)
     /// are covered by one filter rather than two.
-    pub fn candidates(&self, plan: &Plan, case_insensitive: bool, include_hidden: bool) -> Vec<PathBuf> {
+    pub fn candidates(
+        &self,
+        plan: &Plan,
+        case_insensitive: bool,
+        include_hidden: bool,
+    ) -> Vec<PathBuf> {
         let mut ids: Vec<u32> = match plan {
             Plan::All => self
                 .manifest
@@ -282,33 +319,81 @@ impl Index {
         if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
             return Ok(Vec::new());
         }
-        let swept = walk::sweep(&self.root)?;
+        let swept = walk::sweep_unsorted(&self.root)?;
         if let Some(t) = &mut timings {
             t.stage("sweep_walk");
         }
-        let id_by_path: std::collections::HashMap<&Path, u32> = self
-            .manifest
-            .live_entries()
-            .map(|e| (e.path.as_path(), e.id))
+        // Parallel sharded diff (replaces the old two-HashMap serial pass,
+        // ~28ms on a kernel-scale tree). Three phases:
+        //   0. build live-id maps sharded by path hash, in parallel;
+        //   1. classify every swept file against its shard, in parallel,
+        //      marking seen manifest entries atomically;
+        //   2. dead = live entries never marked seen.
+        // Unchanged files touch nothing but an atomic store; fresh and
+        // changed ids come out of phase 1 per shard.
+        let n_shards = rayon::current_num_threads().max(1).next_power_of_two();
+        let shard_mask = n_shards - 1;
+        // Phase 0a: bucket live entries by path hash (serial, cheap push
+        // per entry) so phase 0b can give each shard to exactly one
+        // thread, no concurrent HashMap mutation anywhere.
+        let mut buckets: Vec<Vec<&manifest::FileEntry>> =
+            (0..n_shards).map(|_| Vec::new()).collect();
+        for e in self.manifest.live_entries() {
+            buckets[hash_path(&e.path) & shard_mask].push(e);
+        }
+        // Phase 0b: build each shard's lookup map in parallel.
+        let shard_maps: Vec<std::collections::HashMap<&Path, &manifest::FileEntry>> = buckets
+            .into_par_iter()
+            .map(|bucket| bucket.into_iter().map(|e| (e.path.as_path(), e)).collect())
             .collect();
-        let mut by_path: std::collections::HashMap<&Path, &manifest::FileEntry> = self
+        // seen flags for dead detection: 1 = present on disk unchanged or
+        // changed-in-place (either way, not deleted)
+        let seen: Vec<std::sync::atomic::AtomicU8> = self
             .manifest
-            .live_entries()
-            .map(|e| (e.path.as_path(), e))
+            .entries
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
-
-        let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed
-        for meta in &swept {
-            match by_path.remove(meta.path.as_path()) {
-                Some(e) if e.mtime_ns == meta.mtime_ns && e.size == meta.size => {}
-                _ => fresh.push(meta.clone()),
+        use rayon::prelude::*;
+        let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed (order irrelevant)
+        let mut changed_old_ids: Vec<u32> = Vec::new();
+        {
+            let chunk = (swept.len() / n_shards / 2).max(1024);
+            let results: Vec<(Vec<FileMeta>, Vec<u32>)> = swept
+                .par_chunks(chunk)
+                .map(|metas| {
+                    let mut my_fresh = Vec::new();
+                    let mut my_changed = Vec::new();
+                    for meta in metas {
+                        let h = hash_path(&meta.path) & shard_mask;
+                        match shard_maps[h].get(meta.path.as_path()) {
+                            Some(e) => {
+                                seen[e.id as usize].store(1, std::sync::atomic::Ordering::Relaxed);
+                                if e.mtime_ns != meta.mtime_ns || e.size != meta.size {
+                                    my_fresh.push(meta.clone());
+                                    my_changed.push(e.id);
+                                }
+                            }
+                            None => my_fresh.push(meta.clone()), // brand new
+                        }
+                    }
+                    (my_fresh, my_changed)
+                })
+                .collect();
+            for (f, c) in results {
+                fresh.extend(f);
+                changed_old_ids.extend(c);
             }
         }
-        // whatever remains in by_path was deleted from disk
-        let dead_ids: Vec<u32> = by_path.values().map(|e| e.id).collect();
-        let changed_old_ids: Vec<u32> = fresh
+        let dead_ids: Vec<u32> = self
+            .manifest
+            .entries
             .iter()
-            .filter_map(|m| id_by_path.get(m.path.as_path()).copied())
+            .filter(|e| {
+                e.flags & manifest::FLAG_DEAD == 0
+                    && seen[e.id as usize].load(std::sync::atomic::Ordering::Relaxed) == 0
+            })
+            .map(|e| e.id)
             .collect();
         if let Some(t) = &mut timings {
             t.stage("sweep_diff");
@@ -603,7 +688,10 @@ mod tests {
         let before = std::fs::metadata(&mpath).unwrap().modified().unwrap();
         idx.update(1_048_576, 0).unwrap();
         let after = std::fs::metadata(&mpath).unwrap().modified().unwrap();
-        assert_eq!(before, after, "no-op update with ttl 0 must not rewrite the manifest");
+        assert_eq!(
+            before, after,
+            "no-op update with ttl 0 must not rewrite the manifest"
+        );
     }
 
     #[test]
@@ -617,7 +705,10 @@ mod tests {
         let extra = reader.update(1_048_576, 0).unwrap();
         assert_eq!(extra, vec![std::path::PathBuf::from("hot.txt")]);
         let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
-        assert_eq!(manifest_before, manifest_after, "read-only update must not write");
+        assert_eq!(
+            manifest_before, manifest_after,
+            "read-only update must not write"
+        );
         assert!(!dir.path().join(".glep/delta.bin").exists());
     }
 
@@ -635,7 +726,10 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(by_path(".secret.txt").flags & manifest::FLAG_HIDDEN, manifest::FLAG_HIDDEN);
+        assert_eq!(
+            by_path(".secret.txt").flags & manifest::FLAG_HIDDEN,
+            manifest::FLAG_HIDDEN
+        );
         assert_eq!(by_path("a.txt").flags & manifest::FLAG_HIDDEN, 0);
 
         let plan = crate::plan::build("hiddenneedle", true, false);
@@ -648,8 +742,12 @@ mod tests {
             vec![std::path::PathBuf::from(".secret.txt")]
         );
 
-        assert!(!idx.live_files(false).contains(&std::path::PathBuf::from(".secret.txt")));
-        assert!(idx.live_files(true).contains(&std::path::PathBuf::from(".secret.txt")));
+        assert!(!idx
+            .live_files(false)
+            .contains(&std::path::PathBuf::from(".secret.txt")));
+        assert!(idx
+            .live_files(true)
+            .contains(&std::path::PathBuf::from(".secret.txt")));
     }
 
     #[test]
