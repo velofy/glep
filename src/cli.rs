@@ -257,9 +257,11 @@ pub struct Args {
     /// file is also its stdin)
     #[arg(long, value_name = "COMMAND")]
     pub pre: Option<String>,
-    /// Apply --pre only to files matching this glob (rg --pre-glob)
-    #[arg(long, value_name = "GLOB", requires = "pre")]
-    pub pre_glob: Option<String>,
+    /// Apply --pre only to files matching these globs (rg --pre-glob,
+    /// repeatable; a `!glob` exempts files). Without --pre it changes
+    /// nothing, as in rg.
+    #[arg(long, value_name = "GLOB")]
+    pub pre_glob: Vec<String>,
     /// Treat \r\n as the line terminator (rg --crlf). A last-wins pair
     /// with --null-data, like rg.
     #[arg(long, overrides_with = "null_data")]
@@ -1345,10 +1347,9 @@ fn search_opts(args: &Args, cwd_rel: &Path) -> search::SearchOpts {
         replace: args.replace.as_deref().map(|s| s.as_bytes().to_vec()),
         pre: args.pre.clone(),
         // validated in run(), so a parse failure cannot reach here
-        pre_glob: args
-            .pre_glob
-            .as_deref()
-            .and_then(|g| build_glob_icase(g, false).ok()),
+        pre_glob: filters::build_overrides(&args.pre_glob, &[], false)
+            .ok()
+            .flatten(),
         crlf: args.crlf,
         no_mmap: args.no_mmap,
         explicit_files: args.explicit_files.iter().cloned().collect(),
@@ -1898,9 +1899,9 @@ pub fn run() -> anyhow::Result<i32> {
     }
     validate_sort(&args)?;
     validate_output_flags(&args)?;
-    if let Some(g) = &args.pre_glob {
-        build_glob_icase(g, false)?;
-    }
+    // rg builds the --pre-glob matcher whether or not --pre is given, so
+    // a bad glob is an error either way.
+    filters::build_overrides(&args.pre_glob, &[], false)?;
 
     // Content searches resolve their patterns now (reading -f files),
     // then apply rg's matches_possible rule: with no pattern at all

@@ -106,8 +106,10 @@ pub struct SearchOpts {
     /// --pre COMMAND: search `COMMAND <path>`'s stdout instead of the file
     /// (subprocess per candidate; --pre-glob restricts which paths get it).
     pub pre: Option<String>,
-    /// --pre-glob: only --pre-process files matching this glob.
-    pub pre_glob: Option<globset::GlobMatcher>,
+    /// --pre-glob: rg's override rules over the printed path; --pre
+    /// skips a file they ignore (one no positive glob matches, or one a
+    /// `!glob` matches).
+    pub pre_glob: Option<ignore::overrides::Override>,
     /// --crlf: `\r\n` line terminators (matcher crlf mode plus the
     /// searcher's CRLF line terminator, like rg). --null-data overrides it.
     pub crlf: bool,
@@ -754,7 +756,11 @@ impl<'a> Haystack<'a> {
         convert: bool,
     ) -> Haystack<'a> {
         if let Some(cmd) = &opts.pre {
-            if opts.pre_glob.as_ref().is_none_or(|g| g.is_match(rel)) {
+            if opts
+                .pre_glob
+                .as_ref()
+                .is_none_or(|g| !g.matched(display, false).is_ignore())
+            {
                 // The cwd-relative path, as rg passes it; the full path
                 // when glep runs from outside the tree (GLEP_INDEX_PATH),
                 // where the display path names nothing from the cwd.

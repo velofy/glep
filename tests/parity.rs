@@ -1264,6 +1264,9 @@ fn remaining_stack_flags_match_rg() {
         &["-r", "", "hello"],
         &["-r", "${1}x", "(hel)lo"],
         &["-c", "-r", "X", "hello"],
+        // --pre-glob without --pre changes nothing, as in rg.
+        &["--pre-glob", "*.md", "hello"],
+        &["--pre-glob", "*.md", "-c", "--no-pre", "hello"],
         &["--mmap", "hello"],
         &["--no-mmap", "-c", "hello"],
         &["--mmap", "--no-mmap", "hello"],
@@ -1506,6 +1509,42 @@ fn unix_only_flags_match_rg() {
         // The command gets the cwd-relative path as its argument, like
         // rg: `echo` prints it back as the searched text.
         &["--pre", "echo", "-e", "md", "-e", "rs"],
+        // --pre-glob is repeatable and takes rg's override rules: any
+        // glob selects, a `!glob` exempts.
+        &[
+            "--pre",
+            "echo",
+            "--pre-glob",
+            "*.md",
+            "--pre-glob",
+            "*.rs",
+            "-e",
+            "md",
+            "-e",
+            "rs",
+        ],
+        &[
+            "--pre",
+            "echo",
+            "--pre-glob",
+            "!*.md",
+            "-e",
+            "md",
+            "-e",
+            "rs",
+        ],
+        &[
+            "--pre",
+            "echo",
+            "--pre-glob",
+            "*",
+            "--pre-glob",
+            "!src/**",
+            "-e",
+            "md",
+            "-e",
+            "rs",
+        ],
     ];
     if have_cmd("gzip") {
         use std::io::Write;
@@ -1520,6 +1559,12 @@ fn unix_only_flags_match_rg() {
         ]);
     }
     check_cases(d, "unix", &cases);
+    // The globs match the path as printed, relative to the cwd.
+    let in_src: &[&[&str]] = &[
+        &["--pre", "echo", "--pre-glob", "src/*.rs", "-e", "rs"],
+        &["--pre", "echo", "--pre-glob", "deep/*.rs", "-e", "rs"],
+    ];
+    check_cases(&d.join("src"), "unix src", in_src);
 }
 
 /// Per-file errors are reported and make the exit code 2, like rg: an
