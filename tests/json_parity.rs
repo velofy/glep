@@ -219,6 +219,10 @@ fn json_events_match_rg_on_the_worker_pool() {
         &["--json", "--crlf", "hello$"],
         &["--json", "-m", "1", "hello"],
         &["--json", "zz_totally_absent_zz"],
+        // rg 15's JSON carries each submatch's replacement.
+        &["--json", "-r", "X", "hello"],
+        &["-r", "[$0]", "--json", "-C", "1", "hello"],
+        &["--json", "-r", "$1", "h(el)lo"],
     ];
     for args in cases {
         let g = Command::cargo_bin("glep")

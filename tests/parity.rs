@@ -592,6 +592,36 @@ fn colored_and_hyperlinked_paths_match_rg() {
             "hello",
         ],
         &["--color", "always", "--colors", "path:none", "-c", "hello"],
+        // rg 15's `highlight` type styles the non-matching text of a
+        // matching line.
+        &[
+            "--color",
+            "always",
+            "--colors",
+            "highlight:fg:green",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--colors",
+            "highlight:bg:yellow",
+            "--colors",
+            "match:fg:red",
+            "-C",
+            "1",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--colors",
+            "highlight:style:bold",
+            "--vimgrep",
+            "hello",
+        ],
+        &["--color", "always", "--colors", "highlight:none", "hello"],
+        &["--colors", "highlight:fg:green", "hello"],
         &["--color", "ansi", "-l", "hello"],
         &["--color", "always", "--heading", "hello"],
         &["--color", "always", "-C", "1", "hello"],
@@ -662,6 +692,7 @@ fn colored_and_hyperlinked_paths_match_rg() {
         &["--color", "bogus", "hello"],
         &["--colors", "path:fg:nope", "hello"],
         &["--colors", "zz:fg:red", "hello"],
+        &["--colors", "highlight:fg:nope", "hello"],
         &["--hyperlink-format", "{bogus}", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
@@ -759,6 +790,9 @@ fn terminators_and_separators_match_rg() {
         &["--crlf", "--heading", "-C", "1", "foo"],
         &["--crlf", "-o", "hello"],
         &["--crlf", "--vimgrep", "hello"],
+        // A rewritten line keeps its own terminator, bare LF included.
+        &["--crlf", "-r", "X", "hello"],
+        &["--crlf", "-r", "X", "-o", "hello"],
         &["--crlf", "-0", "-l", "hello"],
         &["--null-data", "hello"],
         &["--null-data", "-l", "hello"],

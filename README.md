@@ -82,7 +82,6 @@ Known differences from rg:
 - `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
 - glep never reads stdin, so a search with no path argument always searches the tree.
 - The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
-- `-r` cannot be combined with `--json` (rg 15 adds replacement text to its JSON matches), and under `--crlf` a rewritten line that ended in a bare LF ends in CRLF (glep's grep-printer 0.2; rg 15 keeps the bare LF).
 
 ## When to use it
 

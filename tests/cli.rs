@@ -954,9 +954,8 @@ fn generate_completions_and_man() {
 }
 
 /// The output modes are last-wins, like rg's search modes: `-l --json`
-/// is a JSON search and `--json -l` lists paths. (-r still conflicts
-/// with --json: rg 15's JSON carries replacements, grep-printer 0.2's
-/// JSON printer cannot.)
+/// is a JSON search and `--json -l` lists paths. `-r` combines with
+/// --json, whose submatches carry the replacement, like rg 15.
 #[test]
 fn output_modes_are_last_wins() {
     let dir = corpus();
@@ -977,7 +976,8 @@ fn output_modes_are_last_wins() {
     glep(dir.path())
         .args(["-r", "x", "--json", "hello"])
         .assert()
-        .code(2);
+        .success()
+        .stdout(predicates::str::contains(r#""replacement":{"text":"x"}"#));
 }
 
 /// Binary files are listed by --files and searched under -a/--binary, but
@@ -1382,7 +1382,10 @@ fn queries_during_another_build_answer_with_a_live_scan() {
         .unwrap();
     held.lock_exclusive().unwrap();
     let cases: &[(&[&str], &str)] = &[
-        (&["-n", "hello"], "notes.txt:1:hello there\nsrc/lib.rs:1:pub fn hello_world() {}\n"),
+        (
+            &["-n", "hello"],
+            "notes.txt:1:hello there\nsrc/lib.rs:1:pub fn hello_world() {}\n",
+        ),
         (&["-l", "hello"], "notes.txt\nsrc/lib.rs\n"),
         (&["-c", "kenobi"], "notes.txt:1\n"),
         (&["--files"], "notes.txt\nsrc/lib.rs\n"),
@@ -1393,7 +1396,11 @@ fn queries_during_another_build_answer_with_a_live_scan() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{args:?}: {err}");
         assert!(err.is_empty(), "{args:?}: {err}");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), p(expected), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            p(expected),
+            "{args:?}"
+        );
     }
     assert!(!dir.path().join(".glep/manifest.bin").exists());
     // The explicit maintenance commands still report the busy lock.
@@ -1401,10 +1408,16 @@ fn queries_during_another_build_answer_with_a_live_scan() {
         .arg("index")
         .assert()
         .code(2)
-        .stderr(predicates::str::contains("another glep holds the index lock"));
+        .stderr(predicates::str::contains(
+            "another glep holds the index lock",
+        ));
     FileExt::unlock(&held).unwrap();
     for &(args, expected) in cases {
-        glep(dir.path()).args(args).assert().success().stdout(p(expected));
+        glep(dir.path())
+            .args(args)
+            .assert()
+            .success()
+            .stdout(p(expected));
     }
     assert!(dir.path().join(".glep/manifest.bin").exists());
 }

@@ -265,7 +265,7 @@ pub const SMALL_WORKLOAD: usize = 32;
 // `grep_printer::Stats` (the per-file "end" event's own `stats` object)
 // already derives a `Serialize` impl with exactly these field names, so we
 // reuse that type directly for the `stats` sub-object instead of redefining
-// it. `grep_printer::JSONBuilder` (grep-printer 0.2.x) has no `.stats(bool)`
+// it. `grep_printer::JSONBuilder` (grep-printer 0.3.x) has no `.stats(bool)`
 // toggle to enable/disable stats collection like `StandardBuilder`/
 // `SummaryBuilder` do; the JSON sink always tracks `Stats` internally, and
 // `JSONSink::stats()` is unconditionally available after a search. So
@@ -1233,7 +1233,9 @@ fn search_hay<M: Matcher>(
     let stats;
     let consumed;
     if opts.json {
-        let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
+        let mut printer = grep_printer::JSONBuilder::new()
+            .replacement(opts.replace.clone())
+            .build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
         consumed = hay.search(searcher, matcher, &mut sink)?;
         matched = sink.has_match();

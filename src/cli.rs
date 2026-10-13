@@ -247,13 +247,9 @@ pub struct Args {
     #[arg(long)]
     pub trace: bool,
     /// Replace matched text in output lines; capture groups resolve as
-    /// $1/${name} (rg -r/--replace)
-    #[arg(
-        short = 'r',
-        long = "replace",
-        value_name = "REPLACEMENT",
-        conflicts_with = "json"
-    )]
+    /// $1/${name} (rg -r/--replace). Under --json each submatch carries
+    /// its replacement, like rg 15.
+    #[arg(short = 'r', long = "replace", value_name = "REPLACEMENT")]
     pub replace: Option<String>,
     /// Search each file's preprocessor output instead of its contents
     /// (rg --pre; the file path is the command's sole argument and the
