@@ -2064,7 +2064,16 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
-    let mut idx = Index::open_or_build(&root, args.max_filesize)?;
+    let mut idx = match Index::open_or_build(&root, args.max_filesize) {
+        Ok(idx) => idx,
+        // Another glep is building the index right now (parallel first
+        // queries on a new tree): answer with a live scan, as --no-index
+        // does, instead of failing or waiting for the build.
+        Err(e) if e.is::<crate::index::IndexBusy>() => {
+            return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
+        }
+        Err(e) => return Err(e),
+    };
     timings.stage("index_open");
     // Path filters scope the freshness sweep too: subtrees outside the
     // filter can't produce results, so sweeping them is wasted work.

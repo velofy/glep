@@ -1363,3 +1363,48 @@ fn closed_pipe_ends_the_run_quietly() {
         assert_eq!(status.code(), Some(code), "{args:?}");
     }
 }
+
+/// Parallel first queries on a tree with no index yet: one glep builds
+/// the index under its lock, and every other one answers with a live
+/// scan (what --no-index searches) instead of failing with "another glep
+/// holds the index lock". Holding the lock here stands in for the
+/// building glep, so the race is not left to timing.
+#[test]
+fn queries_during_another_build_answer_with_a_live_scan() {
+    use fs2::FileExt;
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join(".glep")).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.path().join(".glep/lock"))
+        .unwrap();
+    held.lock_exclusive().unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (&["-n", "hello"], "notes.txt:1:hello there\nsrc/lib.rs:1:pub fn hello_world() {}\n"),
+        (&["-l", "hello"], "notes.txt\nsrc/lib.rs\n"),
+        (&["-c", "kenobi"], "notes.txt:1\n"),
+        (&["--files"], "notes.txt\nsrc/lib.rs\n"),
+        (&["--files", "*.rs"], "src/lib.rs\n"),
+    ];
+    for &(args, expected) in cases {
+        let out = glep(dir.path()).args(args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {err}");
+        assert!(err.is_empty(), "{args:?}: {err}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), p(expected), "{args:?}");
+    }
+    assert!(!dir.path().join(".glep/manifest.bin").exists());
+    // The explicit maintenance commands still report the busy lock.
+    glep(dir.path())
+        .arg("index")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("another glep holds the index lock"));
+    FileExt::unlock(&held).unwrap();
+    for &(args, expected) in cases {
+        glep(dir.path()).args(args).assert().success().stdout(p(expected));
+    }
+    assert!(dir.path().join(".glep/manifest.bin").exists());
+}

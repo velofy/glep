@@ -33,6 +33,21 @@ pub struct Index {
     scope_presence: Vec<(PathBuf, bool)>,
 }
 
+/// Another glep holds the index lock and there is no index to read yet:
+/// it is building (or rebuilding) it right now. A query answers with a
+/// live scan instead of waiting for that build (see `cli::run`); `glep
+/// index` and `glep status` report it.
+#[derive(Debug)]
+pub struct IndexBusy;
+
+impl std::fmt::Display for IndexBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another glep holds the index lock")
+    }
+}
+
+impl std::error::Error for IndexBusy {}
+
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -127,8 +142,10 @@ impl Index {
         if !self_ignore.exists() {
             std::fs::write(&self_ignore, "*\n")?;
         }
-        let (lock, read_only) = Self::acquire_lock(&dir);
-        anyhow::ensure!(!read_only, "another glep holds the index lock");
+        let (lock, busy) = Self::acquire_lock(&dir);
+        if busy {
+            return Err(IndexBusy.into());
+        }
         Self::build_locked(root, max_filesize, lock)
     }
 
@@ -211,7 +228,15 @@ impl Index {
                     });
                 }
                 Err(e) => {
+                    // A busy lock means another glep is writing the index
+                    // right now (a build or a compaction): what failed to
+                    // read is its work in progress, not a broken index.
+                    let (lock, busy) = Self::acquire_lock(&dir);
+                    if busy {
+                        return Err(IndexBusy.into());
+                    }
                     eprintln!("glep: index unreadable ({e}); rebuilding");
+                    return Self::build_locked(root, max_filesize, lock);
                 }
             }
         }
@@ -1103,6 +1128,32 @@ mod tests {
             before, after,
             "no-op update with ttl 0 must not rewrite the manifest"
         );
+    }
+
+    /// With no index to read and the lock held by another glep (a build
+    /// in progress), building or opening is `IndexBusy`, which queries
+    /// answer with a live scan.
+    #[test]
+    fn build_under_a_held_lock_is_busy() {
+        use fs2::FileExt;
+        let dir = corpus();
+        std::fs::create_dir_all(dir.path().join(".glep")).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.path().join(".glep/lock"))
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let busy = |r: anyhow::Result<Index>| r.err().is_some_and(|e| e.is::<IndexBusy>());
+        assert!(busy(Index::build(dir.path(), 1_048_576)));
+        assert!(busy(Index::open_or_build(dir.path(), 1_048_576)));
+        // A torn manifest under a held lock is the writer's work in
+        // progress: busy too, never a rebuild.
+        std::fs::write(dir.path().join(".glep/manifest.bin"), b"torn").unwrap();
+        assert!(busy(Index::open_or_build(dir.path(), 1_048_576)));
+        FileExt::unlock(&held).unwrap();
+        assert!(Index::open_or_build(dir.path(), 1_048_576).is_ok());
     }
 
     #[test]
