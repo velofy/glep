@@ -94,7 +94,6 @@ pub struct SearchOpts {
     /// non-matching line that follows a match (a per-file searcher
     /// setting, exactly like rg).
     pub stop_on_nonmatch: bool,
-
     /// OSC8 hyperlinks for emitted paths (rg --hyperlink-format), resolved
     /// once in cli (format parsed, {host} from --hostname-bin or the
     /// platform). Like rg, links are only written when color is on.
@@ -217,7 +216,6 @@ impl Default for SearchOpts {
             search_zip: false,
             max_columns_preview: false,
             stop_on_nonmatch: false,
-
             hyperlink: None,
             threads: None,
             replace: None,

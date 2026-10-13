@@ -542,15 +542,13 @@ fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     Ok(collected.into_inner().unwrap())
 }
 
-/// Live, index-bypassing sweep for `--no-ignore`: same shape as `sweep`
-/// (root.is_dir() ensure with identical error text, Err-entry warnings on
-/// stderr, output sorted by relative path, `.git`/`.glep` hard-excluded at
-/// any depth) but built on a `WalkBuilder` with every ignore source
-/// disabled, so gitignore'd and .ignore'd trees (node_modules, target,
-/// etc.) are swept anyway. Nothing here reads or writes `.glep/`; this
-/// function has no knowledge of the index at all, which is the point:
-/// `--no-ignore` must never let an ignored tree enter the index (see the
-/// module-level rationale this function's caller documents in cli.rs).
+/// The unfiltered sweep (every ignore source off), kept as the reference
+/// the tests hold the macOS bulk unfiltered walk to; `--no-ignore` itself
+/// runs through `live_walk`, which takes the same bulk path. Same shape
+/// as `sweep` (root.is_dir() ensure with identical error text, output
+/// sorted by relative path, `.git`/`.glep` hard-excluded at any depth),
+/// so gitignore'd and .ignore'd trees (node_modules, target, etc.) are
+/// swept anyway, and nothing here reads or writes `.glep/`.
 ///
 /// `include_hidden` gates hidden (dot-prefixed) entries at the walker
 /// itself via `.hidden(!include_hidden)`, mirroring rg's own default:
