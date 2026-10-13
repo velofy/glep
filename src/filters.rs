@@ -175,6 +175,35 @@ impl Filters {
         })
     }
 
+    /// A copy with the same matchers and operand and empty caches, for a
+    /// worker thread.
+    fn fork(&self) -> Filters {
+        Filters {
+            root: self.root.clone(),
+            cwd_rel: self.cwd_rel.clone(),
+            overrides: self.overrides.clone(),
+            explicit: self.explicit.clone(),
+            types: self.types.clone(),
+            max_depth: self.max_depth,
+            show_hidden: self.show_hidden,
+            prune_dirs: self.prune_dirs,
+            tree_rules: WhitelistChecker::new(),
+            dirs: HashMap::new(),
+            last_parent: None,
+            op: self.op.clone(),
+            op_base: self.op_base,
+            op_outside_cwd: self.op_outside_cwd,
+        }
+    }
+
+    /// No filter can drop a file the sweep did not flag hidden.
+    fn keeps_every_plain_file(&self) -> bool {
+        self.max_depth.is_none()
+            && self.overrides.is_none()
+            && self.explicit.is_empty()
+            && self.types.is_none()
+    }
+
     /// Filter the files of this operand (root-relative) from now on. rg
     /// matches globs and --ignore-file rules against the paths its walk
     /// yields: the operand as typed (cwd-relative), then the path below
@@ -328,6 +357,9 @@ pub enum OperandKind {
     Walked(Vec<PathBuf>),
 }
 
+/// File sets at least this large are filtered across the thread pool.
+const PARALLEL_SELECT: usize = 8192;
+
 /// Merge two path-sorted lists.
 fn merge_sorted(a: Vec<PathBuf>, b: Vec<PathBuf>) -> Vec<PathBuf> {
     if b.is_empty() {
@@ -372,7 +404,25 @@ impl Filters {
             self.begin_operand(&op.path);
             let p = &op.path;
             let all = p.as_os_str().is_empty();
-            plain.retain(|f| (all || f.starts_with(p)) && self.keep(f, false));
+            if all && self.keeps_every_plain_file() {
+                // Nothing to check: the whole set under the root.
+            } else if plain.len() >= PARALLEL_SELECT {
+                // A kernel-scale listing with globs: the per-file checks
+                // run across the pool, each worker on its own copy of the
+                // filters (path order is kept).
+                use rayon::prelude::*;
+                let template = self.fork();
+                plain = plain
+                    .into_par_iter()
+                    .map_init(
+                        || template.fork(),
+                        |flt, f| ((all || f.starts_with(p)) && flt.keep(&f, false), f),
+                    )
+                    .filter_map(|(keep, f)| keep.then_some(f))
+                    .collect();
+            } else {
+                plain.retain(|f| (all || f.starts_with(p)) && self.keep(f, false));
+            }
             let hidden: Vec<PathBuf> = hidden
                 .into_iter()
                 .filter(|f| (all || f.starts_with(p)) && self.keep(f, true))
@@ -483,6 +533,35 @@ mod tests {
             TypeChange::Select("txt".into()),
         ];
         assert!(build_types(&changes).is_err());
+    }
+
+    /// Large sets take the parallel path: same files, same order, as the
+    /// one-by-one checks.
+    #[test]
+    fn parallel_select_matches_serial_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let globs = vec!["!d1".to_string(), "!*.log".to_string()];
+        let mut plain: Vec<PathBuf> = (0..3 * PARALLEL_SELECT)
+            .map(|i| {
+                let ext = if i % 7 == 0 { "log" } else { "txt" };
+                PathBuf::from(format!("a{}/d{}/f{i:05}.{ext}", i % 5, i % 3))
+            })
+            .collect();
+        plain.sort();
+        let mut serial = Filters::new(&spec(&globs), dir.path(), Path::new("")).unwrap();
+        serial.begin_operand(Path::new(""));
+        let expect: Vec<PathBuf> = plain
+            .iter()
+            .filter(|f| serial.keep(f, false))
+            .cloned()
+            .collect();
+        assert!(!expect.is_empty() && expect.len() < plain.len());
+        let mut f = Filters::new(&spec(&globs), dir.path(), Path::new("")).unwrap();
+        let ops = [Operand {
+            path: PathBuf::new(),
+            kind: OperandKind::Dir,
+        }];
+        assert_eq!(f.select(&ops, plain, Vec::new()), expect);
     }
 
     #[test]
