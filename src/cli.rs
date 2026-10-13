@@ -1426,6 +1426,162 @@ fn run_live(
     Ok(exit_code(args, had_error || nothing_searched, found))
 }
 
+/// Unindexed trees holding more than this many bytes of files answer
+/// their first query from a sweep and build the index in the background
+/// (see `run`); smaller ones build it inline, which takes about a second
+/// at this size. GLEP_BG_BUILD_MIN_BYTES overrides it.
+#[cfg(unix)]
+const BG_BUILD_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn background_build_min_bytes() -> u64 {
+    parse_bg_build_min_bytes(std::env::var("GLEP_BG_BUILD_MIN_BYTES").ok().as_deref())
+}
+
+/// A GLEP_BG_BUILD_MIN_BYTES value: a byte count with an optional K, M
+/// or G suffix, like --max-filesize; unset or unparsable is the default.
+#[cfg(unix)]
+fn parse_bg_build_min_bytes(v: Option<&str>) -> u64 {
+    v.and_then(|v| parse_human_u64(v.trim()).ok())
+        .unwrap_or(BG_BUILD_MIN_BYTES)
+}
+
+/// The first query on an unindexed tree too big to index inline, answered
+/// from the full sweep that measured the tree the way `run_live` answers
+/// from its walk: every selected file is searched, so binary handling is
+/// the searcher's own. The sweep applies the index's ignore and hidden
+/// rules (it is the sweep a build indexes), so the scope selects from it
+/// exactly as from a fresh manifest, and the rest is the index path's:
+/// directory operands the sweep holds no file under walk live with rg's
+/// rules, then the --files glob and printer, or the search. Nothing here
+/// opens, builds or writes the index.
+#[cfg(unix)]
+fn run_from_sweep(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    swept: Vec<walk::FileMeta>,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    // `Index::has_files_under` over the sweep instead of the manifest:
+    // operands are root-relative and normalized, so one that is not plain
+    // names below the root (`..`, absolute elsewhere) holds no swept file.
+    scope.walk_unserved(args, cwd_rel, |op| {
+        names_below_root(op) && prefixes_with_files(&swept, &[op.to_path_buf()])[0]
+    });
+    timings.stage("operands");
+    // Split by the sweep's hidden flag, as the index splits by
+    // FLAG_HIDDEN; under --hidden every file is plain.
+    use rayon::prelude::*;
+    let (mut hidden, mut plain): (Vec<PathBuf>, Vec<PathBuf>) =
+        swept.into_par_iter().partition_map(|m| {
+            if m.hidden && !args.hidden {
+                rayon::iter::Either::Left(m.path)
+            } else {
+                rayon::iter::Either::Right(m.path)
+            }
+        });
+    sort_swept_paths(&mut plain);
+    sort_swept_paths(&mut hidden);
+    let mut files = scope.select(plain, hidden);
+    if args.files {
+        // With --files the pattern slot is the glob.
+        retain_glob(&mut files, files_glob(args)?.as_ref(), cwd_rel);
+        apply_sort(&mut files, args, root, cwd_rel)?;
+        print_paths(&files, cwd_rel, args)?;
+        timings.stage("listing");
+        return Ok(exit_code(args, had_error, !files.is_empty()));
+    }
+
+    let (pattern, effective_fixed) = resolve_pattern(args);
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    timings.stage("candidates");
+    // Nothing narrowed the selection, so an empty one searched nothing.
+    let nothing_searched = scope.implicit && files.is_empty();
+    if nothing_searched {
+        report_nothing_searched();
+    }
+    let mut opts = search_opts(args, cwd_rel);
+    opts.fixed = effective_fixed;
+    let mut out = search::StdoutOut;
+    let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
+    timings.stage("search");
+    Ok(exit_code(args, had_error || nothing_searched, found))
+}
+
+/// Start building the index of `root` in a detached child (`glep index`
+/// with GLEP_BG set, see `run_background_build`) and return without
+/// waiting for it. Its stdio is the null device, so a pipe or `$(...)`
+/// reading this run sees EOF as soon as this process exits, and it runs in
+/// a process group of its own, so a Ctrl-C at the terminal leaves it
+/// alone. Nothing is spawned when the index dir cannot be written or
+/// another glep holds its lock (a build is running already), and a spawn
+/// that fails is silent: the next query on the tree tries again.
+#[cfg(unix)]
+fn spawn_background_build(root: &Path, cwd: &Path, max_filesize: u64) {
+    if !Index::can_build(root) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("index")
+        .arg("--max-filesize")
+        .arg(max_filesize.to_string())
+        .current_dir(root)
+        .env("GLEP_BG", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // The child finds this run's root from `root`: through the index dir
+    // `can_build` made there, or through GLEP_INDEX_PATH, resolved against
+    // this run's cwd first because the child runs from the root.
+    if let Some(v) = std::env::var_os("GLEP_INDEX_PATH").filter(|v| !v.is_empty()) {
+        cmd.env("GLEP_INDEX_PATH", cwd.join(v));
+    }
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    if let Ok(child) = cmd.spawn() {
+        // Test hook: the builder's pid, for tests that stop it mid-build.
+        if let Some(path) = std::env::var_os("GLEP_BG_PIDFILE") {
+            let _ = std::fs::write(path, format!("{}\n", child.id()));
+        }
+    }
+}
+
+/// `glep index` as the detached build a first query spawned (GLEP_BG set):
+/// at background priority, it builds the index only while none exists,
+/// and exits 0 without building when another glep holds the lock (a
+/// second spawner lost the race).
+fn run_background_build(root: &Path, max_filesize: u64) -> anyhow::Result<i32> {
+    lower_thread_priority();
+    // The sweep's pool threads too (a second init keeps the first).
+    let _ = rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| lower_thread_priority())
+        .build_global();
+    Index::build_if_missing(root, max_filesize)?;
+    Ok(0)
+}
+
+/// Background priority for the calling thread: utility QoS on macOS,
+/// below every interactive thread for CPU and I/O; nice 10 on other Unix
+/// systems (a per-thread setting on Linux, so every pool thread sets it).
+/// Windows never spawns the build (see `run`).
+fn lower_thread_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: a plain call on the current thread; no pointers involved.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    // SAFETY: a plain call on the current thread; no pointers involved.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
 /// True when `p` (root-relative after `normalize_path_filters`) is a path
 /// of plain names below the root: not the root itself, not absolute, no
 /// `.` or `..` component.
@@ -2134,6 +2290,9 @@ pub fn run() -> anyhow::Result<i32> {
     if subcommand {
         match args.pattern.as_deref() {
             Some("index") => {
+                if std::env::var_os("GLEP_BG").is_some() {
+                    return run_background_build(&root, args.max_filesize);
+                }
                 let idx = Index::build(&root, args.max_filesize)?;
                 eprintln!(
                     "glep: indexed {} files",
@@ -2143,7 +2302,8 @@ pub fn run() -> anyhow::Result<i32> {
             }
             Some("status") => {
                 let mut idx = Index::open_or_build(&root, args.max_filesize)?;
-                if !idx.read_only {
+                // A build just now swept the tree itself.
+                if !idx.read_only && !idx.swept_full() {
                     idx.update(args.max_filesize, 0)?;
                 }
                 let live = idx.manifest.live_entries().count();
@@ -2248,7 +2408,57 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
-    let mut idx = match Index::open_or_build(&root, args.max_filesize) {
+    // First query on a tree with no index yet: one sweep measures it. A
+    // small tree builds its index inline from that same sweep. A bigger
+    // one is answered from the sweep alone, at full-scan cost, and its
+    // index is built afterwards by a detached low-priority child. The
+    // manifest is the build's last write, so queries that arrive
+    // meanwhile find none and take this path again, and the first query
+    // after the build opens the index. GLEP_SYNC_BUILD forces the inline
+    // build. Unix only: a Windows child inherits every inheritable
+    // handle, the parent's stdout pipe included, so a reader would wait
+    // for the whole build.
+    #[cfg(unix)]
+    let first_sweep = if std::env::var_os("GLEP_SYNC_BUILD").is_none()
+        && !root.join(".glep/manifest.bin").exists()
+    {
+        let swept = walk::sweep_unsorted(&root)?;
+        timings.stage("first_sweep");
+        let bytes: u64 = swept.iter().map(|m| m.size).sum();
+        let deferred = bytes > background_build_min_bytes();
+        if std::env::var_os("GLEP_TIMING").is_some() {
+            eprintln!(
+                "glep timing: unindexed tree {} files, {bytes} bytes ({} build)",
+                swept.len(),
+                if deferred { "background" } else { "inline" }
+            );
+        }
+        if deferred {
+            let result = run_from_sweep(
+                &root,
+                &cwd_rel,
+                &args,
+                &mut scope,
+                swept,
+                &mut timings,
+                had_error,
+            );
+            // The output is flushed by now: its reader never waits for the
+            // spawn, let alone the build. A failed query spawns it too, as
+            // an inline build ran before the search could fail.
+            spawn_background_build(&root, &cwd, args.max_filesize);
+            timings.stage("bg_spawn");
+            timings.finish();
+            return result;
+        }
+        Some(swept)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let first_sweep = None;
+
+    let mut idx = match Index::open_or_build_swept(&root, args.max_filesize, first_sweep) {
         Ok(idx) => idx,
         // Another glep is building the index right now (parallel first
         // queries on a new tree): answer with a live scan, as --no-index
@@ -2260,8 +2470,13 @@ pub fn run() -> anyhow::Result<i32> {
     };
     timings.stage("index_open");
     // Path filters scope the freshness sweep too: subtrees outside the
-    // filter can't produce results, so sweeping them is wasted work.
-    let extra = if args.paths.is_empty() {
+    // filter can't produce results, so sweeping them is wasted work. An
+    // index this process just built needs no sweep at all: the build's
+    // own sweep is the freshest there is (a later process starts with
+    // swept_full unset), and the manifest answers every operand.
+    let extra = if idx.swept_full() {
+        Vec::new()
+    } else if args.paths.is_empty() {
         idx.update_timed(args.max_filesize, args.ttl, &mut timings)?
     } else {
         idx.update_scoped(args.max_filesize, args.ttl, &args.paths, &mut timings)?
@@ -2549,6 +2764,24 @@ mod tests {
             [true, true, false, true, true, false, true]
         );
         assert_eq!(prefixes_with_files(&[], &prefixes), [false; 7]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bg_build_min_bytes_parses_like_max_filesize() {
+        assert_eq!(parse_bg_build_min_bytes(None), 64 * 1024 * 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some("0")), 0);
+        assert_eq!(parse_bg_build_min_bytes(Some("4096")), 4096);
+        assert_eq!(parse_bg_build_min_bytes(Some("1K")), 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some(" 2M ")), 2 * 1024 * 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some("1G")), 1 << 30);
+        for junk in ["", "junk", "-1", "1.5M", "64MB"] {
+            assert_eq!(
+                parse_bg_build_min_bytes(Some(junk)),
+                BG_BUILD_MIN_BYTES,
+                "{junk:?}"
+            );
+        }
     }
 
     #[test]

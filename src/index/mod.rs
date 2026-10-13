@@ -195,20 +195,67 @@ impl Index {
         }
     }
 
-    pub fn build(root: &Path, max_filesize: u64) -> anyhow::Result<Index> {
-        let dir = root.join(".glep");
-        std::fs::create_dir_all(&dir)?;
-        // Self-ignoring directory: git never tracks the index, and we never
-        // have to touch the user's .gitignore.
+    /// Create the index dir with its self-ignore file: git never tracks
+    /// the index, and the user's .gitignore is never touched.
+    fn prepare_dir(dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
         let self_ignore = dir.join(".gitignore");
         if !self_ignore.exists() {
             std::fs::write(&self_ignore, "*\n")?;
         }
+        Ok(())
+    }
+
+    pub fn build(root: &Path, max_filesize: u64) -> anyhow::Result<Index> {
+        Self::build_swept(root, max_filesize, None)
+    }
+
+    /// `build`, indexing `swept` (an unsorted full sweep of `root` this
+    /// process already ran) instead of sweeping again when given.
+    fn build_swept(
+        root: &Path,
+        max_filesize: u64,
+        swept: Option<Vec<FileMeta>>,
+    ) -> anyhow::Result<Index> {
+        let dir = root.join(".glep");
+        Self::prepare_dir(&dir)?;
         let (lock, busy) = Self::acquire_lock(&dir);
         if busy {
             return Err(IndexBusy.into());
         }
-        Self::build_locked(root, max_filesize, lock)
+        Self::build_locked(root, max_filesize, lock, swept)
+    }
+
+    /// The detached first build (`glep index` with GLEP_BG set, spawned by
+    /// a query that answered from a sweep): build only while no index
+    /// exists, under the lock. False, without building, when another glep
+    /// holds the lock (a second spawner lost the race, or a query is busy
+    /// with an index that appeared meanwhile) or the manifest is already
+    /// there: what a later query finds then is the open path's business.
+    pub fn build_if_missing(root: &Path, max_filesize: u64) -> anyhow::Result<bool> {
+        let dir = root.join(".glep");
+        Self::prepare_dir(&dir)?;
+        let (lock, busy) = Self::acquire_lock(&dir);
+        if busy || dir.join("manifest.bin").exists() {
+            return Ok(false);
+        }
+        Self::build_locked(root, max_filesize, lock, None)?;
+        Ok(true)
+    }
+
+    /// Whether a detached build could start now: the index dir, its
+    /// self-ignore and its lock file can be created, and no other glep
+    /// holds the lock. The probe's lock is released before this returns,
+    /// so no child spawned afterwards ever shares it.
+    #[cfg(unix)]
+    pub fn can_build(root: &Path) -> bool {
+        let dir = root.join(".glep");
+        if Self::prepare_dir(&dir).is_err() {
+            return false;
+        }
+        let (lock, busy) = Self::acquire_lock(&dir);
+        drop(lock);
+        !busy
     }
 
     /// The full build, under a lock this process already holds. Compaction
@@ -220,10 +267,18 @@ impl Index {
         root: &Path,
         max_filesize: u64,
         lock: Option<std::fs::File>,
+        swept: Option<Vec<FileMeta>>,
     ) -> anyhow::Result<Index> {
         let dir = root.join(".glep");
         let generation = new_generation();
-        let metas = walk::sweep(root)?;
+        let metas = match swept {
+            // `walk::sweep`'s order: ids follow path order.
+            Some(mut v) => {
+                v.sort_by(|a, b| a.path.cmp(&b.path));
+                v
+            }
+            None => walk::sweep(root)?,
+        };
         let mut man = Manifest::default();
         let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (n, meta) in metas.iter().enumerate() {
@@ -257,6 +312,17 @@ impl Index {
     }
 
     pub fn open_or_build(root: &Path, max_filesize: u64) -> anyhow::Result<Index> {
+        Self::open_or_build_swept(root, max_filesize, None)
+    }
+
+    /// `open_or_build`; a build indexes `swept` (an unsorted full sweep of
+    /// `root` this process already ran) when given, instead of sweeping
+    /// the tree a second time. An existing index ignores it.
+    pub fn open_or_build_swept(
+        root: &Path,
+        max_filesize: u64,
+        swept: Option<Vec<FileMeta>>,
+    ) -> anyhow::Result<Index> {
         let dir = root.join(".glep");
         let try_open = || -> anyhow::Result<(Manifest, Postings, Option<Postings>)> {
             let man = Manifest::load(&dir.join("manifest.bin"))?;
@@ -298,11 +364,11 @@ impl Index {
                         return Err(IndexBusy.into());
                     }
                     eprintln!("glep: index unreadable ({e}); rebuilding");
-                    return Self::build_locked(root, max_filesize, lock);
+                    return Self::build_locked(root, max_filesize, lock, swept);
                 }
             }
         }
-        Self::build(root, max_filesize)
+        Self::build_swept(root, max_filesize, swept)
     }
 
     /// `include_hidden = false` (the default, matching rg) drops entries
@@ -604,8 +670,9 @@ impl Index {
         self.split_hidden(ids, include_hidden)
     }
 
-    /// See the `swept_full` field.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// See the `swept_full` field. Before any update this holds only for
+    /// an index this process just built, whose freshness sweep would
+    /// repeat the build's own sweep: queries skip it.
     pub fn swept_full(&self) -> bool {
         self.swept_full
     }
@@ -873,7 +940,7 @@ impl Index {
         if !scoped && main_size > 0 && delta_size > main_size / 10 {
             // Rebuild under the lock this update already holds.
             let lock = self.lock.take();
-            *self = Index::build_locked(&self.root.clone(), max_filesize, lock)?;
+            *self = Index::build_locked(&self.root.clone(), max_filesize, lock, None)?;
         }
         if let Some(t) = &mut timings {
             t.stage("index_write");
@@ -1189,6 +1256,99 @@ mod tests {
         assert_eq!(env(&ro), (id, false), "read-only pass flips in memory");
         idx.update(1_048_576, 0).unwrap();
         assert_eq!(env(&idx), (id, false), "rule restored: visible again");
+    }
+
+    /// A build from a sweep the caller already ran is the build that
+    /// sweeps for itself: the same entries, ids, flags and postings. A
+    /// fresh build is authoritative (swept_full, so queries skip the
+    /// freshness sweep it would repeat); an opened index is not.
+    #[test]
+    fn a_build_from_a_presweep_matches_a_plain_build() {
+        let a = corpus();
+        let b = corpus();
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+            std::fs::write(dir.path().join("sub/deep/z.txt"), "hello deep").unwrap();
+            std::fs::write(dir.path().join("sub/.dot"), "hello dot").unwrap();
+        }
+        let plain = Index::build(a.path(), 1_048_576).unwrap();
+        let mut swept = walk::sweep_unsorted(b.path()).unwrap();
+        swept.reverse();
+        let pre = Index::open_or_build_swept(b.path(), 1_048_576, Some(swept)).unwrap();
+        assert!(plain.swept_full() && pre.swept_full());
+        let entries = |idx: &Index| -> Vec<(u32, PathBuf, u64, u8)> {
+            idx.manifest
+                .entries
+                .iter()
+                .map(|e| (e.id, e.path.clone(), e.size, e.flags))
+                .collect()
+        };
+        assert_eq!(entries(&plain), entries(&pre));
+        for pat in ["hello", "world", "deep"] {
+            let plan = crate::plan::build(pat, true, Case::Sensitive);
+            assert_eq!(
+                plain.candidates(&plan, Case::Sensitive, true, false),
+                pre.candidates(&plan, Case::Sensitive, true, false),
+                "{pat}"
+            );
+        }
+        // An existing index ignores the presweep.
+        drop(pre);
+        let reopened = Index::open_or_build_swept(b.path(), 1_048_576, Some(Vec::new())).unwrap();
+        assert!(!reopened.swept_full());
+        assert_eq!(entries(&reopened), entries(&plain));
+    }
+
+    /// The detached build fills in a missing index only: once the
+    /// manifest exists, or while another glep holds the lock, it builds
+    /// nothing.
+    #[test]
+    fn build_if_missing_builds_a_missing_index_only() {
+        let dir = corpus();
+        assert!(Index::build_if_missing(dir.path(), 1_048_576).unwrap());
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let before = std::fs::read(&mpath).unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new file").unwrap();
+        assert!(!Index::build_if_missing(dir.path(), 1_048_576).unwrap());
+        assert_eq!(std::fs::read(&mpath).unwrap(), before);
+
+        let dir = corpus();
+        let held = Index::build(dir.path(), 1_048_576).unwrap();
+        std::fs::remove_file(dir.path().join(".glep/manifest.bin")).unwrap();
+        assert!(!Index::build_if_missing(dir.path(), 1_048_576).unwrap());
+        assert!(!dir.path().join(".glep/manifest.bin").exists());
+        drop(held);
+        assert!(Index::build_if_missing(dir.path(), 1_048_576).unwrap());
+        assert_eq!(
+            Index::open_or_build(dir.path(), 1_048_576)
+                .unwrap()
+                .live_files(false)
+                .len(),
+            4
+        );
+    }
+
+    /// A query spawns a background build only when one could start: the
+    /// index dir (with its self-ignore) and lock file can be created, and
+    /// no other glep holds the lock. The probe never keeps the lock.
+    #[cfg(unix)]
+    #[test]
+    fn can_build_needs_a_writable_index_dir_and_a_free_lock() {
+        let dir = corpus();
+        assert!(Index::can_build(dir.path()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".glep/.gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(Index::can_build(dir.path()), "the probe kept the lock");
+        let held = Index::build(dir.path(), 1_048_576).unwrap();
+        assert!(!Index::can_build(dir.path()));
+        drop(held);
+        assert!(Index::can_build(dir.path()));
+
+        let blocked = corpus();
+        std::fs::write(blocked.path().join(".glep"), "not a directory").unwrap();
+        assert!(!Index::can_build(blocked.path()));
     }
 
     #[test]

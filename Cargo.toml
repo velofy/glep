@@ -40,5 +40,5 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

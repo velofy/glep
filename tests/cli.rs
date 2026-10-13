@@ -31,7 +31,9 @@ fn corpus() -> tempfile::TempDir {
 #[test]
 fn content_search_builds_index_and_matches() {
     let dir = corpus();
+    // Inline even when GLEP_BG_BUILD_MIN_BYTES would defer the build.
     glep(dir.path())
+        .env("GLEP_SYNC_BUILD", "1")
         .arg("hello")
         .assert()
         .success()
@@ -1429,7 +1431,11 @@ fn queries_during_another_build_answer_with_a_live_scan() {
 #[test]
 fn ttl_skips_the_sweep_for_scoped_queries_too() {
     let dir = corpus();
-    glep(dir.path()).arg("hello").assert().success();
+    glep(dir.path())
+        .env("GLEP_SYNC_BUILD", "1")
+        .arg("hello")
+        .assert()
+        .success();
     std::fs::write(dir.path().join("src/late.rs"), "ttlneedle\n").unwrap();
     let swept = |cwd: &Path, args: &[&str]| -> (bool, i32) {
         let out = glep(cwd)
@@ -1509,4 +1515,77 @@ fn scoped_listings_never_touch_the_index() {
         .assert()
         .success()
         .stdout(p("src/late.rs:1:late_needle\n"));
+}
+
+/// A first query on a tree of at most GLEP_BG_BUILD_MIN_BYTES (64 MiB by
+/// default) builds the index inline, from the sweep that measured the
+/// tree, and skips the freshness sweep its own build just did: the index
+/// is complete when the query returns, and the next process sweeps again
+/// and sees a change. The threshold is inclusive.
+#[test]
+fn small_trees_build_the_index_inline_on_the_first_query() {
+    let run = |dir: &Path, min: Option<&str>, args: &[&str]| -> (String, String) {
+        let mut c = glep(dir);
+        c.env("GLEP_TIMING", "1").env_remove("GLEP_SYNC_BUILD");
+        match min {
+            Some(v) => c.env("GLEP_BG_BUILD_MIN_BYTES", v),
+            None => c.env_remove("GLEP_BG_BUILD_MIN_BYTES"),
+        };
+        let out = c.args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let dir = corpus();
+    let d = dir.path();
+    let (out, err) = run(d, None, &["-l", "hello"]);
+    assert_eq!(out, p("notes.txt\nsrc/lib.rs\n"));
+    assert!(d.join(".glep/manifest.bin").exists());
+    assert!(
+        err.contains("index_open") && !err.contains("sweep_walk"),
+        "{err}"
+    );
+    #[cfg(unix)]
+    assert!(
+        err.contains("first_sweep") && err.contains("(inline build)"),
+        "{err}"
+    );
+    std::fs::write(d.join("src/new.rs"), "fn inline_needle() {}\n").unwrap();
+    let (out, err) = run(d, None, &["inline_needle"]);
+    assert_eq!(out, p("src/new.rs:1:fn inline_needle() {}\n"));
+    assert!(
+        err.contains("sweep_walk") && !err.contains("first_sweep"),
+        "{err}"
+    );
+
+    // corpus() holds 51 bytes of files. A held lock keeps the deferred
+    // case from spawning a builder.
+    #[cfg(unix)]
+    for (min, inline) in [("51", true), ("50", false)] {
+        use fs2::FileExt;
+        let dir = corpus();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join(".glep")).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(d.join(".glep/lock"))
+            .unwrap();
+        if !inline {
+            held.lock_exclusive().unwrap();
+        }
+        let (out, err) = run(d, Some(min), &["-l", "hello"]);
+        assert_eq!(out, p("notes.txt\nsrc/lib.rs\n"), "{min}");
+        assert!(err.contains("2 files, 51 bytes"), "{min}: {err}");
+        let mode = if inline {
+            "(inline build)"
+        } else {
+            "(background build)"
+        };
+        assert!(err.contains(mode), "{min}: {err}");
+        assert_eq!(d.join(".glep/manifest.bin").exists(), inline, "{min}");
+    }
 }

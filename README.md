@@ -38,7 +38,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 ## Features
 
 - **Trigram index** in `.glep/`, memory-mapped, about 10% of corpus size on the kernel tree.
-- **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
+- **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher and no daemon: the one background process is the first index build of a large tree, which runs once and exits.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
 - **Familiar flags:** ripgrep's own spellings, including `-i -S -F -w -x -v -l -c -o -q -U -e -f -g -t -T -C -A -B -m -M -n -N -a -z -P -E -L -u -0 -j -H -I -b` and `--json --stats --heading --column --vimgrep --trim --sort --sortr --count-matches --files-without-match --passthru --null-data --hidden --no-ignore --no-ignore-vcs --ignore-file --type-add --color --hyperlink-format`. Flags that change which files exist for a query (`--no-ignore`, `-L`, `--one-file-system` and friends) run as live scans that never touch the index.
@@ -68,7 +68,7 @@ glep status                     # index stats
 
 `--no-ignore` always pays a full scan: it bypasses the index entirely, so gitignored trees never enter it. It costs the same as `rg --no-ignore`, every time.
 
-The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory.
+The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory. On a tree holding more than 64 MiB the first query does not wait for that build: it answers with a full scan, at rg's cost, and then builds the index in a detached low-priority process, so later queries use it; a smaller tree builds it inline. `GLEP_SYNC_BUILD=1` always builds inline, and `GLEP_BG_BUILD_MIN_BYTES` moves the threshold (`K`, `M` and `G` suffixes accepted). On Windows the build is always inline.
 
 Binary files are handled the way rg's default reader handles them, and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
 

@@ -150,6 +150,23 @@ fn glep_out(dir: &Path, args: &[&str]) -> (String, i32) {
     )
 }
 
+/// `glep_out` with GLEP_SYNC_BUILD set: a first query on the tree builds
+/// the index inline, whatever GLEP_BG_BUILD_MIN_BYTES says, for tests
+/// that read the index (or the listing cache) right after it.
+fn glep_out_sync(dir: &Path, args: &[&str]) -> (String, i32) {
+    let out = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(dir)
+        .env("GLEP_SYNC_BUILD", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 fn rg_out(dir: &Path, args: &[&str]) -> (String, i32) {
     let out = std::process::Command::new("rg")
         .current_dir(dir)
@@ -628,6 +645,8 @@ fn worker_count_never_changes_output() {
         .unwrap_or(4);
     let wide = (ap + 2).to_string();
     let wide = wide.as_str();
+    // The candidate counts below are the index's narrowing.
+    assert_eq!(glep_out_sync(d, &["index"]).1, 0);
 
     // The pool's width per variant, on a `hello` search.
     let (n, default_w) = pool_width(d, &["hello"], None).expect("hello must take the pool path");
@@ -1260,46 +1279,49 @@ fn binary_files_match_rg() {
         eprintln!("parity: rg not installed, skipping");
         return;
     }
-    let cases: &[&[&str]] = &[
-        &["hello"],
-        &["-c", "hello"],
-        &["-c", "--include-zero", "hello"],
-        &["-c", "--include-zero", "zz_absent_zz"],
-        &["--count-matches", "hello"],
-        &["-l", "hello"],
-        &["--files-without-match", "hello"],
-        &["--files-without-match", "zz_absent_zz"],
-        &["--files-without-match", "-c", "zz_absent_zz"],
-        &["-c", "--files-without-match", "zz_absent_zz"],
-        &["-l", "--files-without-match", "hello"],
-        &["--files-without-match", "-l", "hello"],
-        &["-q", "late"],
-        &["late"],
-        &["-o", "hello"],
-        &["-m", "1", "hello"],
-        &["-A", "1", "hello"],
-        &["-v", "-c", "hello"],
-        &["-U", "hello"],
-        &["--no-mmap", "hello"],
-        &["-a", "hello"],
-        &["-a", "-c", "hello"],
-        &["-a", "--files-without-match", "zz_absent_zz"],
-        &["--binary", "hello"],
-        &["--binary", "-c", "hello"],
-        &["--binary", "--files-without-match", "zz_absent_zz"],
-        &["utf16token"],
-        &["-c", "utf16token"],
-        &["-l", "utf16"],
-        &["-E", "none", "hello"],
-        &["-E", "none", "-c", "hello"],
-        &["-E", "auto", "-c", "hello"],
-        &["--no-encoding", "-c", "hello"],
-    ];
+    let cases = BINARY_CASES;
     check_cases(binary_corpus(false).path(), "small", cases);
     let pool = binary_corpus(true);
     assert_eq!(search_path(pool.path(), &["hello"]), "pool");
     check_cases(pool.path(), "pool", cases);
 }
+
+/// `binary_corpus`'s cases: every search mode and binary-detection mode.
+const BINARY_CASES: &[&[&str]] = &[
+    &["hello"],
+    &["-c", "hello"],
+    &["-c", "--include-zero", "hello"],
+    &["-c", "--include-zero", "zz_absent_zz"],
+    &["--count-matches", "hello"],
+    &["-l", "hello"],
+    &["--files-without-match", "hello"],
+    &["--files-without-match", "zz_absent_zz"],
+    &["--files-without-match", "-c", "zz_absent_zz"],
+    &["-c", "--files-without-match", "zz_absent_zz"],
+    &["-l", "--files-without-match", "hello"],
+    &["--files-without-match", "-l", "hello"],
+    &["-q", "late"],
+    &["late"],
+    &["-o", "hello"],
+    &["-m", "1", "hello"],
+    &["-A", "1", "hello"],
+    &["-v", "-c", "hello"],
+    &["-U", "hello"],
+    &["--no-mmap", "hello"],
+    &["-a", "hello"],
+    &["-a", "-c", "hello"],
+    &["-a", "--files-without-match", "zz_absent_zz"],
+    &["--binary", "hello"],
+    &["--binary", "-c", "hello"],
+    &["--binary", "--files-without-match", "zz_absent_zz"],
+    &["utf16token"],
+    &["-c", "utf16token"],
+    &["-l", "utf16"],
+    &["-E", "none", "hello"],
+    &["-E", "none", "-c", "hello"],
+    &["-E", "auto", "-c", "hello"],
+    &["--no-encoding", "-c", "hello"],
+];
 
 /// rg's search modes (-l, --files-without-match, -c, --count-matches,
 /// --json) are last-wins: the later flag decides the output.
@@ -1917,7 +1939,7 @@ fn operands_the_index_cannot_serve_match_rg() {
 /// `--files` could be answered from it.
 fn warm_listing_cache(dir: &Path) {
     for _ in 0..2 {
-        let (_, code) = glep_out(dir, &["--files"]);
+        let (_, code) = glep_out_sync(dir, &["--files"]);
         assert_eq!(code, 0);
     }
     #[cfg(target_os = "macos")]
@@ -2805,7 +2827,7 @@ fn scoped_listings_from_the_sweep_match_rg() {
         assert!(scoped);
         // A subdirectory run finds the tree's root by its index: build it,
         // and the scoped listings below leave it untouched.
-        let (_, code) = glep_out(d, &["-c", "fn"]);
+        let (_, code) = glep_out_sync(d, &["-c", "fn"]);
         assert_eq!(code, 0);
         let manifest = std::fs::read(d.join(".glep/manifest.bin")).unwrap();
         // From a subdirectory: the cwd scope, operands below it and one
@@ -2880,4 +2902,363 @@ fn scoped_listings_under_a_rule_naming_the_operand_match_rg() {
         ],
     );
     assert!(!d.join(".glep").exists());
+}
+
+/// glep in `dir` with every first query deferred to a background build
+/// (GLEP_BG_BUILD_MIN_BYTES=0, GLEP_SYNC_BUILD removed), GLEP_TIMING on
+/// and the builder's pid recorded in `pidfile`: (stdout, exit code,
+/// stderr).
+#[cfg(unix)]
+fn deferred(dir: &Path, args: &[&str], pidfile: &Path) -> (String, i32, String) {
+    let out = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(dir)
+        .env("GLEP_BG_BUILD_MIN_BYTES", "0")
+        .env_remove("GLEP_SYNC_BUILD")
+        .env("GLEP_TIMING", "1")
+        .env("GLEP_BG_PIDFILE", pidfile)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Take the index lock of `dir` the way a running build holds it: while
+/// the returned file stays open no build can start, so every query on an
+/// unindexed tree answers from its sweep.
+#[cfg(unix)]
+fn hold_index_lock(dir: &Path) -> std::fs::File {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir.join(".glep")).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".glep/lock"))
+        .unwrap();
+    f.lock_exclusive().unwrap();
+    f
+}
+
+/// Whether some process holds the index lock of `dir` (a build running).
+#[cfg(unix)]
+fn index_lock_held(dir: &Path) -> bool {
+    use fs2::FileExt;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(".glep/lock"))
+    else {
+        return false;
+    };
+    match f.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&f).unwrap();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Poll until `cond` holds, failing with `what` after `secs` seconds.
+#[cfg(unix)]
+fn wait_until(secs: u64, what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} after {secs} s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Wait for the background build of `dir` to finish: its manifest
+/// written and its lock released.
+#[cfg(unix)]
+fn wait_for_background_build(dir: &Path, secs: u64) {
+    wait_until(secs, "no finished background build", || {
+        dir.join(".glep/manifest.bin").exists() && !index_lock_held(dir)
+    });
+}
+
+/// The builder pid a deferred query recorded (GLEP_BG_PIDFILE).
+#[cfg(unix)]
+fn builder_pid(pidfile: &Path) -> u32 {
+    let text = std::fs::read_to_string(pidfile).unwrap();
+    text.trim().parse().unwrap()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `files` text files of about 44 KB over 20 directories, every 50th
+/// with a `needle_` line: a search of them takes milliseconds, a debug
+/// build of their index seconds.
+#[cfg(unix)]
+fn big_fixture(dir: &Path, files: usize) {
+    use std::fmt::Write;
+    for i in 0..files {
+        let sub = dir.join(format!("d{:02}", i % 20));
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut body = String::with_capacity(48 * 1024);
+        for j in 0..1000 {
+            let (a, b, c) = ((i * 7 + j) % 97, (i * 13 + j * 3) % 101, j % 89);
+            writeln!(body, "line {j} of file {i}: alpha{a} beta{b} gamma{c}").unwrap();
+        }
+        if i % 50 == 0 {
+            writeln!(body, "the needle_{i} sits here").unwrap();
+        }
+        std::fs::write(sub.join(format!("f{i:03}.txt")), body).unwrap();
+    }
+}
+
+/// A first query on an unindexed tree too big to index inline answers
+/// from the sweep that measured the tree: rg's bytes and exit code for
+/// every case, on the small path and the worker pool, binary files, an
+/// ignored directory operand (walked live) and subdirectory runs
+/// included. A held index lock stands in for a running build, so every
+/// query takes that path and none spawns a builder or writes an index.
+#[cfg(unix)]
+#[test]
+fn first_queries_answer_from_the_sweep_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let pool = pool_corpus();
+    std::fs::write(pool.path().join(".gitignore"), "*.log\nbuilt/\n").unwrap();
+    std::fs::create_dir_all(pool.path().join("built")).unwrap();
+    std::fs::write(pool.path().join("built/out.txt"), "hello built\n").unwrap();
+    let extra: &[&[&str]] = &[
+        &["hello", "built"],
+        &["-l", "hello", "built", "src"],
+        &["hello", "src", "pool/d1"],
+        &["-c", "foo", "pool/d2", "README.md"],
+        &["--files", "-g", "*.rs"],
+        &["--files-without-match", "hello"],
+        &["--stats", "-c", "foo"],
+    ];
+    let corpora = [
+        ("small", corpus(), BASE_CASES),
+        ("pool", pool, BASE_CASES),
+        ("binary", binary_corpus(true), BINARY_CASES),
+    ];
+    for (label, dir, cases) in &corpora {
+        let d = dir.path();
+        let lock = hold_index_lock(d);
+        let (_, _, err) = deferred(d, &["hello"], &pidfile);
+        assert!(
+            err.contains("first_sweep")
+                && err.contains("(background build)")
+                && err.contains("bg_spawn")
+                && !err.contains("index_open"),
+            "{label}: {err}"
+        );
+        if *label != "small" {
+            assert!(err.contains("search path pool"), "{label}: {err}");
+        }
+        let extra = if *label == "pool" { extra } else { &[] };
+        for args in cases.iter().chain(extra) {
+            let (g, gc, _) = deferred(d, args, &pidfile);
+            let (r, rc) = rg_out(d, args);
+            if args.contains(&"--stats") {
+                // Timings differ; every counter matches.
+                let keep = |s: &str| -> String {
+                    s.lines()
+                        .filter(|l| !l.contains("seconds"))
+                        .map(|l| format!("{l}\n"))
+                        .collect()
+                };
+                assert_eq!(keep(&g), keep(&r), "{label}: stdout diverged for {args:?}");
+            } else {
+                assert_eq!(g, r, "{label}: stdout diverged for {args:?}");
+            }
+            assert_eq!(gc, rc, "{label}: exit code diverged for {args:?}");
+        }
+        if *label == "pool" {
+            let sub = d.join("pool");
+            for args in [&["hello"][..], &["-c", "foo"], &["hello", "../src"]] {
+                let (g, gc, err) = deferred(&sub, args, &pidfile);
+                assert!(err.contains("first_sweep"), "{err}");
+                assert_eq!((g, gc), rg_out(&sub, args), "pool/: {args:?}");
+            }
+        }
+        assert!(!d.join(".glep/manifest.bin").exists(), "{label}");
+        assert!(!pidfile.exists(), "{label}: spawned under a held lock");
+        drop(lock);
+    }
+}
+
+/// The first query on an unindexed tree spawns the build and returns
+/// without it: the index appears with no further query, and the next
+/// query opens it and prints what rg prints.
+#[cfg(unix)]
+#[test]
+fn first_query_builds_the_index_in_the_background() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = pool_corpus();
+    let d = dir.path();
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let (r, rc) = rg_out(d, &["hello"]);
+    let (g, gc, err) = deferred(d, &["hello"], &pidfile);
+    assert_eq!((&g, gc), (&r, rc));
+    assert!(
+        err.contains("first_sweep")
+            && err.contains("bg_spawn")
+            && err.contains("search path pool")
+            && !err.contains("index_open"),
+        "{err}"
+    );
+    assert!(pidfile.exists(), "no builder spawned: {err}");
+    wait_for_background_build(d, 30);
+    let (g, gc, err) = deferred(d, &["hello"], &pidfile);
+    assert_eq!((&g, gc), (&r, rc));
+    assert!(
+        err.contains("index_open") && !err.contains("first_sweep"),
+        "{err}"
+    );
+    for args in [&["-l", "foo"][..], &["-c", "hello"], &["--files"]] {
+        let (g, gc, _) = deferred(d, args, &pidfile);
+        assert_eq!((g, gc), rg_out(d, args), "{args:?}");
+    }
+}
+
+/// A deferred first query never keeps its reader waiting for the build:
+/// `$(...)` and a pipe into `head -1` return while the builder still
+/// runs, since its stdio is the null device, not the query's pipes.
+#[cfg(unix)]
+#[test]
+fn first_query_output_never_waits_for_the_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    big_fixture(d, 600);
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let bin = assert_cmd::cargo::cargo_bin("glep");
+    // `$0` is glep in each script.
+    let sh = |script: &str| -> (String, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&bin)
+            .current_dir(d)
+            .env("GLEP_BG_BUILD_MIN_BYTES", "0")
+            .env_remove("GLEP_SYNC_BUILD")
+            .env("GLEP_BG_PIDFILE", &pidfile)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let took = start.elapsed();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{script}: {err}");
+        (String::from_utf8(out.stdout).unwrap(), took)
+    };
+    let (all, took) = sh(r#"out=$("$0" needle_); printf '%s\n' "$out""#);
+    let pid = builder_pid(&pidfile);
+    assert!(
+        process_alive(pid),
+        "the build was over when $(...) returned"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "$(...) took {took:?}"
+    );
+    assert_eq!(all.lines().count(), 12, "{all}");
+    if have_rg() {
+        assert_eq!(all, rg_out(d, &["needle_"]).0);
+    }
+    let (first, took) = sh(r#""$0" needle_ | head -1"#);
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "| head -1 took {took:?}"
+    );
+    assert_eq!(first, "d00/f000.txt:1001:the needle_0 sits here\n");
+    // The tree goes away with this test: stop its builder (the second
+    // query found it holding the lock, or spawned one that lost the race).
+    kill_process(pid);
+    let last = builder_pid(&pidfile);
+    if last != pid {
+        kill_process(last);
+    }
+}
+
+/// A background build killed partway leaves no index, and leftovers of
+/// interrupted writes harm nothing: the next query prints the same as a
+/// live scan, from a fresh sweep, and spawns a new build, whose index the
+/// query after it opens.
+#[cfg(unix)]
+#[test]
+fn killed_background_build_is_redone_and_queries_stay_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    big_fixture(d, 200);
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let live = |args: &[&str]| -> (String, i32) {
+        let mut full = vec!["--no-index"];
+        full.extend_from_slice(args);
+        glep_out(d, &full)
+    };
+    let expected = live(&["needle_"]);
+    assert_eq!(expected.1, 0);
+    let (g, gc, err) = deferred(d, &["needle_"], &pidfile);
+    assert_eq!((g, gc), expected, "{err}");
+    let pid = builder_pid(&pidfile);
+    // Kill it once it holds the lock, mid-build: a debug build of this
+    // tree takes about a second, and the manifest is its last write.
+    wait_until(10, "the builder never took the lock", || index_lock_held(d));
+    kill_process(pid);
+    wait_until(10, "the killed builder kept the lock", || {
+        !index_lock_held(d)
+    });
+    assert!(
+        !d.join(".glep/manifest.bin").exists(),
+        "built before the kill"
+    );
+    // What a build killed while writing leaves: a postings file without
+    // its manifest, and a half-written manifest under its temp name.
+    std::fs::write(d.join(".glep/postings.bin"), b"torn").unwrap();
+    std::fs::write(d.join(".glep/manifest.tmp"), b"torn").unwrap();
+    std::fs::remove_file(&pidfile).unwrap();
+    let (g, gc, err) = deferred(d, &["needle_"], &pidfile);
+    assert_eq!((g, gc), expected, "{err}");
+    assert!(
+        err.contains("first_sweep") && err.contains("bg_spawn"),
+        "{err}"
+    );
+    assert!(pidfile.exists(), "no new builder: {err}");
+    wait_for_background_build(d, 60);
+    for args in [&["needle_"][..], &["-l", "needle_"], &["-c", "alpha5 beta"]] {
+        let (g, gc, err) = deferred(d, args, &pidfile);
+        assert_eq!((g, gc), live(args), "{args:?}: {err}");
+        assert!(
+            err.contains("index_open") && !err.contains("first_sweep"),
+            "{err}"
+        );
+    }
 }
