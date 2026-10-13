@@ -98,24 +98,34 @@ pub struct Args {
     /// Additional color spec, e.g. --colors 'path:fg:magenta' (repeatable)
     #[arg(long = "colors", value_name = "COLOR_SPEC")]
     pub color_specs: Vec<String>,
-    /// Print every line (matches still marked), rg --passthru
-    #[arg(long)]
+    /// Print every line (matches still marked), rg --passthru (alias
+    /// --passthrough). A last-wins pair with -A/-B/-C, like rg's context
+    /// mode: whichever comes last decides.
+    #[arg(
+        long,
+        alias = "passthrough",
+        overrides_with_all = ["context", "after_context", "before_context"]
+    )]
     pub passthru: bool,
     /// Disable unicode mode in the regex (rg --no-unicode)
     #[arg(long)]
     pub no_unicode: bool,
-    /// Separator between match fields (path/line/content), single byte,
-    /// rg --field-match-separator
+    /// Separator between match fields (path/line/content), default `:`;
+    /// escapes like \t or \x7F are decoded (rg --field-match-separator)
     #[arg(long, value_name = "SEP")]
     pub field_match_separator: Option<String>,
-    /// Separator between context fields, single byte,
-    /// rg --field-context-separator
+    /// Separator between context fields, default `-`; escapes are
+    /// decoded (rg --field-context-separator)
     #[arg(long, value_name = "SEP")]
     pub field_context_separator: Option<String>,
-    /// Separator printed between match groups/files, rg --context-separator.
-    /// "" disables the separator entirely.
-    #[arg(long, value_name = "SEP")]
+    /// Separator printed between non-contiguous context groups and
+    /// between files in context mode, default `--`; escapes are decoded
+    /// and "" still prints a line break (rg --context-separator)
+    #[arg(long, value_name = "SEP", overrides_with = "no_context_separator")]
     pub context_separator: Option<String>,
+    /// Print no context separators at all (rg --no-context-separator)
+    #[arg(long, overrides_with = "context_separator")]
+    pub no_context_separator: bool,
     /// PCRE2 regex engine (lookaround, backrefs, etc.)
     #[arg(short = 'P', long = "pcre2")]
     pub pcre2: bool,
@@ -179,10 +189,8 @@ pub struct Args {
     /// Print all known file types and exit (rg --type-list)
     #[arg(long)]
     pub type_list: bool,
-    /// Alias spellings accepted for script compat (rg --passthrough,
-    /// --print0 = -0, --sort-files = --sort path)
-    #[arg(long = "passthrough", hide = true, overrides_with = "passthru")]
-    pub passthrough_alias: bool,
+    /// Alias spellings accepted for script compat (--print0 = -0,
+    /// --sort-files = --sort path)
     #[arg(long, hide = true)]
     pub print0: bool,
     #[arg(long = "sort-files", hide = true)]
@@ -232,8 +240,9 @@ pub struct Args {
     /// Apply --pre only to files matching this glob (rg --pre-glob)
     #[arg(long, value_name = "GLOB", requires = "pre")]
     pub pre_glob: Option<String>,
-    /// Treat \r\n as the line terminator (rg --crlf)
-    #[arg(long)]
+    /// Treat \r\n as the line terminator (rg --crlf). A last-wins pair
+    /// with --null-data, like rg.
+    #[arg(long, overrides_with = "null_data")]
     pub crlf: bool,
     /// Use memory-mapped IO when searching files (rg --mmap). Already
     /// glep's default: files are searched straight from the page cache.
@@ -249,8 +258,9 @@ pub struct Args {
     /// Generate shell completions or man page and exit (rg --generate)
     #[arg(long, value_name = "KIND", value_parser = ["man", "complete-bash", "complete-zsh", "complete-fish", "complete-powershell"])]
     pub generate: Option<String>,
-    /// NUL is the line terminator (rg --null-data)
-    #[arg(long = "null-data")]
+    /// NUL is the line terminator (rg --null-data). A last-wins pair
+    /// with --crlf, like rg.
+    #[arg(long = "null-data", overrides_with = "crlf")]
     pub null_data: bool,
     /// DFA size limit for the regex engine (rg --dfa-size-limit)
     #[arg(long, value_name = "BYTES")]
@@ -296,9 +306,13 @@ pub struct Args {
     /// Terminate printed paths with NUL instead of a separator (rg -0)
     #[arg(short = '0', long = "null")]
     pub null: bool,
-    /// Replace the OS path separator in output paths; exactly one byte
+    /// Replace the OS path separator in output paths: exactly one byte
+    /// after escapes are decoded, "" keeps the default
     /// (rg --path-separator)
-    #[arg(long, value_parser = parse_path_separator)]
+    #[arg(long = "path-separator", value_name = "SEP")]
+    pub path_separator_raw: Option<String>,
+    /// The resolved --path-separator byte (set in `run`).
+    #[arg(skip)]
     pub path_separator: Option<u8>,
     /// With -c, print `path:0` lines for searched files with no matches
     /// (rg --include-zero). Needs the full walked set, so the index plan
@@ -380,15 +394,27 @@ pub struct Args {
     pub max_filesize: u64,
 }
 
-fn parse_path_separator(s: &str) -> Result<u8, String> {
-    if s.len() == 1 {
-        Ok(s.as_bytes()[0])
-    } else {
-        Err(format!(
-            "A path separator must be exactly one byte, but the given separator is {} bytes: {}",
-            s.len(),
-            s
-        ))
+/// rg's escape decoding for separator flags (`\t`, `\n`, `\r`, `\0`,
+/// `\\`, `\xNN`; anything else stays literal), via the same bstr routine
+/// the reference uses.
+fn unescape(s: &str) -> Vec<u8> {
+    use bstr::ByteVec;
+    Vec::unescape_bytes(s)
+}
+
+/// rg's --path-separator: decoded, empty means the default, otherwise it
+/// must be exactly one byte.
+fn parse_path_separator(s: Option<&str>) -> anyhow::Result<Option<u8>> {
+    let Some(s) = s else {
+        return Ok(None);
+    };
+    let raw = unescape(s);
+    match raw.len() {
+        0 => Ok(None),
+        1 => Ok(Some(raw[0])),
+        n => anyhow::bail!(
+            "A path separator must be exactly one byte, but the given separator is {n} bytes: {s}\nIn some shells on Windows '/' is automatically expanded. Use '//' instead."
+        ),
     }
 }
 
@@ -984,18 +1010,17 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         null_data: args.null_data,
         dfa_size_limit: args.dfa_size_limit,
         regex_size_limit: args.regex_size_limit,
-        field_match_separator: args
-            .field_match_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        field_context_separator: args
-            .field_context_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
-        context_separator: args
-            .context_separator
-            .as_ref()
-            .map(|v| v.clone().into_bytes()),
+        field_match_separator: args.field_match_separator.as_deref().map(unescape),
+        field_context_separator: args.field_context_separator.as_deref().map(unescape),
+        context_separator: if args.no_context_separator {
+            None
+        } else {
+            Some(
+                args.context_separator
+                    .as_deref()
+                    .map_or_else(|| b"--".to_vec(), unescape),
+            )
+        },
         pcre2: args.pcre2,
         search_zip: args.search_zip,
         word: args.word_regexp,
@@ -1384,10 +1409,8 @@ pub fn run() -> anyhow::Result<i32> {
         args.paths.push(cwd_rel.clone());
     }
 
+    args.path_separator = parse_path_separator(args.path_separator_raw.as_deref())?;
     // Compat spellings fold into their canonical flags.
-    if args.passthrough_alias {
-        args.passthru = true;
-    }
     if args.print0 {
         args.null = true;
     }

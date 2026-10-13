@@ -13,6 +13,7 @@ documentation = "https://velofy.co/glep/"
 [dependencies]
 anyhow = "1"
 bincode = "1"
+bstr = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4.6.11"
 clap_mangen = "0.3.3"

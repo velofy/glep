@@ -126,6 +126,14 @@ fn corpus() -> tempfile::TempDir {
     // --vimgrep's one-line-per-match output.
     std::fs::write(dir.path().join("pad.txt"), "   padded hello   \n").unwrap();
     std::fs::write(dir.path().join("mm.txt"), "aa bb aa\nplain\n").unwrap();
+    // CRLF fixture for --crlf: matches on the first and last lines, a
+    // non-matching line between them, and `$` anchors that only match
+    // before `\r\n` in CRLF mode.
+    std::fs::write(
+        dir.path().join("crlf.txt"),
+        "crlf hello\r\nsecond line\r\nhello end\r\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -491,7 +499,6 @@ fn colored_and_hyperlinked_paths_match_rg() {
         &["--color", "always", "-c", "hello"],
         &["--color", "always", "--count-matches", "hello"],
         &["--color", "always", "--files"],
-
         &["--color", "always", "-0", "-l", "hello"],
         &["--color", "always", "-0", "-c", "hello"],
         &["--color", "always", "--path-separator", "%", "-c", "hello"],
@@ -635,4 +642,79 @@ fn hostname_bin_runs_a_program_like_rg() {
     check_cases(dir.path(), "hostname-bin", cases);
     let (g, _) = glep_out(dir.path(), cases[0]);
     assert!(g.contains("file://fake.host/"), "{g:?}");
+}
+
+/// Every record a printer writes ends with the searcher's line
+/// terminator: CRLF under --crlf, NUL under --null-data (a last-wins
+/// pair). That covers -c/-l/--count-matches records and the separators
+/// between files. Separator flags decode escapes; --context-separator ""
+/// still prints a line break while --no-context-separator prints none;
+/// --heading always separates files with a bare line break; --passthru
+/// and -A/-B/-C are a last-wins pair with no file separator under
+/// --passthru.
+#[test]
+fn terminators_and_separators_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["--crlf", "hello"],
+        &["--crlf", "hello$"],
+        &["--crlf", "-c", "hello"],
+        &["--crlf", "-l", "hello"],
+        &["--crlf", "--count-matches", "hello"],
+        &["--crlf", "-c", "--include-zero", "hello"],
+        &["--crlf", "-C", "1", "hello"],
+        &["--crlf", "--heading", "hello"],
+        &["--crlf", "--heading", "-C", "1", "foo"],
+        &["--crlf", "-o", "hello"],
+        &["--crlf", "--vimgrep", "hello"],
+        &["--crlf", "-0", "-l", "hello"],
+        &["--null-data", "hello"],
+        &["--null-data", "-l", "hello"],
+        &["--null-data", "-c", "hello"],
+        &["--null-data", "-C", "1", "hello"],
+        &["--null-data", "--heading", "hello"],
+        &["--null-data", "--files-without-match", "hello"],
+        &["--crlf", "--null-data", "-c", "hello"],
+        &["--null-data", "--crlf", "-c", "hello"],
+        &["--null-data", "--crlf", "-l", "hello"],
+        &["-C", "1", "--context-separator", "", "hello"],
+        &["-C", "1", "--context-separator", "==", "hello"],
+        &["-C", "1", "--context-separator", "\\x3d\\t", "hello"],
+        &["--heading", "--context-separator", "==", "hello"],
+        &["--heading", "-C", "1", "--context-separator", "==", "foo"],
+        &["--heading", "-C", "1", "--context-separator", "", "foo"],
+        &["-C", "1", "--no-context-separator", "hello"],
+        &[
+            "-C",
+            "1",
+            "--no-context-separator",
+            "--context-separator",
+            "XX",
+            "hello",
+        ],
+        &[
+            "-C",
+            "1",
+            "--context-separator",
+            "XX",
+            "--no-context-separator",
+            "hello",
+        ],
+        &["--heading", "--no-context-separator", "hello"],
+        &["--passthru", "-C", "1", "hello"],
+        &["-C", "1", "--passthru", "hello"],
+        &["-A", "1", "--passthru", "-B", "1", "hello"],
+        &["--passthrough", "hello"],
+        &["--passthru", "--heading", "hello"],
+        &["--field-match-separator", "\\t", "hello"],
+        &["--field-context-separator", "\\x2b", "-C", "1", "hello"],
+        &["--path-separator", "\\x25", "hello"],
+        &["--path-separator", "", "-l", "hello"],
+        &["--path-separator", "ab", "hello"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    check_cases(pool_corpus().path(), "pool", cases);
 }

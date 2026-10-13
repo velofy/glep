@@ -74,7 +74,8 @@ pub struct SearchOpts {
     pub field_match_separator: Option<Vec<u8>>,
     /// --field-context-separator (bytes between fields on context lines)
     pub field_context_separator: Option<Vec<u8>>,
-    /// --context-separator ("" = none)
+    /// The context separator (rg's default `--`, escapes already decoded;
+    /// empty still prints a line break). None = --no-context-separator.
     pub context_separator: Option<Vec<u8>>,
     /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
     pub pcre2: bool,
@@ -121,6 +122,30 @@ pub struct SearchOpts {
     pub quiet: bool,
 }
 
+impl SearchOpts {
+    /// The searcher's line terminator, which rg's printers also end every
+    /// record and separator with: NUL under --null-data, CRLF under
+    /// --crlf (the two are a last-wins pair, resolved in cli), else LF.
+    pub fn line_term(&self) -> &'static [u8] {
+        if self.null_data {
+            b"\0"
+        } else if self.crlf {
+            b"\r\n"
+        } else {
+            b"\n"
+        }
+    }
+
+    /// A summary record's terminator: the -0 path terminator when set,
+    /// else the line terminator (rg's summary printer).
+    fn push_record_end(&self, buf: &mut Vec<u8>) {
+        match self.path_terminator {
+            Some(t) => buf.push(t),
+            None => buf.extend_from_slice(self.line_term()),
+        }
+    }
+}
+
 impl Default for SearchOpts {
     /// rg's defaults: line numbers on, filenames on, quit-at-NUL binary
     /// detection, unicode on, everything else off.
@@ -159,7 +184,7 @@ impl Default for SearchOpts {
             regex_size_limit: None,
             field_match_separator: None,
             field_context_separator: None,
-            context_separator: None,
+            context_separator: Some(b"--".to_vec()),
             pcre2: false,
             search_zip: false,
             max_columns_preview: false,
@@ -448,9 +473,7 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
     if let Some(s) = &opts.field_context_separator {
         b.separator_field_context(s.clone());
     }
-    if let Some(s) = &opts.context_separator {
-        b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
-    }
+    b.separator_context(opts.context_separator.clone());
     if opts.color {
         b.color_specs(color_specs(&opts.color_specs));
     }
@@ -823,15 +846,16 @@ fn search_one<M: Matcher>(
             .then(|| file_stats(stat_path, sink.count, sink.occurrences));
         if sink.count > 0 || opts.include_zero {
             // `path` + field terminator (`:` normally, NUL under --null) +
-            // count; bare `N` when the path is suppressed. The record end
-            // is NUL under --null-data.
+            // count; bare `N` when the path is suppressed. The record ends
+            // with the line terminator (CRLF under --crlf, NUL under
+            // --null-data), exactly like rg's summary printer.
             let mut line = Vec::with_capacity(display.as_os_str().len() + 12);
             if opts.with_filename {
                 state.paths.write(&mut line, display);
                 line.push(opts.path_terminator.unwrap_or(b':'));
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
-            line.push(if opts.null_data { b'\0' } else { b'\n' });
+            line.extend_from_slice(opts.line_term());
             return Ok(FileResult {
                 buf: line,
                 matched: sink.count > 0,
@@ -868,7 +892,7 @@ fn search_one<M: Matcher>(
         let mut buf = Vec::new();
         if matched && opts.files_with_matches {
             state.paths.write(&mut buf, display);
-            buf.push(opts.path_terminator.unwrap_or(b'\n'));
+            opts.push_record_end(&mut buf);
         }
         return Ok(FileResult {
             buf,
@@ -950,17 +974,18 @@ const PRINT_BATCH: usize = 256 * 1024;
 
 /// In-order output state, shared by the on-thread small path and the
 /// printer thread so byte output cannot drift between them. Results are
-/// emitted strictly in file-index order; `separate` drives the
-/// rg-compatible group separator (`--` in context modes, a blank line
-/// under --heading, or --context-separator's bytes).
+/// emitted strictly in file-index order; `file_separator` is rg's
+/// separator between files' output.
 struct Printer {
     next: usize,
     ring: Vec<Option<FileResult>>,
     ring_mask: usize,
     total: usize,
-    separate: bool,
-    heading: bool,
-    context_separator: Option<Vec<u8>>,
+    /// rg's file separator, line terminator included: a bare line break
+    /// under --heading, the context separator plus a line break in
+    /// context mode (-A/-B/-C, not --passthru), nothing otherwise or under
+    /// --no-context-separator. Only the standard output mode has one.
+    file_separator: Option<Vec<u8>>,
     line_buffered: bool,
     printed_any: bool,
     found: bool,
@@ -979,21 +1004,28 @@ struct Printer {
 impl Printer {
     fn new(opts: &SearchOpts, ring_cap: usize, total: usize) -> Printer {
         let cap = ring_cap.max(1).next_power_of_two();
-        let separate = (opts.heading || opts.before > 0 || opts.after > 0)
-            && !opts.files_with_matches
+        let standard = !opts.files_with_matches
             && !opts.files_without_match
             && !opts.json
             && !opts.count
             && !opts.count_matches
             && !opts.quiet;
+        let sep: Option<&[u8]> = if !standard {
+            None
+        } else if opts.heading {
+            Some(b"")
+        } else if (opts.before > 0 || opts.after > 0) && !opts.passthru {
+            opts.context_separator.as_deref()
+        } else {
+            None
+        };
+        let file_separator = sep.map(|s| [s, opts.line_term()].concat());
         Printer {
             next: 0,
             ring: (0..cap).map(|_| None).collect(),
             ring_mask: cap - 1,
             total,
-            separate,
-            heading: opts.heading,
-            context_separator: opts.context_separator.clone(),
+            file_separator,
             line_buffered: opts.line_buffered,
             printed_any: false,
             found: false,
@@ -1096,21 +1128,13 @@ impl Printer {
         if buf.is_empty() {
             return Ok(());
         }
-        if self.separate && self.printed_any {
-            match &self.context_separator {
-                // "" disables the separator entirely
-                Some(v) if v.is_empty() => {}
-                Some(v) => {
-                    let mut sep = v.clone();
-                    sep.push(b'\n');
-                    self.write_bytes(&sep, out)?;
-                }
-                None => {
-                    if self.heading {
-                        self.write_bytes(b"\n", out)?;
-                    } else {
-                        self.write_bytes(b"--\n", out)?;
-                    }
+        if self.printed_any {
+            if let Some(sep) = &self.file_separator {
+                if self.line_buffered {
+                    out.write_all(sep)?;
+                } else {
+                    // Coalesced with the file's own bytes just below.
+                    self.out_buf.extend_from_slice(sep);
                 }
             }
         }
@@ -1419,7 +1443,7 @@ fn finish(
             if !matched.contains(p.as_path()) {
                 found = true;
                 paths.write(&mut buf, &display_path(p, opts));
-                buf.push(opts.path_terminator.unwrap_or(b'\n'));
+                opts.push_record_end(&mut buf);
             }
         }
         out.write_all(&buf)?;
