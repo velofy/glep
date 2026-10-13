@@ -1405,7 +1405,9 @@ where
 }
 
 pub fn run() -> anyhow::Result<i32> {
-    let mut args = Args::parse();
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = Args::command().get_matches();
+    let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if let Some(n) = args.threads {
         // Global rayon pool (sweeps, filters); the search pool reads
         // SearchOpts::threads. A second init keeps the first (only ever
@@ -1502,11 +1504,27 @@ pub fn run() -> anyhow::Result<i32> {
         args.sortr = None;
     }
     if args.pretty {
-        // -p: colors + heading + line numbers, like rg --pretty.
-        args.color = Some("always".to_string());
-        args.heading = true;
-        args.line_number = true;
-        args.no_line_number = false;
+        // -p is rg's alias for --color always --heading --line-number, so
+        // each of those settings only holds unless a flag given AFTER -p
+        // changes it again (`-p --color never` keeps the heading).
+        // Defaults carry indices too: only command-line occurrences count.
+        let at = |id: &str| {
+            (matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
+                .then(|| matches.indices_of(id).and_then(|i| i.max()))
+                .flatten()
+        };
+        let p = at("pretty");
+        if at("color") < p {
+            args.color = Some("always".to_string());
+        }
+        if at("no_heading") < p {
+            args.heading = true;
+            args.no_heading = false;
+        }
+        if at("no_line_number") < p {
+            args.line_number = true;
+            args.no_line_number = false;
+        }
     }
     if args.no_heading {
         args.heading = false;

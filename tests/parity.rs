@@ -1053,6 +1053,14 @@ fn remaining_stack_flags_match_rg() {
         &["--mmap", "--no-mmap", "hello"],
         &["-p", "hello"],
         &["-p", "-c", "hello"],
+        // -p is an alias for --color always --heading --line-number, so
+        // a later flag overrides each part and an earlier one does not.
+        &["-p", "--color", "never", "hello"],
+        &["--color", "never", "-p", "hello"],
+        &["-p", "--no-heading", "hello"],
+        &["--no-heading", "-p", "hello"],
+        &["-p", "-N", "hello"],
+        &["-N", "-p", "hello"],
         &["--iglob", "*.MD", "-l", "hello"],
         &["-g", "*.MD", "-l", "hello"],
         &["--glob-case-insensitive", "-g", "*.MD", "-l", "hello"],
