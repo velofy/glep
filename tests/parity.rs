@@ -858,6 +858,7 @@ fn dash_leading_flag_values_match_rg() {
     }
     let cases: &[&[&str]] = &[
         &["-e", "-> u32"],
+        &["-e", "-foo", "-c"],
         &["--regexp", "-> u32", "-l"],
         &["-F", "-e", "-> u32"],
         &["-e", "hello", "-e", "-> u32", "-c"],
