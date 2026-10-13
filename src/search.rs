@@ -79,6 +79,12 @@ pub struct SearchOpts {
     pub context_separator: Option<Vec<u8>>,
     /// -P/--pcre2: use the PCRE2 engine instead of Rust's regex.
     pub pcre2: bool,
+    /// --engine auto (rg's hybrid mode): Rust's regex when the pattern
+    /// builds there, PCRE2 when it does not.
+    pub engine_auto: bool,
+    /// Transcode files that start with a UTF-8/UTF-16 byte-order mark
+    /// (rg's default); `-E none` turns it off.
+    pub bom_sniffing: bool,
     /// -z: decompress .gz files via flate2 and search the decoded stream.
     pub search_zip: bool,
     /// -M preview: a truncated long line ends with a `[... N more matches]`
@@ -186,6 +192,8 @@ impl Default for SearchOpts {
             field_context_separator: None,
             context_separator: Some(b"--".to_vec()),
             pcre2: false,
+            engine_auto: false,
+            bom_sniffing: true,
             search_zip: false,
             max_columns_preview: false,
             stop_on_nonmatch: false,
@@ -303,74 +311,81 @@ fn build_pcre2_matcher(
     pattern: &str,
     opts: &SearchOpts,
 ) -> anyhow::Result<grep_pcre2::RegexMatcher> {
-    // Mirrors rg's own PCRE2 configuration (multi_line always on so ^/$
-    // anchor per line; case/boundary modes; utf+ucp unless --no-unicode).
+    // rg's own PCRE2 configuration (hiargs matcher_pcre2): multi_line
+    // always on so ^/$ anchor per line; case/boundary modes; JIT with a
+    // 10 MB stack on 64-bit targets; utf+ucp unless --no-unicode; dotall
+    // only under -U; CRLF-aware anchors under --crlf.
     let mut b = grep_pcre2::RegexMatcherBuilder::new();
     b.multi_line(true)
         .fixed_strings(opts.fixed)
         .caseless(opts.case_insensitive)
         .case_smart(opts.smart_case)
         .word(opts.word)
-        .whole_line(opts.line_regexp)
-        .jit_if_available(true);
+        .whole_line(opts.line_regexp);
+    if cfg!(target_pointer_width = "64") {
+        b.jit_if_available(true)
+            .max_jit_stack_size(Some(10 * (1 << 20)));
+    }
     if opts.unicode {
         b.utf(true).ucp(true);
     }
     if opts.multiline {
         b.dotall(opts.multiline_dotall);
     }
-    if opts.crlf && !opts.null_data {
+    if opts.crlf {
         b.crlf(true);
     }
     Ok(b.build(pattern)?)
 }
 
 fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex::RegexMatcher> {
+    // rg's own Rust-regex configuration (hiargs matcher_rust), knob for
+    // knob. multi_line is always on so ^/$ are line anchors (the fast
+    // whole-buffer line search depends on it). -S resolves case from the
+    // pattern AST (an inline (?i) beats everything); -w/-x are a
+    // last-wins pair in cli.
     let mut b = RegexMatcherBuilder::new();
-    b.case_insensitive(opts.case_insensitive);
-    // -S: case sensitivity is resolved by the matcher from the pattern AST
-    // (an inline (?i) beats everything), same as rg.
-    b.case_smart(opts.smart_case);
-    b.fixed_strings(opts.fixed);
-    b.word(opts.word);
-    // -x maps to grep-regex's whole_line, the same knob rg uses for
-    // --line-regexp. It wraps the HIR in line anchors after -F literals and
-    // smart-case resolution are applied. rg treats -w/-x as last-wins
-    // (enforced via clap overrides_with in cli.rs); if both were ever set,
-    // whole_line would subsume word anyway.
-    b.whole_line(opts.line_regexp);
-    // rg's -U maps to: searcher.multi_line(true) so matches may span lines,
-    // plus a matcher built without a line-terminator restriction so a
-    // literal \n in the pattern is allowed to compile and match. We never
-    // call RegexMatcherBuilder::line_terminator here (its default is
-    // already None/unrestricted), so \n-containing patterns already
-    // compile; the only builder change needed for -U is enabling the
-    // regex "m" flag so ^/$ keep their per-line semantics once the
-    // searcher stops feeding lines one at a time (verified empirically
-    // against real rg: `rg -U '^foo'` still matches at line starts, not
-    // just at the start of the whole file).
+    b.multi_line(true)
+        .unicode(opts.unicode)
+        .octal(false)
+        .fixed_strings(opts.fixed)
+        .case_insensitive(opts.case_insensitive)
+        .case_smart(opts.smart_case)
+        .word(opts.word)
+        .whole_line(opts.line_regexp);
     if opts.multiline {
-        b.multi_line(true);
+        // -U: matches may span lines, so the matcher has no line
+        // terminator (a literal \n in the pattern is fine) and `.` spans
+        // lines only under --multiline-dotall. Under --crlf the anchors
+        // still treat \r\n as a line end.
+        b.dot_matches_new_line(opts.multiline_dotall);
+        if opts.crlf {
+            b.crlf(true).line_terminator(None);
+        }
+    } else {
+        // Line-oriented: \n is the line terminator, so a pattern that
+        // must match it is an error (rg: "the literal \n is not allowed
+        // in a regex") and classes like \s never match it. The same
+        // knob lets the searcher use its fast whole-buffer line search.
+        b.line_terminator(Some(b'\n')).dot_matches_new_line(false);
+        if opts.crlf {
+            b.crlf(true);
+        }
+        if opts.null_data {
+            b.line_terminator(Some(b'\0'));
+        }
     }
-    if opts.multiline_dotall {
-        b.dot_matches_new_line(true);
-    }
-    if !opts.unicode {
-        b.unicode(false);
-    }
-    if opts.null_data {
-        // NUL is the record separator: the matcher must know so `.`
-        // doesn't stop at NUL and ^/$ anchor on NUL boundaries.
-        b.line_terminator(Some(0));
-    }
-    if opts.crlf && !opts.null_data {
-        b.crlf(true);
+    if let Some(s) = opts.regex_size_limit {
+        b.size_limit(s);
     }
     if let Some(d) = opts.dfa_size_limit {
         b.dfa_size_limit(d);
     }
-    if let Some(s) = opts.regex_size_limit {
-        b.size_limit(s);
+    // With binary detection on, a NUL can never be matched (detection
+    // quits at it or rewrites it), so a pattern that requires one is an
+    // error, as in rg.
+    if opts.binary != BinaryDetection::none() && !opts.null_data {
+        b.ban_byte(Some(b'\0'));
     }
     Ok(b.build(pattern)?)
 }
@@ -536,6 +551,7 @@ impl WorkerState {
         if let Some(enc) = encoding {
             sb.encoding(Some(enc.clone()));
         }
+        sb.bom_sniffing(opts.bom_sniffing);
         if opts.null_data {
             sb.line_terminator(grep_matcher::LineTerminator::byte(0));
         } else if opts.crlf {
@@ -1210,7 +1226,17 @@ pub fn run(
         let matcher = build_pcre2_matcher(pattern, opts)?;
         return run_impl(&matcher, root, files, universe, opts, out);
     }
-    let matcher = build_matcher(pattern, opts)?;
+    let matcher = match build_matcher(pattern, opts) {
+        Ok(m) => m,
+        // --engine auto: rg's hybrid mode falls back to PCRE2 whenever the
+        // default engine rejects the pattern, and reports the default
+        // engine's error when PCRE2 rejects it too.
+        Err(e) if opts.engine_auto => match build_pcre2_matcher(pattern, opts) {
+            Ok(m) => return run_impl(&m, root, files, universe, opts, out),
+            Err(_) => return Err(e),
+        },
+        Err(e) => return Err(e),
+    };
     run_impl(&matcher, root, files, universe, opts, out)
 }
 

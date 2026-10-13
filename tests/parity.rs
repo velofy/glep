@@ -718,3 +718,92 @@ fn terminators_and_separators_match_rg() {
     check_cases(corpus().path(), "small", cases);
     check_cases(pool_corpus().path(), "pool", cases);
 }
+
+/// The matcher is configured knob for knob like rg's: \n is the line
+/// terminator outside -U (a pattern that must match it is an error),
+/// -U --crlf keeps CRLF-aware anchors without a line terminator, a
+/// pattern that must match NUL is an error unless -a, -s/-i/-S are a
+/// last-wins trio, --engine auto falls back to PCRE2 per pattern, and
+/// -m 0 or an empty pattern set (without -v) exits 1 without searching.
+/// Pattern files keep empty lines (an empty pattern matches every line).
+#[test]
+fn matcher_config_matches_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let pats = tempfile::tempdir().unwrap();
+    let with_empty = pats.path().join("with_empty.txt");
+    std::fs::write(&with_empty, "foo\n\n").unwrap();
+    let two = pats.path().join("two.txt");
+    std::fs::write(&two, "hello\r\nanswer\n").unwrap();
+    let none = pats.path().join("none.txt");
+    std::fs::write(&none, "").unwrap();
+    let (with_empty, two, none) = (
+        with_empty.to_str().unwrap(),
+        two.to_str().unwrap(),
+        none.to_str().unwrap(),
+    );
+    let cases: &[&[&str]] = &[
+        &["-c", "-f", with_empty],
+        &["-c", "-f", two],
+        &["-c", "-f", none],
+        &["-v", "-c", "-f", none],
+        &["--json", "-f", none],
+        &["--files-without-match", "-f", none],
+        &["-c", "-e", ""],
+        &["-c", "-e", "hello", "-f", none],
+        // A literal line terminator is an error outside -U.
+        &["-c", "hello\nfoo"],
+        &["-c", "hello\\nfoo"],
+        &["-c", "-F", "hello\nfoo"],
+        &["-U", "-c", "goodbye\\nfoo"],
+        &["-U", "-c", "-F", "goodbye\nfoo"],
+        &["-c", "\\s+$"],
+        &["-c", "^\\s"],
+        &["-c", "(?-m)^use"],
+        &["-c", "x\\z"],
+        // CRLF: anchors see \r\n as a line end, with and without -U.
+        &["--crlf", "-c", "o$"],
+        &["-U", "--crlf", "hello\\r\\nsecond"],
+        &["-U", "--crlf", "end$"],
+        &["-U", "--crlf", "-c", "line$"],
+        &["-P", "--crlf", "-c", "o$"],
+        &["--null-data", "--crlf", "-P", "-c", "o$"],
+        // NUL can only be matched without binary detection.
+        &["-c", "a\\x00"],
+        &["-a", "-c", "a\\x00"],
+        &["-P", "-c", "\\x00"],
+        // -s/-i/-S: last wins.
+        &["-s", "-i", "HELLO"],
+        &["-i", "-s", "HELLO"],
+        &["-S", "-s", "hello"],
+        &["-s", "-S", "hello"],
+        &["-s", "HELLO"],
+        // Size limits take K/M/G suffixes; a too-small limit is an error.
+        &["--regex-size-limit", "1M", "hello"],
+        &["--dfa-size-limit", "1K", "hello"],
+        &["--regex-size-limit", "1m", "hello"],
+        &["--regex-size-limit", "10", "a{100}"],
+        // -m 0: nothing can match, so nothing is searched or printed.
+        &["-m", "0", "--files-without-match", "hello"],
+        &["-m", "0", "-c", "--include-zero", "hello"],
+        &["-m", "0", "--json", "hello"],
+        &["-m", "0", "--stats", "hello"],
+        &["-m", "0", "-v", "hello"],
+        &["-m", "0", "hello", "no_such_operand"],
+        // --engine auto falls back to PCRE2 per pattern; -P and --engine
+        // are a last-wins pair.
+        &["--engine", "auto", "-c", "hel(?=lo)"],
+        &["--engine", "auto", "-c", "a\\nb"],
+        &["--engine", "auto", "-c", "hello"],
+        &["--engine", "default", "-P", "-c", "hel(?=lo)"],
+        &["-P", "--engine", "default", "-c", "hel(?=lo)"],
+        // -E: auto/none keywords, a real label, an unknown label.
+        &["-E", "none", "hello"],
+        &["-E", "utf-16le", "-c", "hello"],
+        &["-E", "bogus", "hello"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    check_cases(pool_corpus().path(), "pool", cases);
+}

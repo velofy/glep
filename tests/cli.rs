@@ -1128,3 +1128,38 @@ fn quiet_suppresses_output_but_keeps_exit_code() {
     let summary: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(summary["type"], "summary");
 }
+
+/// `-f -` reads the pattern list from stdin (rg semantics); the
+/// positional slot is then a path.
+#[test]
+fn pattern_file_dash_reads_stdin() {
+    let dir = corpus();
+    glep(dir.path())
+        .args(["-f", "-", "-l"])
+        .write_stdin("kenobi\nhello_world\n")
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+    glep(dir.path())
+        .args(["-f", "-", "-l", "src"])
+        .write_stdin("hello\n")
+        .assert()
+        .success()
+        .stdout(p("src/lib.rs\n"));
+}
+
+/// -s is rg's --case-sensitive (not --no-messages, which is long-only).
+#[test]
+fn short_s_is_case_sensitive() {
+    let dir = corpus();
+    glep(dir.path()).args(["-i", "-s", "HELLO"]).assert().code(1);
+    glep(dir.path())
+        .args(["-s", "-i", "HELLO", "-l"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+    glep(dir.path())
+        .args(["--no-messages", "hello", "-l"])
+        .assert()
+        .success();
+}

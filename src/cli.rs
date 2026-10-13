@@ -126,8 +126,9 @@ pub struct Args {
     /// Print no context separators at all (rg --no-context-separator)
     #[arg(long, overrides_with = "context_separator")]
     pub no_context_separator: bool,
-    /// PCRE2 regex engine (lookaround, backrefs, etc.)
-    #[arg(short = 'P', long = "pcre2")]
+    /// PCRE2 regex engine (lookaround, backrefs, etc.). A last-wins pair
+    /// with --engine, like rg.
+    #[arg(short = 'P', long = "pcre2", overrides_with = "engine")]
     pub pcre2: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
@@ -166,11 +167,19 @@ pub struct Args {
     /// (rg --no-ignore-messages). Nonfatal IO warnings stay.
     #[arg(long)]
     pub no_ignore_messages: bool,
-    /// Suppress all nonfatal per-file warnings (rg -s/--no-messages).
-    /// -s only silences errors; the missing-path check in run() still
+    /// Suppress all nonfatal per-file warnings (rg --no-messages). Only
+    /// errors are silenced; the missing-path check in run() still
     /// reports operand problems (same class split as the reference).
-    #[arg(short = 's', long = "no-messages")]
+    #[arg(long = "no-messages")]
     pub no_messages: bool,
+    /// Search case sensitively, the default (rg -s/--case-sensitive).
+    /// Overrides -i and -S; whichever of the three comes last wins.
+    #[arg(
+        short = 's',
+        long = "case-sensitive",
+        overrides_with_all = ["ignore_case", "smart_case"]
+    )]
+    pub case_sensitive: bool,
     /// With -M, show a truncation preview marker on long lines
     /// (rg --max-columns-preview)
     #[arg(long, requires = "max_columns")]
@@ -262,11 +271,13 @@ pub struct Args {
     /// with --crlf, like rg.
     #[arg(long = "null-data", overrides_with = "crlf")]
     pub null_data: bool,
-    /// DFA size limit for the regex engine (rg --dfa-size-limit)
-    #[arg(long, value_name = "BYTES")]
+    /// DFA size limit for the regex engine; K, M and G suffixes accepted
+    /// (rg --dfa-size-limit)
+    #[arg(long, value_name = "NUM+SUFFIX?", value_parser = parse_human_usize)]
     pub dfa_size_limit: Option<usize>,
-    /// Regex compiled-size limit (rg --regex-size-limit)
-    #[arg(long, value_name = "BYTES")]
+    /// Regex compiled-size limit; K, M and G suffixes accepted
+    /// (rg --regex-size-limit)
+    #[arg(long, value_name = "NUM+SUFFIX?", value_parser = parse_human_usize)]
     pub regex_size_limit: Option<usize>,
     /// Search inside gzip-compressed files by decompressing on the fly
     /// (rg -z/--search-zip; gzip only for now, other formats search raw)
@@ -337,10 +348,17 @@ pub struct Args {
     #[arg(long)]
     pub stats: bool,
     /// Decode files with the given encoding label before searching
-    /// (e.g. utf-16, latin1, shift_jis). Unknown labels error out like
-    /// the reference.
-    #[arg(short = 'E', long = "encoding")]
+    /// (e.g. utf-16, latin1, shift_jis). `auto` (the default) transcodes
+    /// files with a UTF-8/UTF-16 byte-order mark, `none` disables that.
+    /// Unknown labels error out like the reference.
+    #[arg(short = 'E', long = "encoding", overrides_with = "no_encoding")]
     pub encoding: Option<String>,
+    /// Back to the default `-E auto` (rg --no-encoding)
+    #[arg(long, overrides_with = "encoding")]
+    pub no_encoding: bool,
+    /// `-E none`: BOM sniffing off (set in `run`).
+    #[arg(skip)]
+    pub no_bom_sniffing: bool,
     /// Make `.` match newlines (dotall / (?s) regex mode). Independently
     /// settable like the reference; only visibly changes multiline (-U)
     /// searches since single-line scanning can't span lines anyway.
@@ -390,8 +408,40 @@ pub struct Args {
     /// Skip the freshness sweep if the last one ran within this many seconds
     #[arg(long, default_value_t = 0)]
     pub ttl: u64,
-    #[arg(long, default_value_t = 1_048_576)]
+    /// Index size cap per file (larger files are never indexed and are
+    /// always scanned); K, M and G suffixes accepted
+    #[arg(long, default_value = "1048576", value_name = "NUM+SUFFIX?", value_parser = parse_human_u64)]
     pub max_filesize: u64,
+    /// The resolved pattern list for a content search (set in `run`).
+    #[arg(skip)]
+    pub pattern_set: Vec<String>,
+    /// --engine auto (set in `run`).
+    #[arg(skip)]
+    pub engine_auto: bool,
+}
+
+/// rg's human-readable sizes: digits with an optional K, M or G suffix
+/// (powers of 1024).
+fn parse_human_u64(s: &str) -> Result<u64, String> {
+    let (digits, shift) = match s.as_bytes().last() {
+        Some(b'K') => (&s[..s.len() - 1], 10),
+        Some(b'M') => (&s[..s.len() - 1], 20),
+        Some(b'G') => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid format for size '{s}', which should be a non-empty sequence of digits followed by an optional 'K', 'M' or 'G' suffix"));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|e| format!("invalid integer found in size '{s}': {e}"))?;
+    n.checked_mul(1 << shift)
+        .ok_or_else(|| format!("size too big in '{s}'"))
+}
+
+fn parse_human_usize(s: &str) -> Result<usize, String> {
+    let n = parse_human_u64(s)?;
+    usize::try_from(n).map_err(|_| format!("size too big in '{s}'"))
 }
 
 /// rg's escape decoding for separator flags (`\t`, `\n`, `\r`, `\0`,
@@ -517,35 +567,46 @@ fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel
     }
 }
 
-/// Combine -e/--file/positional into one pattern string. Multiple
-/// sources OR together, each arm wrapped in a non-capturing group so
-/// ^/$ stay arm-local. -f files contribute one arm per non-empty line
-/// (rg -f semantics; line-trailing `\n` stripped). Under -F each arm is
-/// escaped individually and the union is a regex: the matcher/planner
-/// see effective_fixed=false.
-fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
+/// The patterns rg would search for: every -e value, then every line of
+/// every -f file (`-f -` reads stdin; line terminators are stripped and
+/// empty lines are kept, since an empty pattern matches every line, as
+/// in rg), else the positional pattern. Empty only when -f files hold no
+/// lines at all.
+fn pattern_list(args: &Args) -> anyhow::Result<Vec<String>> {
     let mut pats: Vec<String> = args.regexp.clone();
     for f in &args.pattern_files {
-        let text =
-            std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
-        for line in text.lines() {
-            if !line.is_empty() {
-                pats.push(line.to_string());
-            }
-        }
+        let text = if f.as_os_str() == "-" {
+            std::io::read_to_string(std::io::stdin()).map_err(|e| anyhow::anyhow!("-: {e}"))?
+        } else {
+            std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?
+        };
+        pats.extend(text.lines().map(str::to_string));
     }
     // -e/-f leave the positional slot as a path; only the bare
     // positional counts as a pattern when no -e/-f is present.
-    if pats.is_empty() {
-        if let Some(p) = &args.pattern {
-            pats.push(p.clone());
+    if args.regexp.is_empty() && args.pattern_files.is_empty() {
+        match &args.pattern {
+            Some(p) => pats.push(p.clone()),
+            None => anyhow::bail!("a pattern is required (or --files)"),
         }
     }
+    Ok(pats)
+}
+
+/// Combine the resolved pattern list into one pattern string. Multiple
+/// patterns OR together, each arm wrapped in a non-capturing group so
+/// ^/$ stay arm-local. Under -F each arm is escaped individually and the
+/// union is a regex: the matcher/planner see effective_fixed=false.
+fn resolve_pattern(args: &Args) -> (String, bool) {
+    let pats = &args.pattern_set;
     if pats.is_empty() {
-        anyhow::bail!("a pattern is required (or --files)");
+        // Zero patterns only reach a search under -v (see the
+        // matches_possible check in `run`): a pattern that never matches,
+        // so every line is inverted in, as in rg.
+        return (r"[^\s\S]".to_string(), false);
     }
     if pats.len() == 1 {
-        return Ok((pats[0].clone(), args.fixed_strings));
+        return (pats[0].clone(), args.fixed_strings);
     }
     let fixed = args.fixed_strings;
     let joined = pats
@@ -560,7 +621,7 @@ fn resolve_pattern(args: &Args) -> anyhow::Result<(String, bool)> {
         .map(|p| format!("(?:{p})"))
         .collect::<Vec<_>>()
         .join("|");
-    Ok((joined, false))
+    (joined, false)
 }
 
 /// Drop path filters that don't exist on disk, printing the rg-style
@@ -980,6 +1041,8 @@ fn with_filename(args: &Args, root: &Path) -> bool {
 fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
     search::SearchOpts {
         case_insensitive: args.ignore_case,
+        engine_auto: args.engine_auto,
+        bom_sniffing: !args.no_bom_sniffing,
         fixed: args.fixed_strings,
         files_with_matches: args.files_with_matches,
         files_without_match: args.files_without_match,
@@ -1090,7 +1153,7 @@ fn run_live_files(
         return Ok(exit_code(had_error, !files.is_empty()));
     }
 
-    let (pattern, effective_fixed) = resolve_pattern(args)?;
+    let (pattern, effective_fixed) = resolve_pattern(args);
     apply_filters(&mut files, args, root)?;
     apply_sort(&mut files, args, root, cwd_rel)?;
     timings.stage("candidates");
@@ -1391,24 +1454,8 @@ pub fn run() -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    let cwd = std::env::current_dir()?;
-    let (root, cwd_rel) = discover_index_root(&cwd)?;
-    // Missing path filters are errors (exit 2), checked against the cwd
-    // before paths are relativized into the index tree.
-    let had_error = report_missing_paths(&args.paths, &cwd, args.files);
-    // Missing operands were already reported: drop them so the sweeps
-    // don't re-error on the same paths (search continues with the valid
-    // ones, matching the reference's report-and-continue contract).
-    if had_error {
-        args.paths.retain(|p| cwd.join(p).exists());
-    }
-    normalize_path_filters(&mut args.paths, &root, &cwd_rel);
-    // No explicit paths: the implicit scope is the cwd subtree (rg's
-    // default `.`). At the discovered root itself this is "": everything.
-    if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
-        args.paths.push(cwd_rel.clone());
-    }
-
+    // Flag folding and validation: everything rg rejects while parsing
+    // flags exits 2 here, before any tree or index work.
     args.path_separator = parse_path_separator(args.path_separator_raw.as_deref())?;
     // Compat spellings fold into their canonical flags.
     if args.print0 {
@@ -1433,6 +1480,72 @@ pub fn run() -> anyhow::Result<i32> {
         args.text = true;
         args.binary = false;
     }
+    // --engine and -P are a last-wins pair (clap keeps only the later).
+    if let Some(e) = &args.engine {
+        match e.as_str() {
+            "default" => args.pcre2 = false,
+            "pcre2" => args.pcre2 = true,
+            // rg's hybrid mode: decided per pattern when the matcher is
+            // built (search::run falls back to PCRE2).
+            "auto" => args.engine_auto = true,
+            other => anyhow::bail!("unrecognized regex engine '{other}'"),
+        }
+    }
+    // -E: `auto` is the default (BOM sniffing), `none` turns sniffing
+    // off; any other label must name a real encoding.
+    if args.no_encoding {
+        args.encoding = None;
+    }
+    match args.encoding.as_deref() {
+        Some("auto") => args.encoding = None,
+        Some("none") => {
+            args.encoding = None;
+            args.no_bom_sniffing = true;
+        }
+        Some(label) => {
+            grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        }
+        None => {}
+    }
+    validate_sort(&args)?;
+    validate_output_flags(&args)?;
+    if let Some(g) = &args.pre_glob {
+        build_glob_icase(g, false)?;
+    }
+
+    // Content searches resolve their patterns now (reading -f files),
+    // then apply rg's matches_possible rule: with no pattern at all
+    // (and no -v) or -m 0 nothing can ever match, so rg exits 1 without
+    // walking, printing or even checking path operands.
+    let subcommand = args.regexp.is_empty()
+        && args.pattern_files.is_empty()
+        && !args.files
+        && !args.no_ignore
+        && matches!(args.pattern.as_deref(), Some("index") | Some("status"));
+    if !args.files && !subcommand {
+        args.pattern_set = pattern_list(&args)?;
+        if args.max_count == Some(0) || (args.pattern_set.is_empty() && !args.invert_match) {
+            return Ok(1);
+        }
+    }
+
+    let cwd = std::env::current_dir()?;
+    let (root, cwd_rel) = discover_index_root(&cwd)?;
+    // Missing path filters are errors (exit 2), checked against the cwd
+    // before paths are relativized into the index tree.
+    let had_error = report_missing_paths(&args.paths, &cwd, args.files);
+    // Missing operands were already reported: drop them so the sweeps
+    // don't re-error on the same paths (search continues with the valid
+    // ones, matching the reference's report-and-continue contract).
+    if had_error {
+        args.paths.retain(|p| cwd.join(p).exists());
+    }
+    normalize_path_filters(&mut args.paths, &root, &cwd_rel);
+    // No explicit paths: the implicit scope is the cwd subtree (rg's
+    // default `.`). At the discovered root itself this is "": everything.
+    if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
+        args.paths.push(cwd_rel.clone());
+    }
     if args.debug || args.trace {
         eprintln!(
             "glep: DEBUG cwd={} root={} threads={} pattern={:?}",
@@ -1445,32 +1558,8 @@ pub fn run() -> anyhow::Result<i32> {
         );
     }
 
-    // --engine validates before any index work (rg errors at arg-parse).
-    if let Some(e) = &args.engine {
-        match e.as_str() {
-            "default" => args.pcre2 = false,
-            "pcre2" => args.pcre2 = true,
-            "auto" => {
-                // The default engine unless the pattern needs PCRE2.
-                if !args.pcre2 {
-                    if let Ok((p, fixed)) = resolve_pattern(&args) {
-                        if !fixed && regex_syntax::parse(&p).is_err() {
-                            args.pcre2 = true;
-                        }
-                    }
-                }
-            }
-            other => anyhow::bail!("unrecognized regex engine '{other}'"),
-        }
-    }
-    validate_sort(&args)?;
-    validate_output_flags(&args)?;
-    if let Some(g) = &args.pre_glob {
-        build_glob_icase(g, false)?;
-    }
-
     // Subcommand-style words in the pattern slot.
-    if args.regexp.is_empty() && args.pattern_files.is_empty() && !args.files && !args.no_ignore {
+    if subcommand {
         match args.pattern.as_deref() {
             Some("index") => {
                 let idx = Index::build(&root, args.max_filesize)?;
@@ -1626,7 +1715,7 @@ pub fn run() -> anyhow::Result<i32> {
         return Ok(exit_code(had_error, !files.is_empty()));
     }
 
-    let (pattern, effective_fixed) = resolve_pattern(&args)?;
+    let (pattern, effective_fixed) = resolve_pattern(&args);
 
     // Plan selection: several modes must bypass trigram narrowing
     // (each is sound, just scans more):
