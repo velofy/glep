@@ -1486,6 +1486,20 @@ fn subdirectory_runs_match_rg() {
         &["-l", "-g", "src/**", "hello"],
     ];
     check_cases(&sub, "subdir", cases);
+    // Operands outside the index root, relative or absolute, are walked
+    // live as rg walks them.
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("o.txt"), "hello outside\n").unwrap();
+    let name = outside.path().file_name().unwrap().to_str().unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let up = format!("..{sep}..{sep}{name}");
+    let abs = outside.path().to_str().unwrap();
+    let away: &[&[&str]] = &[
+        &["-l", "hello", &up],
+        &["-c", "hello", &up, "main.rs"],
+        &["-l", "hello", abs],
+    ];
+    check_cases(&sub, "subdir outside", away);
 }
 
 /// Directory operands the index holds no file under are walked live with

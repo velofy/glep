@@ -599,28 +599,6 @@ fn build_glob_icase(g: &str, icase: bool) -> anyhow::Result<globset::GlobMatcher
         .compile_matcher())
 }
 
-/// Lexically join a base dir and a relative path, folding `.`/`..`
-/// components. Returns None when the result escapes above `base`'s own
-/// root, i.e. the normalized path would start with `..` (an indexed
-/// search can never serve such a path; it is kept verbatim so existence
-/// checks still fire and filters simply match nothing).
-fn norm_join(base: &Path, rel: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::from(base);
-    for c in rel.components() {
-        match c {
-            std::path::Component::Normal(s) => out.push(s),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
-        }
-    }
-    Some(out)
-}
-
 /// Discover the tree root: `GLEP_INDEX_PATH` (points at the index dir
 /// itself; its parent is the root) wins; otherwise the nearest ancestor
 /// of `cwd` containing a `.glep/` directory; otherwise `cwd` itself (the
@@ -674,6 +652,10 @@ fn discover_index_root(cwd: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
 /// keeps its leading `..` components (display_rel turns it back into the
 /// same cwd-relative path).
 fn root_relative(cwd_rel: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        // Outside the tree: kept as is, and printed as is.
+        return p.to_path_buf();
+    }
     let mut parts: Vec<&std::ffi::OsStr> = cwd_rel.iter().collect();
     let mut ups = 0usize;
     for c in p.components() {
@@ -706,7 +688,9 @@ fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel
                 *p = rel.to_path_buf();
             }
         } else {
-            *p = norm_join(cwd_rel, p).unwrap_or_else(|| p.clone());
+            // Root-relative; an operand above the root keeps leading `..`
+            // components, so it still names the right place.
+            *p = root_relative(cwd_rel, p);
         }
     }
 }
@@ -2184,15 +2168,24 @@ mod tests {
     }
 
     #[test]
-    fn norm_join_folds_dots() {
+    fn root_relative_folds_dots_and_keeps_climbs() {
         assert_eq!(
-            norm_join(Path::new("src"), Path::new("..")),
-            Some(PathBuf::new())
+            root_relative(Path::new("src"), Path::new("..")),
+            PathBuf::new()
         );
         assert_eq!(
-            norm_join(Path::new("src"), Path::new("./deep/../x")),
-            Some(PathBuf::from("src/x"))
+            root_relative(Path::new("src"), Path::new("./deep/../x")),
+            PathBuf::from("src/x")
         );
-        assert_eq!(norm_join(Path::new(""), Path::new("..")), None);
+        // Above the root: the leading `..` stays, and display_rel turns
+        // it back into the same cwd-relative path.
+        let up = root_relative(Path::new("a"), Path::new("../../x/y"));
+        assert_eq!(up, PathBuf::from("../x/y"));
+        assert_eq!(
+            crate::search::display_rel(&up, Path::new("a")),
+            Path::new("../../x/y")
+        );
+        let abs = std::env::temp_dir();
+        assert_eq!(root_relative(Path::new("a"), &abs), abs);
     }
 }
