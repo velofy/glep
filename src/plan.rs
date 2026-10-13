@@ -72,28 +72,49 @@ type Dnf = Vec<Vec<Piece>>;
 /// `Boundary`, which is always sound: it just narrows less.
 const MAX_VARIANTS: usize = 64;
 
+/// Size caps that keep planning linear in the pattern however its
+/// repetitions nest (`(?:a.){30000}`, `((ab){1000}){1000}`): a counted
+/// repetition expands at most `MAX_REPEAT_COPIES` copies, a literal keeps
+/// at most `MAX_LIT_BYTES` bytes, a group at most `MAX_GROUP_PIECES`
+/// pieces and `MAX_GROUP_TRIGRAMS` trigrams. Each cut drops required
+/// literals (or a literal's tail) and closes fusion where it cut, so the
+/// plan only narrows less; it never misses a match.
+const MAX_REPEAT_COPIES: usize = 64;
+const MAX_LIT_BYTES: usize = 1024;
+const MAX_GROUP_PIECES: usize = 128;
+const MAX_GROUP_TRIGRAMS: usize = 1024;
+
 fn anything() -> Dnf {
     vec![vec![Piece::Boundary]]
 }
 
-fn lit(s: Vec<u8>) -> Dnf {
+fn lit(mut s: Vec<u8>) -> Dnf {
+    // A literal's prefix is required wherever the literal is; only its
+    // right edge stops being adjacent to what follows it.
+    let fuse_right = s.len() <= MAX_LIT_BYTES;
+    s.truncate(MAX_LIT_BYTES);
     vec![vec![Piece::Lit {
         fuse_left: true,
-        fuse_right: true,
+        fuse_right,
         s,
     }]]
 }
 
-/// Merge group `a` and `b` for concatenation; when `a`'s last literal
-/// fuses right and `b`'s first fuses left, their strings concatenate
-/// (longer literals produce better trigram narrowing).
-fn concat_groups(a: &[Piece], b: &[Piece]) -> Vec<Piece> {
-    let mut out = a.to_vec();
-    match (out.last_mut(), b.first()) {
+/// Append group `b` to group `a` for concatenation, in place; when `a`'s
+/// last literal fuses right and `b`'s first fuses left, their strings
+/// concatenate (longer literals produce better trigram narrowing). A
+/// literal that outgrows `MAX_LIT_BYTES` keeps its prefix and closes its
+/// right edge; a group that reaches `MAX_GROUP_PIECES` ends in a
+/// `Boundary` and takes nothing more.
+fn append_group(a: &mut Vec<Piece>, b: &[Piece]) {
+    if a.len() >= MAX_GROUP_PIECES {
+        return;
+    }
+    match (a.last_mut(), b.first()) {
         (
             Some(Piece::Lit {
-                fuse_right: true,
-                s: ref mut s0,
+                fuse_right: fr0 @ true,
+                s: s0,
                 ..
             }),
             Some(Piece::Lit {
@@ -103,35 +124,54 @@ fn concat_groups(a: &[Piece], b: &[Piece]) -> Vec<Piece> {
             }),
         ) => {
             s0.extend_from_slice(s1);
-            if !fuse_right {
-                // Keep the fused literal's right edge closed.
-                if let Some(Piece::Lit { fuse_right: fr, .. }) = out.last_mut() {
-                    *fr = false;
-                }
+            // Keep the fused literal's right edge closed when `b`'s was.
+            *fr0 = *fuse_right;
+            if s0.len() > MAX_LIT_BYTES {
+                s0.truncate(MAX_LIT_BYTES);
+                *fr0 = false;
             }
-            out.extend_from_slice(&b[1..]);
+            a.extend_from_slice(&b[1..]);
         }
-        _ => out.extend_from_slice(b),
+        _ => a.extend_from_slice(b),
     }
-    out
+    if a.len() >= MAX_GROUP_PIECES {
+        a.truncate(MAX_GROUP_PIECES - 1);
+        a.push(Piece::Boundary);
+    }
 }
 
-fn concat(dnfs: Vec<Dnf>) -> Dnf {
+/// Concatenate `d` onto `acc`: every group of `acc` followed by every
+/// alternative of `d`. A single alternative extends the groups in place,
+/// so a long concatenation never re-clones what it has built.
+fn concat_into(acc: &mut Dnf, d: &Dnf) {
+    if acc.len().saturating_mul(d.len()) > MAX_VARIANTS {
+        // Product would explode past the cap: degrade THIS element to a
+        // boundary. The accumulated groups keep their literals: sound,
+        // just less fused.
+        concat_into(acc, &anything());
+        return;
+    }
+    if let [e] = d.as_slice() {
+        for g in acc.iter_mut() {
+            append_group(g, e);
+        }
+        return;
+    }
+    let mut next = Vec::with_capacity(acc.len() * d.len());
+    for g in acc.iter() {
+        for e in d {
+            let mut g = g.clone();
+            append_group(&mut g, e);
+            next.push(g);
+        }
+    }
+    *acc = next;
+}
+
+fn concat(dnfs: impl IntoIterator<Item = Dnf>) -> Dnf {
     let mut acc: Dnf = vec![Vec::new()];
-    for mut d in dnfs {
-        if acc.len().saturating_mul(d.len()) > MAX_VARIANTS {
-            // Product would explode past the cap: degrade THIS element to
-            // a boundary. The accumulated groups keep their literals:
-            // sound, just less fused.
-            d = anything();
-        }
-        let mut next = Vec::with_capacity(acc.len() * d.len());
-        for g in &acc {
-            for e in &d {
-                next.push(concat_groups(g, e));
-            }
-        }
-        acc = next;
+    for d in dnfs {
+        concat_into(&mut acc, &d);
     }
     acc
 }
@@ -184,23 +224,29 @@ fn req(hir: &regex_syntax::hir::Hir) -> Dnf {
         HirKind::Class(c) => class_alts(c),
         HirKind::Look(_) => anything(),
         HirKind::Repetition(r) => {
-            // A repetition desugars to `min` required copies concatenated,
-            // plus a fusion-closing boundary whenever the tail is optional
-            // (unbounded or max > min): a further copy may interpose bytes,
-            // so `r+`'s right edge must not fuse into its neighbor.
+            // A repetition desugars to `min` required copies concatenated
+            // (at most MAX_REPEAT_COPIES of them: the first copies are
+            // required whatever follows), plus a fusion-closing boundary
+            // whenever more may follow them (copies left out, or an
+            // optional tail: unbounded or max > min): a further copy may
+            // interpose bytes, so `r+`'s right edge must not fuse into
+            // its neighbor.
             if r.min == 0 {
                 return anything();
             }
             let sub = req(&r.sub);
-            let copies: Vec<Dnf> = std::iter::repeat_n(sub, r.min as usize).collect();
-            let mut d = concat(copies);
-            if r.max.is_none_or(|max| max > r.min) {
-                d = concat(vec![d, anything()]);
+            let copies = (r.min as usize).min(MAX_REPEAT_COPIES);
+            let mut d: Dnf = vec![Vec::new()];
+            for _ in 0..copies {
+                concat_into(&mut d, &sub);
+            }
+            if copies < r.min as usize || r.max.is_none_or(|max| max > r.min) {
+                concat_into(&mut d, &anything());
             }
             d
         }
         HirKind::Capture(c) => req(&c.sub),
-        HirKind::Concat(subs) => concat(subs.iter().map(req).collect()),
+        HirKind::Concat(subs) => concat(subs.iter().map(req)),
         HirKind::Alternation(subs) => subs.iter().flat_map(req).collect(),
     }
 }
@@ -214,6 +260,11 @@ fn group_trigrams(group: &[Piece], case: Case) -> Option<Vec<u32>> {
     for p in group {
         if let Piece::Lit { s, .. } = p {
             tris.extend(trigrams_of(s, case));
+            if tris.len() >= MAX_GROUP_TRIGRAMS {
+                // Any subset of the required trigrams still narrows soundly.
+                tris.truncate(MAX_GROUP_TRIGRAMS);
+                break;
+            }
         }
     }
     if tris.is_empty() {
@@ -370,6 +421,70 @@ mod tests {
             Plan::Groups(g) => {
                 assert!(g[0].contains(&pack(b"xab")));
                 assert!(!g[0].contains(&pack(b"aby")));
+            }
+            Plan::All => panic!("expected groups"),
+        }
+    }
+
+    /// Counted repetitions, nested or not, and long concatenations plan in
+    /// time linear in the pattern: a repetition expands at most
+    /// MAX_REPEAT_COPIES copies and groups and literals stay bounded.
+    /// `(?:a.){30000}` used to spend 10 s in the planner (quadratic in the
+    /// count) and deeper nesting grew without bound.
+    #[test]
+    fn huge_and_nested_repetitions_plan_quickly() {
+        let long_concat = "a.".repeat(30_000);
+        let long_lit = "xyz".repeat(5_000);
+        for pat in [
+            "(?:a.){30000}",
+            "(?:ab?){30000}",
+            "((?:ab){1000}){1000}",
+            "(((?:abc){64}){64}){64}",
+            "((((?:abc){100}){100}){100}){100}",
+            "(?:(?:a|b|c)(?:d|e)){5000}",
+            long_concat.as_str(),
+            long_lit.as_str(),
+        ] {
+            let t = std::time::Instant::now();
+            let plan = build(pat, false, Case::Sensitive);
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "{}: planning took {:?}",
+                &pat[..pat.len().min(40)],
+                t.elapsed()
+            );
+            if let Plan::Groups(g) = plan {
+                assert!(g.len() <= MAX_VARIANTS);
+                assert!(g.iter().all(|t| t.len() <= MAX_GROUP_TRIGRAMS));
+            }
+        }
+    }
+
+    /// The caps only weaken what a group requires: the first copies of a
+    /// long repetition still narrow, and the literal after it no longer
+    /// fuses with the last expanded copy (more copies come between).
+    #[test]
+    fn capped_repetitions_still_narrow_soundly() {
+        match build("x(?:abc){100}y", false, Case::Sensitive) {
+            Plan::Groups(g) => {
+                assert_eq!(g.len(), 1);
+                assert!(g[0].contains(&pack(b"xab")));
+                assert!(g[0].contains(&pack(b"cab")));
+                assert!(!g[0].contains(&pack(b"bcy")));
+            }
+            Plan::All => panic!("expected groups"),
+        }
+        // Below the cap a counted repetition fuses completely.
+        match build("x(?:abc){2}y", false, Case::Sensitive) {
+            Plan::Groups(g) => assert!(g[0].contains(&pack(b"bcy"))),
+            Plan::All => panic!("expected groups"),
+        }
+        // A literal longer than MAX_LIT_BYTES narrows on its prefix.
+        let long: String = (0..2000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        match build(&long, true, Case::Sensitive) {
+            Plan::Groups(g) => {
+                assert!(g[0].contains(&pack(b"abc")));
+                assert!(g[0].len() <= MAX_GROUP_TRIGRAMS);
             }
             Plan::All => panic!("expected groups"),
         }
