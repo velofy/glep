@@ -426,6 +426,11 @@ pub struct Args {
     /// searches these unconditionally, with --binary's detection.
     #[arg(skip)]
     pub explicit_files: Vec<PathBuf>,
+    /// rg's single-file heuristic, decided from the operands exactly as
+    /// typed (set in `run` before missing operands are dropped): exactly
+    /// one operand, and it is not a directory.
+    #[arg(skip)]
+    pub one_file_operand: bool,
     /// --engine auto (set in `run`).
     #[arg(skip)]
     pub engine_auto: bool,
@@ -1053,28 +1058,23 @@ fn binary_detection(args: &Args) -> grep_searcher::BinaryDetection {
     }
 }
 
-/// rg's implicit with-filename heuristic: a sole explicit file operand
-/// prints bare matches (no path); everything else prints `path:`.
-fn with_filename(args: &Args, root: &Path) -> bool {
+/// rg's with-filename rule: -H/-I decide when given (last wins); else
+/// --vimgrep always prints the path, and otherwise a single operand that
+/// is not a directory prints bare matches. The operand count is the one
+/// typed, so `glep pat file missing` still prints `file:` prefixes.
+fn with_filename(args: &Args) -> bool {
     if args.with_filename {
         return true;
     }
     if args.no_filename {
         return false;
     }
-    // A sole explicit FILE operand suppresses paths; a dir operand does not.
-    if args.paths.len() == 1 {
-        let p = root.join(&args.paths[0]);
-        if p.is_file() {
-            return false;
-        }
-    }
-    true
+    args.vimgrep || !args.one_file_operand
 }
 
-/// Full SearchOpts builder: every flag mode in one place. `root`/`cwd_rel`
-/// feed the with_filename heuristic and the display-prefix strip.
-fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
+/// Full SearchOpts builder: every flag mode in one place. `cwd_rel`
+/// feeds the display-prefix strip.
+fn search_opts(args: &Args, cwd_rel: &Path) -> search::SearchOpts {
     search::SearchOpts {
         case_insensitive: args.ignore_case,
         engine_auto: args.engine_auto,
@@ -1097,7 +1097,7 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         path_terminator: args.null.then_some(0u8),
         path_separator: args.path_separator,
         include_zero: args.include_zero,
-        with_filename: with_filename(args, root),
+        with_filename: with_filename(args),
         stats: args.stats,
         multiline_dotall: args.multiline_dotall,
         encoding: args.encoding.clone(),
@@ -1130,7 +1130,8 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         // -M0 means no limit in rg.
         max_columns: args.max_columns.filter(|&n| n > 0),
         line_number: !args.no_line_number,
-        heading: args.heading,
+        // rg never prints headings in --vimgrep's one-line records.
+        heading: args.heading && !args.vimgrep,
         only_matching: args.only_matching,
         quiet: args.quiet,
         max_columns_preview: args.max_columns_preview,
@@ -1197,7 +1198,7 @@ fn run_live_files(
     apply_filters(&mut files, args, root, cwd_rel)?;
     apply_sort(&mut files, args, root, cwd_rel)?;
     timings.stage("candidates");
-    let mut opts = search_opts(args, root, cwd_rel);
+    let mut opts = search_opts(args, cwd_rel);
     opts.fixed = effective_fixed;
     let mut out = search::StdoutOut;
     let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
@@ -1600,6 +1601,7 @@ pub fn run() -> anyhow::Result<i32> {
 
     let cwd = std::env::current_dir()?;
     let (root, cwd_rel) = discover_index_root(&cwd)?;
+    args.one_file_operand = args.paths.len() == 1 && !cwd.join(&args.paths[0]).is_dir();
     // Missing path filters are errors (exit 2), checked against the cwd
     // before paths are relativized into the index tree.
     let had_error = report_missing_paths(&args.paths, &cwd, args.files);
@@ -1614,7 +1616,7 @@ pub fn run() -> anyhow::Result<i32> {
             // and exits 2.
             if !args.files {
                 let (pattern, fixed) = resolve_pattern(&args);
-                let mut opts = search_opts(&args, &root, &cwd_rel);
+                let mut opts = search_opts(&args, &cwd_rel);
                 opts.fixed = fixed;
                 search::run(&pattern, &root, &[], None, &opts, &mut search::StdoutOut)?;
             }
@@ -1886,7 +1888,7 @@ pub fn run() -> anyhow::Result<i32> {
         None
     };
 
-    let mut opts = search_opts(&args, &root, &cwd_rel);
+    let mut opts = search_opts(&args, &cwd_rel);
     opts.fixed = effective_fixed;
 
     // rg's nothing-searched heuristic: with the implicit path scope, an

@@ -260,6 +260,13 @@ const BASE_CASES: &[&[&str]] = &[
     &["hello", "README.md"],
     &["-c", "hello", "README.md"],
     &["-H", "hello", "README.md"],
+    // --vimgrep always prints the path (editors run `rg --vimgrep pat
+    // file`) unless -I says otherwise, and never prints headings.
+    &["--vimgrep", "hello", "README.md"],
+    &["--vimgrep", "-C", "1", "hello", "README.md"],
+    &["--vimgrep", "-I", "hello", "README.md"],
+    &["--heading", "--vimgrep", "aa"],
+    &["--heading", "--vimgrep", "hello", "README.md", "pad.txt"],
     // repeatable -e: union of patterns; positional still a path
     &["-e", "hello", "-e", "answer", "-l"],
     &["-e", "hello", "-l", "src"],
@@ -1056,6 +1063,11 @@ fn remaining_stack_flags_match_rg() {
         &["--no-messages", "hello"],
         &["--no-messages", "hello", "no_such_path"],
         &["hello", "no_such_path"],
+        // The single-file heuristic counts the operands as typed: one
+        // file plus a missing one still prints `path:` prefixes.
+        &["-n", "hello", "README.md", "no_such_path"],
+        &["-c", "hello", "README.md", "no_such_path"],
+        &["--vimgrep", "hello", "no_such_path", "README.md"],
         // -q answers only "did anything match": a match wins over an
         // error (exit 0), a miss after an error is still exit 2.
         &["-q", "hello", "README.md", "no_such_path"],
