@@ -984,6 +984,28 @@ impl Scope {
         }
     }
 
+    /// The directory operands below the root: the ones the index might
+    /// not serve.
+    #[cfg(target_os = "macos")]
+    fn dir_operands(&self) -> Vec<PathBuf> {
+        self.operands
+            .iter()
+            .filter(|op| {
+                matches!(op.kind, filters::OperandKind::Dir) && !op.path.as_os_str().is_empty()
+            })
+            .map(|op| op.path.clone())
+            .collect()
+    }
+
+    /// Whether some operand was walked live (its files bypass the
+    /// index-side filtering).
+    #[cfg(target_os = "macos")]
+    fn has_walked(&self) -> bool {
+        self.operands
+            .iter()
+            .any(|op| matches!(op.kind, filters::OperandKind::Walked(_)))
+    }
+
     /// Whether the implicit scope's walk would search at least one file
     /// (rg's nothing-searched check), stopping at the first file that
     /// survives the filters instead of building the list.
@@ -1035,14 +1057,6 @@ fn retain_glob(files: &mut Vec<PathBuf>, glob: Option<&globset::GlobMatcher>, cw
             .filter(|f| g.is_match(&*search::display_rel(f, cwd_rel)))
             .collect();
     }
-}
-
-/// Whether a path-sorted list holds a path under `prefix`: in component
-/// order, everything under a directory sorts right after it.
-#[cfg(target_os = "macos")]
-fn sorted_has_under(list: &[PathBuf], prefix: &Path) -> bool {
-    let i = list.partition_point(|x| x.as_path() < prefix);
-    list.get(i).is_some_and(|x| x.starts_with(prefix))
 }
 
 /// Split read-only sweep extras by rg's hidden rule (whitelist rescue
@@ -1439,11 +1453,16 @@ fn listing_cache_eligible(args: &Args) -> bool {
 /// freshness-sweep path. Filtering inside keeps the loaded tree's
 /// ownership local to this function.
 #[cfg(target_os = "macos")]
-fn listing_via_cache(
+fn listing_via_cache<F>(
     root: &Path,
     index_dir: &Path,
+    keep: F,
+    probe: &[PathBuf],
     timings: &mut Timings,
-) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Option<CachedListing>
+where
+    F: Fn(&crate::walk::FileMeta) -> bool + Sync,
+{
     let t0 = std::time::Instant::now();
     let tree = crate::dircache::DirTree::load(index_dir)?;
     let t1 = std::time::Instant::now();
@@ -1470,12 +1489,20 @@ fn listing_via_cache(
         };
         let _ = updated.save(index_dir);
     }
-    // The sweep's hidden flag splits the result, like the index's
-    // live_files_split.
+    // Whether the full listing holds a file under each probed operand,
+    // before `keep` narrows it.
     use rayon::prelude::*;
+    let present: Vec<bool> = probe
+        .iter()
+        .map(|op| outcome.files.par_iter().any(|m| m.path.starts_with(op)))
+        .collect();
+    // Parallel filter: 86k globset matches on a kernel-scale tree cost
+    // ~15ms serial, ~2ms across the pool. Only the kept paths are cloned,
+    // split by the sweep's hidden flag like the index's live_files_split.
     let (hidden, plain): (Vec<PathBuf>, Vec<PathBuf>) = outcome
         .files
         .par_iter()
+        .filter(|m| keep(m))
         .map(|m| (m.hidden, m.path.clone()))
         .partition_map(|(h, p)| {
             if h {
@@ -1492,7 +1519,21 @@ fn listing_via_cache(
             t1.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Some((plain, hidden))
+    Some(CachedListing {
+        plain,
+        hidden,
+        present,
+    })
+}
+
+/// A listing served by the dir-mtime cache: the kept paths split by the
+/// hidden flag (unsorted), and for each probed operand whether the full
+/// listing held any file under it.
+#[cfg(target_os = "macos")]
+struct CachedListing {
+    plain: Vec<PathBuf>,
+    hidden: Vec<PathBuf>,
+    present: Vec<bool>,
 }
 
 /// Every --type-add, --type-clear, -t and -T in command-line order (rg
@@ -1962,21 +2003,41 @@ pub fn run() -> anyhow::Result<i32> {
     // cwd scope and every other filter apply after the listing.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
-        if let Some((mut plain, mut hidden)) =
-            listing_via_cache(&root, &root.join(".glep"), &mut timings)
+        // The --files glob applies inside the listing (only its matches
+        // are cloned and sorted); the operands get their presence probe
+        // on the full listing first.
+        let glob_matcher = files_glob(&args)?;
+        let glob_cwd = cwd_rel.clone();
+        let keep = move |m: &crate::walk::FileMeta| -> bool {
+            match &glob_matcher {
+                Some(g) => g.is_match(&*search::display_rel(&m.path, &glob_cwd)),
+                None => true,
+            }
+        };
+        let probe = scope.dir_operands();
+        if let Some(listing) =
+            listing_via_cache(&root, &root.join(".glep"), keep, &probe, &mut timings)
         {
-            // Path order first: the scope groups by operand from it.
             use rayon::prelude::*;
+            let CachedListing {
+                mut plain,
+                mut hidden,
+                present,
+            } = listing;
             if args.hidden {
                 plain.append(&mut hidden);
             }
+            scope.walk_unserved(&args, &cwd_rel, |op| {
+                probe.iter().zip(&present).any(|(p, &has)| has && p == op)
+            });
+            // Path order: the scope groups operands from it.
             plain.par_sort();
             hidden.sort();
-            scope.walk_unserved(&args, &cwd_rel, |op| {
-                sorted_has_under(&plain, op) || sorted_has_under(&hidden, op)
-            });
             let mut files = scope.select(plain, hidden);
-            retain_glob(&mut files, files_glob(&args)?.as_ref(), &cwd_rel);
+            if scope.has_walked() {
+                // Walked operands come back whole.
+                retain_glob(&mut files, files_glob(&args)?.as_ref(), &cwd_rel);
+            }
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");

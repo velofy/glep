@@ -256,3 +256,26 @@ fn hidden_flag_over_cache_matches_authoritative() {
     assert!(!cached_listing(dir.path(), &[]).contains(".env"));
     assert!(cached_listing(dir.path(), &["--hidden"]).contains(".env"));
 }
+
+/// Operands the index cannot serve (here an ignored directory) are walked
+/// live: the listing is the same whether the cache or the authoritative
+/// path answers, and the --files glob applies to the walked files too.
+#[test]
+fn unserved_operands_list_the_same_through_the_cache() {
+    let dir = setup(|p| {
+        base_fixture(p);
+        fs::write(p.join(".gitignore"), "build/\n").unwrap();
+        fs::create_dir_all(p.join("build/deep")).unwrap();
+        fs::write(p.join("build/out.txt"), "x").unwrap();
+        fs::write(p.join("build/deep/x.rs"), "x").unwrap();
+    });
+    for args in [
+        &["*.txt", "build"][..],
+        &["**", "build", "z"],
+        &["*.rs", "build", "a"],
+    ] {
+        let cached = cached_listing(dir.path(), args);
+        assert_eq!(cached, listing(dir.path(), args), "{args:?}");
+        assert!(cached.contains("build/"), "{args:?}: {cached}");
+    }
+}
