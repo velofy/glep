@@ -13,6 +13,7 @@
 use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
+use std::time::SystemTime;
 
 fn glep() -> Command {
     Command::cargo_bin("glep").unwrap()
@@ -400,4 +401,395 @@ fn older_cache_schema_is_rebuilt() {
     assert!(!uses_cache(dir.path()), "an old-schema cache was served");
     assert!(uses_cache(dir.path()), "the cache was not rebuilt");
     assert_eq!(cached_listing(dir.path(), &[]), listing(dir.path(), &[]));
+}
+
+// ---------------------------------------------------------------------
+// Against rg, on a tree with more files than the small fixtures above.
+// ---------------------------------------------------------------------
+
+fn have_rg() -> bool {
+    std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `rg --files --sort path ARGS` in `dir`: (stdout, exit code). The
+/// fixtures are no git repositories, and glep honors their `.gitignore`
+/// files as rg does with --no-require-git.
+fn rg_files(dir: &Path, args: &[&str]) -> (String, i32) {
+    let out = std::process::Command::new("rg")
+        .current_dir(dir)
+        .args(["--files", "--sort", "path", "--no-require-git"])
+        .args(args)
+        .output()
+        .expect("rg run");
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `glep --files ARGS` in `dir`: (stdout, exit code), and whether the
+/// listing cache answered it.
+fn glep_files(dir: &Path, args: &[&str]) -> ((String, i32), bool) {
+    let out = glep()
+        .arg("--files")
+        .args(args)
+        .current_dir(dir)
+        .env("GLEP_TIMING", "1")
+        .output()
+        .expect("glep run");
+    let cached = String::from_utf8_lossy(&out.stderr).contains("listing_cache");
+    (
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            out.status.code().unwrap_or(-1),
+        ),
+        cached,
+    )
+}
+
+/// `glep --files ARGS` and `glep --files ARGS -g '*.h'` print rg's bytes
+/// and exit like rg, both answered by the listing cache.
+fn assert_lists_like_rg(dir: &Path, args: &[&str], what: &str) {
+    for extra in [&[][..], &["-g", "*.h"]] {
+        let args = [args, extra].concat();
+        let (got, cached) = glep_files(dir, &args);
+        assert!(cached, "{what} {args:?}: not answered by the listing cache");
+        assert_eq!(got, rg_files(dir, &args), "{what} {args:?}");
+    }
+}
+
+/// A tree of 48 listed files at several depths: leaves, and interior
+/// directories holding files of their own; `.gitignore` rules at the
+/// root, in an interior directory and in a leaf; hidden files; a hidden
+/// directory the root `.gitignore` whitelists (`!.github/`); C sources
+/// and headers; a vendor tree. No ignored file matches a glob the tests
+/// pass to -g or --iglob: rg lists those over any ignore rule, while the
+/// index glep lists from never holds an ignored file.
+fn big_fixture(p: &Path) {
+    let files: &[(&str, &str)] = &[
+        (".gitignore", "*.o\nbuild/\n!.github/\n"),
+        (".env", "x"),
+        (".github/workflows/ci.yml", "x"),
+        (".github/CODEOWNERS", "x"),
+        ("README.md", "x"),
+        ("Makefile", "x"),
+        ("build/out.c", "x"),
+        ("src/.gitignore", "gen_*.tmp\n"),
+        ("src/gen_a.tmp", "x"),
+        ("src/main.c", "x"),
+        ("src/main.h", "x"),
+        ("src/util.c", "x"),
+        ("src/util.h", "x"),
+        ("src/x.o", "x"),
+        ("src/core/core.c", "x"),
+        ("src/core/core.h", "x"),
+        ("src/core/sched.c", "x"),
+        ("src/core/deep/a.c", "x"),
+        ("src/core/deep/a.h", "x"),
+        ("src/core/deep/b.c", "x"),
+        ("src/core/deep/b.h", "x"),
+        ("src/core/deep2/z.h", "x"),
+        ("src/net/net.c", "x"),
+        ("src/net/net.h", "x"),
+        ("src/net/ipv4.c", "x"),
+        ("src/net/ipv6.c", "x"),
+        ("include/top.h", "x"),
+        ("include/linux/list.h", "x"),
+        ("include/linux/types.h", "x"),
+        ("include/linux/kernel.h", "x"),
+        ("include/linux/module.h", "x"),
+        ("include/uapi/.gitignore", "secret.txt\n"),
+        ("include/uapi/ioctl.h", "x"),
+        ("include/uapi/notes.txt", "x"),
+        ("include/uapi/secret.txt", "x"),
+        ("include/asm/io.h", "x"),
+        ("include/asm/irq.h", "x"),
+        ("vendor/README", "x"),
+        ("vendor/lib/a/a.c", "x"),
+        ("vendor/lib/a/a.h", "x"),
+        ("vendor/lib/b/b.c", "x"),
+        ("vendor/lib/b/b.h", "x"),
+        ("deep/one/top.c", "x"),
+        ("deep/one/two/mid.c", "x"),
+        ("deep/one/two/three/leaf.h", "x"),
+        ("docs/index.md", "x"),
+        ("docs/api.md", "x"),
+        ("docs/.hidden.md", "x"),
+        ("tools/x.py", "x"),
+        ("tools/y.py", "x"),
+        ("tools/build.sh", "x"),
+        ("tools/z.c", "x"),
+        ("lib/l1.c", "x"),
+        ("lib/l2.c", "x"),
+        ("lib/l3.c", "x"),
+        ("lib/l4.h", "x"),
+        ("lib/l5.h", "x"),
+    ];
+    for (path, body) in files {
+        let path = p.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+}
+
+/// `big_fixture`, indexed.
+fn big_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    big_fixture(dir.path());
+    glep()
+        .arg("index")
+        .current_dir(dir.path())
+        .output()
+        .expect("index");
+    dir
+}
+
+/// The listing cache file's identity: a rewrite (tmp file and rename)
+/// changes it.
+fn cache_stamp(dir: &Path) -> (u64, SystemTime) {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata(dir.join(".glep/dirtree.bin")).expect("listing cache");
+    (md.ino(), md.modified().unwrap())
+}
+
+/// Run the first `glep --files` in `dir`, which lists from the index's
+/// sweep and then builds the listing cache, paused right before that
+/// build (a debug-build hook) while `change` runs. Returns what it
+/// printed.
+#[cfg(debug_assertions)]
+fn list_and_build_around(dir: &Path, change: impl FnOnce()) -> String {
+    use std::time::{Duration, Instant};
+    assert!(!dir.join(".glep/dirtree.bin").exists());
+    let pause = tempfile::tempdir().unwrap();
+    let stdout = pause.path().join("stdout");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_glep"))
+        .arg("--files")
+        .current_dir(dir)
+        .env("GLEP_TEST_PAUSE_BEFORE_DIRCACHE_BUILD", pause.path())
+        .stdout(fs::File::create(&stdout).unwrap())
+        .spawn()
+        .expect("glep run");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !pause.path().join("reached").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "glep exited before building the cache"
+        );
+        assert!(Instant::now() < deadline, "glep never reached the build");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    change();
+    fs::write(pause.path().join("resume"), "").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(dir.join(".glep/dirtree.bin").exists(), "no cache built");
+    fs::read_to_string(stdout).unwrap()
+}
+
+/// The cache a full listing builds stats each directory and `.gitignore`
+/// after the sweep that listed it. A file created in a leaf in between
+/// must not be hidden from every later listing (the leaf's new mtime
+/// recorded next to its old listing), and a `.gitignore` edited in
+/// between must not let listings filtered by its old rules be served,
+/// whether it sits at the root, in an interior directory, or in a leaf.
+#[cfg(debug_assertions)]
+#[test]
+fn changes_while_the_cache_is_built_are_seen() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let cases: &[(&str, &str, &str, &str)] = &[
+        // (what, file written, its new contents, a line the listing
+        // printed before the change and must not print after it, or
+        // "" for none)
+        (
+            "a file created in a leaf",
+            "src/core/deep/during.h",
+            "x",
+            "",
+        ),
+        (
+            "the root .gitignore edited in place",
+            ".gitignore",
+            "*.c\nbuild/\n!.github/\n",
+            "src/core/deep/a.c\n",
+        ),
+        (
+            "an interior .gitignore edited in place",
+            "src/.gitignore",
+            "*.c\n",
+            "src/core/deep/a.c\n",
+        ),
+        (
+            "a leaf .gitignore edited in place, same size",
+            "include/uapi/.gitignore",
+            "notes.txt\n\n",
+            "include/uapi/notes.txt\n",
+        ),
+    ];
+    for &(what, file, contents, gone) in cases {
+        let dir = big_tree();
+        let root = dir.path();
+        let printed = list_and_build_around(root, || fs::write(root.join(file), contents).unwrap());
+        assert!(!printed.contains("during.h"), "{what}: {printed}");
+        // The next two listings come from the cache and see the change.
+        for run in 0..2 {
+            assert_lists_like_rg(root, &[], &format!("{what}, run {run}"));
+            let ((listed, _), _) = glep_files(root, &[]);
+            if gone.is_empty() {
+                assert!(listed.contains("src/core/deep/during.h\n"), "{what}");
+            } else {
+                assert!(printed.contains(gone), "{what}: the fixture changed");
+                assert!(!listed.contains(gone), "{what}: {listed}");
+            }
+        }
+    }
+}
+
+/// A listing rewrites the cache exactly when some directory changed: a
+/// file created in a leaf or in an interior directory, a subdirectory
+/// added to a leaf (which makes it interior), a directory deleted, a
+/// `.gitignore` edited in place with its size kept. Every listing prints
+/// rg's bytes.
+#[test]
+fn the_cache_is_rewritten_exactly_when_a_directory_changed() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let dir = big_tree();
+    let root = dir.path();
+    // The first listing builds the cache from the index's sweep, and the
+    // walk after it may still reorder what that build recorded.
+    for _ in 0..2 {
+        glep_files(root, &[]);
+    }
+    let check = |what: &str, change: Option<&dyn Fn()>| {
+        if let Some(change) = change {
+            change();
+        }
+        let before = cache_stamp(root);
+        let (got, cached) = glep_files(root, &[]);
+        assert!(cached, "{what}: not answered by the listing cache");
+        assert_eq!(got, rg_files(root, &[]), "{what}");
+        assert_eq!(
+            cache_stamp(root) != before,
+            change.is_some(),
+            "{what}: rewritten exactly when something changed"
+        );
+        // Nothing changed since: the cache stays as it is.
+        let before = cache_stamp(root);
+        assert_lists_like_rg(root, &[], what);
+        assert_eq!(cache_stamp(root), before, "{what}: rewritten again");
+    };
+    check("no change", None);
+    check(
+        "a file created in a leaf",
+        Some(&|| fs::write(root.join("src/core/deep/new.c"), "x").unwrap()),
+    );
+    check(
+        "a file created in an interior directory",
+        Some(&|| fs::write(root.join("src/core/new.h"), "x").unwrap()),
+    );
+    check(
+        "a subdirectory added to a leaf",
+        Some(&|| {
+            fs::create_dir(root.join("src/net/sub")).unwrap();
+            fs::write(root.join("src/net/sub/s.h"), "x").unwrap();
+        }),
+    );
+    check(
+        "a directory deleted",
+        Some(&|| fs::remove_dir_all(root.join("vendor/lib/b")).unwrap()),
+    );
+    check(
+        "a leaf .gitignore edited in place, same size",
+        Some(&|| fs::write(root.join("include/uapi/.gitignore"), "notes.txt\n\n").unwrap()),
+    );
+    check(
+        "an interior .gitignore edited in place, same size",
+        Some(&|| fs::write(root.join("src/.gitignore"), "util.c\n\n\n\n").unwrap()),
+    );
+    check(
+        "the root .gitignore edited in place, same size",
+        Some(&|| fs::write(root.join(".gitignore"), "*.c\nbuild/\n!.github/\n").unwrap()),
+    );
+    let ((listed, _), _) = glep_files(root, &[]);
+    for (path, shown) in [
+        ("src/core/deep/new.c", false),
+        ("src/core/new.h", true),
+        ("src/net/sub/s.h", true),
+        ("vendor/lib/b/b.h", false),
+        ("include/uapi/secret.txt", true),
+        ("include/uapi/notes.txt", false),
+        ("src/gen_a.tmp", true),
+        ("src/util.c", false),
+        ("src/util.h", true),
+    ] {
+        assert_eq!(listed.contains(&format!("{path}\n")), shown, "{path}");
+    }
+}
+
+/// rg's filters apply inside the cached listing, before any path is
+/// copied: each of them lists rg's bytes through the cache, over a tree
+/// whose root `.gitignore` whitelists the hidden `.github/` directory.
+#[test]
+fn filters_over_the_cache_match_rg() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let dir = big_tree();
+    let root = dir.path();
+    for _ in 0..2 {
+        glep_files(root, &[]);
+    }
+    let ((listed, _), _) = glep_files(root, &[]);
+    assert!(listed.contains(".github/workflows/ci.yml\n"), "{listed}");
+    assert!(!listed.contains(".env"), "{listed}");
+    for args in [
+        &[][..],
+        &["-g", "!vendor"],
+        &["-g", "deep/**"],
+        &["--iglob", "*.C"],
+        &["-t", "c"],
+        &["-T", "c"],
+        &["--type-add", "hdr:*.h", "-t", "hdr"],
+        &["--max-depth", "2"],
+        &["--max-depth", "1"],
+        &["--hidden"],
+        &["--hidden", "-g", "!.github"],
+        &["-g", ".env"],
+        &["-g", ".github/**"],
+        &["-g", "!.github/"],
+        &["-g", "!src", "-g", "!include"],
+    ] {
+        assert_lists_like_rg(root, args, "filter");
+    }
+}
+
+/// The walk that first sees a change saves the whole tree whatever the
+/// query filters: a filtered listing leaves the cache right for the next
+/// plain one.
+#[test]
+fn a_filtered_listing_saves_the_whole_tree() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let dir = big_tree();
+    let root = dir.path();
+    for _ in 0..2 {
+        glep_files(root, &[]);
+    }
+    fs::write(root.join("lib/new.c"), "x").unwrap();
+    assert_lists_like_rg(root, &["-g", "!lib", "-t", "py"], "a filtered listing");
+    let ((listed, _), cached) = glep_files(root, &[]);
+    assert!(cached);
+    assert!(listed.contains("lib/new.c\n"), "{listed}");
+    assert_eq!((listed, 0), rg_files(root, &[]));
 }

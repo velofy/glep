@@ -1706,25 +1706,38 @@ fn sort_swept_paths(paths: &mut Vec<PathBuf>) {
     use rayon::prelude::*;
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStringExt;
-        let swap = |mut b: Vec<u8>, from: u8, to: u8| {
-            for c in b.iter_mut().filter(|c| **c == from) {
-                *c = to;
-            }
-            b
-        };
         let mut keys: Vec<Vec<u8>> = std::mem::take(paths)
             .into_par_iter()
-            .map(|p| swap(p.into_os_string().into_vec(), b'/', 0))
+            .map(into_sort_key)
             .collect();
         keys.par_sort_unstable();
-        *paths = keys
-            .into_par_iter()
-            .map(|k| PathBuf::from(std::ffi::OsString::from_vec(swap(k, 0, b'/'))))
-            .collect();
+        *paths = keys.into_par_iter().map(from_sort_key).collect();
     }
     #[cfg(not(unix))]
     paths.par_sort_unstable();
+}
+
+/// A swept path's bytes as its `Path`-order sort key (see
+/// `sort_swept_paths`): the separator becomes NUL, in place.
+#[cfg(unix)]
+fn into_sort_key(p: PathBuf) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt;
+    swap_byte(p.into_os_string().into_vec(), b'/', 0)
+}
+
+/// The path an `into_sort_key` key came from, in the key's own buffer.
+#[cfg(unix)]
+fn from_sort_key(k: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(swap_byte(k, 0, b'/')))
+}
+
+#[cfg(unix)]
+fn swap_byte(mut b: Vec<u8>, from: u8, to: u8) -> Vec<u8> {
+    for c in b.iter_mut().filter(|c| **c == from) {
+        *c = to;
+    }
+    b
 }
 
 /// How the matcher will compare letters, for the index plan. -S always
@@ -1759,14 +1772,15 @@ fn report_nothing_searched() {
 /// live-scan escape hatch before the cache is ever consulted; the
 /// remaining filters (-g, -t/-T/--type-add/--type-clear, --ignore-file,
 /// --max-depth, --hidden, the glob slot) are pure functions of the path
-/// applied identically after either listing. Timestamp sorts need a live
-/// walk order and live metadata, so they bypass the cache.
+/// and the sweep's hidden flag, applied identically to either listing
+/// (inside the cached one, before any path is copied). Timestamp sorts
+/// need a live walk order and live metadata, so they bypass the cache.
 ///
 /// The cache's pruned walk always covers the whole tree, so a scoped
 /// listing (a path operand below the root, or the cwd scope of a
 /// subdirectory run) is cheaper through the index's scoped sweep, which
 /// walks only the operands: on a kernel-scale tree `--files` in `rust/`
-/// takes about 14 ms that way against 64 ms through the cache.
+/// takes about 14 ms that way, while the cache walks the whole tree.
 #[cfg(target_os = "macos")]
 fn listing_cache_eligible(args: &Args) -> bool {
     sort_is_path_order(args) && args.paths.iter().all(|p| p.as_os_str().is_empty())
@@ -1775,21 +1789,24 @@ fn listing_cache_eligible(args: &Args) -> bool {
 /// macOS-only fast listing via the dir-mtime cache (see dircache.rs):
 /// load the cached tree, verify the ignore-source fingerprint, run the
 /// pruned walk (zero-clone: cache-hit entries borrow the loaded tree),
-/// filter the result with `keep`, save the rebuilt tree if anything
-/// changed, and return the matching paths (unsorted; caller sorts).
+/// save the walked tree when some directory changed, and return the paths
+/// `keep` accepts, in path order. `keep` runs across the pool with one
+/// `init()` state per rayon job, and only the paths it keeps are copied.
 /// None = cache miss for any reason: caller falls back to the full
-/// freshness-sweep path. Filtering inside keeps the loaded tree's
-/// ownership local to this function.
+/// freshness-sweep path.
 #[cfg(target_os = "macos")]
-fn listing_via_cache<F>(
+fn listing_via_cache<S, I, F>(
     root: &Path,
     index_dir: &Path,
+    init: I,
     keep: F,
     timings: &mut Timings,
 ) -> Option<CachedListing>
 where
-    F: Fn(&crate::walk::FileMeta) -> bool + Sync,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, &crate::walk::FileMeta) -> bool + Sync + Send,
 {
+    use rayon::prelude::*;
     let t0 = std::time::Instant::now();
     let tree = crate::dircache::DirTree::load(index_dir)?;
     let t1 = std::time::Instant::now();
@@ -1800,55 +1817,75 @@ where
     if outcome.aborted {
         return None;
     }
-    let t_cmp = std::time::Instant::now();
-    let changed = outcome.tree != tree.root;
-    if std::env::var_os("GLEP_TIMING").is_some() {
-        eprintln!(
-            "glep timing: tree compare {:.1}ms ({changed})",
-            t_cmp.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    if changed {
+    let t_walk = std::time::Instant::now();
+    if let Some(walked) = outcome.tree {
         let updated = crate::dircache::DirTree {
             schema: crate::dircache::SCHEMA,
             fingerprint: tree.fingerprint.clone(),
-            root: outcome.tree,
+            root: walked,
         };
         let _ = updated.save(index_dir);
+        // The listing prints and the process exits right after: leave the
+        // copy to the exit (see the cache branch in `run`).
+        std::mem::forget(updated);
     }
-    use rayon::prelude::*;
+    let t_save = std::time::Instant::now();
     // Parallel filter: 86k globset matches on a kernel-scale tree cost
-    // ~15ms serial, ~2ms across the pool. Only the kept paths are cloned,
-    // split by the sweep's hidden flag like the index's live_files_split.
-    let (hidden, plain): (Vec<PathBuf>, Vec<PathBuf>) = outcome
+    // ~15ms serial, ~2ms across the pool. Only the kept paths are copied,
+    // straight into their sort keys.
+    let mut keys: Vec<Vec<u8>> = outcome
         .files
         .par_iter()
-        .filter(|m| keep(m))
-        .map(|m| (m.hidden, m.path.clone()))
-        .partition_map(|(h, p)| {
-            if h {
-                rayon::iter::Either::Left(p)
-            } else {
-                rayon::iter::Either::Right(p)
-            }
-        });
+        .map_init(&init, |state, m| {
+            keep(state, m).then(|| into_sort_key(m.path.clone()))
+        })
+        .filter_map(std::convert::identity)
+        .collect();
+    let t_filter = std::time::Instant::now();
+    keys.par_sort_unstable();
+    let files: Vec<PathBuf> = keys.into_par_iter().map(from_sort_key).collect();
+    // The entries borrow `tree`, which the caller leaves to the exit too.
+    std::mem::forget(outcome.files);
     timings.stage("listing_cache_walk");
     if std::env::var_os("GLEP_TIMING").is_some() {
+        let ms = |a: std::time::Instant, b: std::time::Instant| {
+            b.duration_since(a).as_secs_f64() * 1000.0
+        };
         eprintln!(
-            "glep timing: cache load {:.1}ms, pruned walk+filter {:.1}ms",
-            t1.duration_since(t0).as_secs_f64() * 1000.0,
-            t1.elapsed().as_secs_f64() * 1000.0
+            "glep timing: cache load {:.1}ms, pruned walk {:.1}ms, save {:.1}ms, filter {:.1}ms, sort {:.1}ms",
+            ms(t0, t1),
+            ms(t1, t_walk),
+            ms(t_walk, t_save),
+            ms(t_save, t_filter),
+            ms(t_filter, std::time::Instant::now())
         );
     }
-    Some(CachedListing { plain, hidden })
+    Some(CachedListing { files, tree })
 }
 
-/// A listing served by the dir-mtime cache: the kept paths split by the
-/// hidden flag (unsorted).
+/// Debug builds only, for tests: when the environment variable `var`
+/// names a directory, create `reached` in it, then wait (a minute at
+/// most) until `resume` appears there, so a test can change the tree at
+/// that exact point of a run.
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn test_pause(var: &str) {
+    let Some(dir) = std::env::var_os(var).map(PathBuf::from) else {
+        return;
+    };
+    let _ = std::fs::write(dir.join("reached"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A listing served by the dir-mtime cache: the kept paths in path order,
+/// and the loaded tree they were listed from, which the caller leaves to
+/// the process exit.
 #[cfg(target_os = "macos")]
 struct CachedListing {
-    plain: Vec<PathBuf>,
-    hidden: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    tree: crate::dircache::DirTree,
 }
 
 /// Every --type-add, --type-clear, -t and -T in command-line order (rg
@@ -2352,38 +2389,56 @@ pub fn run() -> anyhow::Result<i32> {
     // manifest, no postings, no freshness sweep, just the cache and the
     // pruned walk. The index opens below only on cache miss, and serves
     // every scoped listing (see `listing_cache_eligible`). The cache
-    // lives in the discovered index dir, so GLEP_INDEX_PATH shares it;
-    // every filter applies after the listing.
+    // lives in the discovered index dir, so GLEP_INDEX_PATH shares it.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
-        // The --files glob applies inside the listing (only its matches
-        // are cloned and sorted).
+        // Every operand is the root (`listing_cache_eligible`), so rg's
+        // filters for it (-g/--iglob, -t/-T, --ignore-file, --max-depth
+        // and the hidden rule, as `Filters::select` applies them) and the
+        // --files glob all apply inside the listing, before any path is
+        // copied: each rayon job filters with its own copy of the scope's
+        // filters, whose verdict caches are per copy.
         let glob_matcher = files_glob(&args)?;
         let glob_cwd = cwd_rel.clone();
-        let keep = move |m: &crate::walk::FileMeta| -> bool {
-            match &glob_matcher {
-                Some(g) => g.is_match(&*search::display_rel(&m.path, &glob_cwd)),
-                None => true,
-            }
+        scope.filters.begin_operand(Path::new(""));
+        let rescue = scope.filters.may_keep_hidden(Path::new(""));
+        let template = &scope.filters;
+        let keep = |flt: &mut filters::Filters, m: &crate::walk::FileMeta| -> bool {
+            (rescue || !m.hidden)
+                && glob_matcher
+                    .as_ref()
+                    .is_none_or(|g| g.is_match(&*search::display_rel(&m.path, &glob_cwd)))
+                && flt.keep(&m.path, m.hidden)
         };
-        if let Some(listing) = listing_via_cache(&root, &root.join(".glep"), keep, &mut timings) {
-            use rayon::prelude::*;
-            let CachedListing {
-                mut plain,
-                mut hidden,
-            } = listing;
-            if args.hidden {
-                plain.append(&mut hidden);
+        if let Some(listing) = listing_via_cache(
+            &root,
+            &root.join(".glep"),
+            || template.fork(),
+            keep,
+            &mut timings,
+        ) {
+            let CachedListing { mut files, tree } = listing;
+            // The root named more than once lists every file once per
+            // operand, as in rg.
+            if scope.operands.len() > 1 {
+                let once = files.clone();
+                for _ in 1..scope.operands.len() {
+                    files.extend_from_slice(&once);
+                }
             }
-            // Path order: the scope groups operands from it.
-            plain.par_sort();
-            hidden.sort();
-            let mut files = scope.select(plain, hidden);
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
             timings.finish();
-            return Ok(exit_code(&args, had_error, !files.is_empty()));
+            let code = exit_code(&args, had_error, !files.is_empty());
+            // The run returns right here and the process exits: the
+            // listing and the loaded tree (about 100k allocations on a
+            // kernel-scale tree) are left to the exit instead of being
+            // freed one by one. Nothing may use them, or run at all,
+            // between this and the return.
+            std::mem::forget(files);
+            std::mem::forget(tree);
+            return Ok(code);
         }
     }
 
@@ -2407,6 +2462,19 @@ pub fn run() -> anyhow::Result<i32> {
             }
         }
     }
+
+    // A listing rebuilds the listing cache below from the sweep that
+    // builds or refreshes the index. That build stats directories after
+    // the sweep, so it trusts no mtime from about when the sweep starts
+    // on, and it records the ignore sources above the root as they stood
+    // before the sweep read them (see `dircache::build_from_listing`).
+    #[cfg(target_os = "macos")]
+    let cache_seed = args.files.then(|| {
+        (
+            std::time::SystemTime::now(),
+            crate::dircache::source_fingerprint(&root),
+        )
+    });
 
     // First query on a tree with no index yet: one sweep measures it. A
     // small tree builds its index inline from that same sweep. A bigger
@@ -2513,13 +2581,16 @@ pub fn run() -> anyhow::Result<i32> {
         // pass can leave entries stale, and stale entries must never be
         // re-certified by current directory mtimes.
         #[cfg(target_os = "macos")]
-        {
+        if let Some((sweep_started, fingerprint)) = cache_seed {
             if idx.swept_full() && extra.is_empty() {
+                #[cfg(debug_assertions)]
+                test_pause("GLEP_TEST_PAUSE_BEFORE_DIRCACHE_BUILD");
                 let listing = idx.live_file_metas(true);
                 let tree = crate::dircache::build_from_listing(
                     &root,
                     &listing,
-                    crate::dircache::source_fingerprint(&root),
+                    fingerprint,
+                    sweep_started,
                 );
                 let _ = tree.save(&idx.dir);
             }
