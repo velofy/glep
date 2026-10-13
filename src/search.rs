@@ -98,7 +98,7 @@ pub struct SearchOpts {
     /// once in cli (format parsed, {host} from --hostname-bin or the
     /// platform). Like rg, links are only written when color is on.
     pub hyperlink: Option<grep_printer::HyperlinkConfig>,
-    /// Worker thread count (rg -j); None or 0 means one per core.
+    /// Worker thread count (rg -j); None or 0 means `default_threads()`.
     pub threads: Option<usize>,
     /// -r: rewrite matched text in output lines (capture refs like $1
     /// resolve; byte-level, applied by the printer).
@@ -246,6 +246,72 @@ impl Default for SearchOpts {
 /// pool and the in-order printer thread. Tests that want the pool path
 /// use a corpus larger than this.
 pub const SMALL_WORKLOAD: usize = 32;
+
+/// The search pool's width when -j is not given (or is 0). The rayon
+/// global pool (sweeps, listing filters) keeps one thread per core: see
+/// `cli::run`.
+///
+/// 1. `GLEP_THREADS`, a count above 0, wins: the A/B knob and escape
+///    hatch (0 or anything unparsable falls through).
+/// 2. macOS: the performance-core count (`hw.perflevel0.physicalcpu`),
+///    at most available_parallelism. A full scan is mostly kernel open,
+///    read and page-fault work whose lock contention grows faster than
+///    the thread count: on an M3 Pro (5 performance plus 6 efficiency
+///    cores) a kernel-tree full scan at 5 workers spends about a quarter
+///    of the system time it spends at 11 and finishes in 40 to 60% of the
+///    wall time. The knee sits at the performance-core count; efficiency
+///    cores add contention, not throughput.
+/// 3. Everywhere else (no perflevel sysctl: Intel Macs, Linux, Windows):
+///    available_parallelism, 4 if unknown.
+pub fn default_threads() -> usize {
+    let ap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    pick_threads(
+        std::env::var_os("GLEP_THREADS").as_deref(),
+        performance_cores(),
+        ap,
+    )
+}
+
+/// `default_threads`'s rule over its inputs: the GLEP_THREADS value, the
+/// performance-core count, and available_parallelism.
+fn pick_threads(env: Option<&std::ffi::OsStr>, perf_cores: Option<usize>, ap: usize) -> usize {
+    let forced = env
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    match (forced, perf_cores) {
+        (Some(n), _) => n,
+        (None, Some(p)) if p >= 1 => p.min(ap),
+        _ => ap,
+    }
+}
+
+/// The performance-core count, `hw.perflevel0.physicalcpu`; None when
+/// the sysctl is missing (Intel Macs) or reads below 1.
+#[cfg(target_os = "macos")]
+fn performance_cores() -> Option<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is a NUL-terminated C string, `value` is a c_int
+    // and `len` holds its size, and nothing is written (null new value).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value >= 1).then_some(value as usize)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_cores() -> Option<usize> {
+    None
+}
 
 // --- rg-compatible --json closing `summary` event -------------------------
 //
@@ -1715,14 +1781,17 @@ fn run_impl<M: Matcher + Sync>(
     };
 
     if std::env::var_os("GLEP_TIMING").is_some() {
-        // Which search path ran: tests use it to prove the worker pool is
-        // exercised.
-        let path = if files.len() <= SMALL_WORKLOAD {
-            "small"
+        // Which search path ran, and the pool's width: tests use it to
+        // prove the worker pool is exercised with the expected workers.
+        if files.len() <= SMALL_WORKLOAD {
+            eprintln!("glep timing: search path small ({} files)", files.len());
         } else {
-            "pool"
-        };
-        eprintln!("glep timing: search path {path} ({} files)", files.len());
+            eprintln!(
+                "glep timing: search path pool ({} files, {} workers)",
+                files.len(),
+                pool_workers(opts, files.len())
+            );
+        }
     }
     let mut printer = if files.len() <= SMALL_WORKLOAD {
         // Small workloads: stay on this thread, one reusable searcher,
@@ -1748,6 +1817,16 @@ fn run_impl<M: Matcher + Sync>(
     finish(&mut printer, files, universe, opts, out, start)
 }
 
+/// The worker pool's width for `files` files: -j when above 0 (rg's -j),
+/// else `default_threads()`, and never more workers than files.
+fn pool_workers(opts: &SearchOpts, files: usize) -> usize {
+    let parallelism = match opts.threads {
+        Some(n) if n > 0 => n,
+        _ => default_threads(),
+    };
+    parallelism.min(files).max(1)
+}
+
 /// The worker pool + in-order printer thread for workloads larger than
 /// `SMALL_WORKLOAD`. Returns the printer's final state (found flag,
 /// merged stats, matched indices).
@@ -1759,13 +1838,7 @@ fn run_pool<M: Matcher + Sync>(
     encoding: Option<&grep_searcher::Encoding>,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<Printer> {
-    let parallelism = match opts.threads {
-        Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
-    };
-    let workers = parallelism.min(files.len()).max(1);
+    let workers = pool_workers(opts, files.len());
     // The channel capacity is the memory bound: at most this many file
     // output buffers (plus one per worker in flight) exist at once.
     let window = (workers * 16).max(64);
@@ -2083,20 +2156,106 @@ mod tests {
         assert_eq!(out, expect);
     }
 
-    /// The same 100-file search through a 2-worker pool (-j 2) and through
-    /// one worker: identical bytes regardless of the worker count.
+    /// Serialises the tests that set GLEP_THREADS or depend on its value.
+    static GLEP_THREADS_ENV: Mutex<()> = Mutex::new(());
+
+    /// The same 100-file search through one worker, through 2- and
+    /// 3-worker pools, and through the default width (threads None and
+    /// -j 0: `default_threads()`, the performance-core count on macOS),
+    /// plus wider than the machine: identical bytes regardless of the
+    /// worker count.
     #[test]
     fn parallel_output_independent_of_thread_count() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, files) = big_corpus(100);
+        let ap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let mut o1 = opts();
         o1.threads = Some(1);
-        let mut o2 = opts();
-        o2.threads = Some(2);
         let (_, a) = run_str("needle", dir.path(), &files, &o1);
-        let (_, b) = run_str("needle", dir.path(), &files, &o2);
-        let (_, c) = run_str("needle", dir.path(), &files, &opts());
-        assert_eq!(a, b);
-        assert_eq!(a, c);
+        for threads in [Some(2), Some(3), None, Some(0), Some(ap), Some(ap + 3)] {
+            let mut o = opts();
+            o.threads = threads;
+            let (_, b) = run_str("needle", dir.path(), &files, &o);
+            assert_eq!(a, b, "threads {threads:?}");
+        }
+    }
+
+    /// The pool width: -j above 0 as given, else `default_threads()`,
+    /// never more workers than files and never fewer than one.
+    #[test]
+    fn pool_workers_follow_j_then_default() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut o = opts();
+        o.threads = Some(7);
+        assert_eq!(pool_workers(&o, 1000), 7);
+        assert_eq!(pool_workers(&o, 4), 4);
+        assert_eq!(pool_workers(&o, 0), 1);
+        for threads in [None, Some(0)] {
+            o.threads = threads;
+            assert_eq!(pool_workers(&o, 100_000), default_threads());
+        }
+    }
+
+    /// `default_threads`'s rule: GLEP_THREADS above 0 wins (even above
+    /// available_parallelism), 0 and garbage fall through to the
+    /// performance-core count capped at available_parallelism, and with
+    /// no performance-core count it is available_parallelism.
+    #[test]
+    fn pick_threads_rule() {
+        use std::ffi::OsStr;
+        let env = |v: &'static str| Some(OsStr::new(v));
+        assert_eq!(pick_threads(env("3"), Some(5), 11), 3);
+        assert_eq!(pick_threads(env("16"), Some(5), 11), 16);
+        assert_eq!(pick_threads(env("3"), None, 11), 3);
+        for junk in ["0", "", "abc", "-2", "3x", " 3", "1.5", "99999999999999999999999"] {
+            assert_eq!(pick_threads(env(junk), Some(5), 11), 5, "{junk:?}");
+            assert_eq!(pick_threads(env(junk), None, 11), 11, "{junk:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let not_utf8 = OsStr::from_bytes(b"\xff3");
+            assert_eq!(pick_threads(Some(not_utf8), Some(5), 11), 5);
+        }
+        assert_eq!(pick_threads(None, Some(5), 11), 5);
+        assert_eq!(pick_threads(None, Some(6), 6), 6);
+        assert_eq!(pick_threads(None, Some(12), 8), 8);
+        assert_eq!(pick_threads(None, Some(0), 11), 11);
+        assert_eq!(pick_threads(None, None, 11), 11);
+        assert_eq!(pick_threads(None, None, 1), 1);
+    }
+
+    /// `default_threads()` itself: within [1, available_parallelism]
+    /// without GLEP_THREADS (the performance-core count where the sysctl
+    /// exists), GLEP_THREADS=3 gives 3, and 0 or garbage fall through.
+    #[test]
+    fn default_threads_env_and_bounds() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("GLEP_THREADS");
+        let ap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        std::env::remove_var("GLEP_THREADS");
+        let base = default_threads();
+        assert!((1..=ap).contains(&base), "{base} not within [1, {ap}]");
+        match performance_cores() {
+            Some(p) => assert_eq!(base, p.min(ap)),
+            None => assert_eq!(base, ap),
+        }
+        std::env::set_var("GLEP_THREADS", "3");
+        assert_eq!(default_threads(), 3);
+        std::env::set_var("GLEP_THREADS", (ap + 5).to_string());
+        assert_eq!(default_threads(), ap + 5);
+        for junk in ["0", "", "abc", "-2", "3x"] {
+            std::env::set_var("GLEP_THREADS", junk);
+            assert_eq!(default_threads(), base, "GLEP_THREADS={junk:?}");
+        }
+        match saved {
+            Some(v) => std::env::set_var("GLEP_THREADS", v),
+            None => std::env::remove_var("GLEP_THREADS"),
+        }
     }
 
     /// -l through the parallel path must print one path per matched file,

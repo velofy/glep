@@ -559,6 +559,148 @@ fn check_cases(dir: &Path, label: &str, cases: &[&[&str]]) {
     }
 }
 
+/// `pool_corpus()` plus WIDE_FILES files over 16 directories, a third of
+/// them carrying `hello`: enough candidates that every worker of the
+/// widest pool gets files and the in-order printer's window wraps.
+const WIDE_FILES: usize = 256;
+
+fn wide_pool_corpus() -> tempfile::TempDir {
+    let dir = pool_corpus();
+    for i in 0..WIDE_FILES {
+        let p = dir.path().join(format!("wide/d{:02}/w{i:03}.txt", i % 16));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let body = match i % 3 {
+            0 => format!("hello wide {i}\nfoo {i} bar\n"),
+            1 => format!("no greeting {i}\nmatch {i} line\nbbb\n"),
+            _ => format!("x{i}\n"),
+        };
+        std::fs::write(&p, body).unwrap();
+    }
+    dir
+}
+
+/// glep in `dir` with GLEP_THREADS set to `threads`, or removed.
+fn glep_threads_cmd(dir: &Path, args: &[&str], threads: Option<&str>) -> Command {
+    let mut cmd = Command::cargo_bin("glep").unwrap();
+    cmd.current_dir(dir).args(args);
+    match threads {
+        Some(v) => cmd.env("GLEP_THREADS", v),
+        None => cmd.env_remove("GLEP_THREADS"),
+    };
+    cmd
+}
+
+/// A pool search's (candidate files, workers) from GLEP_TIMING; None
+/// when the search ran on the calling thread.
+fn pool_width(dir: &Path, args: &[&str], threads: Option<&str>) -> Option<(usize, usize)> {
+    let out = glep_threads_cmd(dir, args, threads)
+        .env("GLEP_TIMING", "1")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let rest = err
+        .lines()
+        .find_map(|l| l.strip_prefix("glep timing: search path pool ("))?
+        .to_string();
+    let mut nums = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.parse::<usize>().unwrap());
+    Some((nums.next()?, nums.next()?))
+}
+
+/// The worker count never shows in the output: the default width
+/// (`default_threads`: GLEP_THREADS, else the performance-core count on
+/// macOS, else one per core), GLEP_THREADS overrides, and explicit -j
+/// widths all print rg's exact bytes, searches and listings alike. -j
+/// above 0 beats GLEP_THREADS, which beats the platform default, and
+/// GLEP_THREADS=0 or garbage falls through to the default.
+#[test]
+fn worker_count_never_changes_output() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = wide_pool_corpus();
+    let d = dir.path();
+    let ap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let wide = (ap + 2).to_string();
+    let wide = wide.as_str();
+
+    // The pool's width per variant, on a `hello` search.
+    let (n, default_w) = pool_width(d, &["hello"], None).expect("hello must take the pool path");
+    assert!((1..=ap).contains(&default_w), "default width {default_w}");
+    #[cfg(target_os = "macos")]
+    {
+        let perf = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&p| p >= 1);
+        assert_eq!(default_w, perf.map_or(ap, |p| p.min(ap)).min(n));
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(default_w, ap.min(n));
+    let widths: &[(&[&str], Option<&str>, usize)] = &[
+        (&["hello"], Some("3"), 3),
+        (&["hello"], Some(wide), ap + 2),
+        (&["hello"], Some("0"), default_w),
+        (&["hello"], Some("junk"), default_w),
+        (&["-j", "1", "hello"], None, 1),
+        (&["-j", "2", "hello"], Some("3"), 2),
+        (&["-j", "0", "hello"], Some("3"), 3),
+        (&["-j", "0", "hello"], None, default_w),
+    ];
+    for &(args, threads, want) in widths {
+        assert_eq!(
+            pool_width(d, args, threads),
+            Some((n, want.min(n))),
+            "GLEP_THREADS={threads:?} {args:?}"
+        );
+    }
+
+    // Every width prints rg's bytes.
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-c", "hello"],
+        &["-l", "foo"],
+        &["-c", ".*"],
+        &["-v", "-c", "a"],
+        &["-c", "[0-9]{2}"],
+        &["-C", "1", "match"],
+        &["--files"],
+        &["--files", "-g", "w0*.txt"],
+    ];
+    let variants: &[(Option<&str>, &[&str])] = &[
+        (None, &[]),
+        (Some("1"), &[]),
+        (Some("3"), &[]),
+        (Some(wide), &[]),
+        (Some("0"), &[]),
+        (Some("junk"), &[]),
+        (None, &["-j", "1"]),
+        (None, &["-j", "2"]),
+        (None, &["-j", "0"]),
+        (Some("3"), &["-j", "2"]),
+        (None, &["-j", wide]),
+    ];
+    for args in cases {
+        let (r, rc) = rg_out(d, args);
+        for &(threads, extra) in variants {
+            let full: Vec<&str> = extra.iter().chain(args.iter()).copied().collect();
+            let out = glep_threads_cmd(d, &full, threads).output().unwrap();
+            let g = String::from_utf8(out.stdout).unwrap();
+            let gc = out.status.code().unwrap_or(-1);
+            assert_eq!(g, r, "GLEP_THREADS={threads:?}: stdout diverged for {full:?}");
+            assert_eq!(gc, rc, "GLEP_THREADS={threads:?}: exit code diverged for {full:?}");
+        }
+    }
+}
+
 /// Under --color always rg styles the path of every summary record (-l,
 /// -c, --count-matches, --files-without-match) and of the --files listing
 /// with the path color spec, and wraps it in an OSC 8 hyperlink when

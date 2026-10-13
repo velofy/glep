@@ -347,7 +347,8 @@ pub struct Args {
     /// (rg --max-depth/-d; a file operand itself is depth 0)
     #[arg(short = 'd', long, visible_alias = "maxdepth", alias = "depth")]
     pub max_depth: Option<usize>,
-    /// Worker thread count, 0 for auto (rg -j/--threads)
+    /// Worker thread count, 0 for auto: GLEP_THREADS if set, else the
+    /// performance-core count on macOS, else one per core (rg -j/--threads)
     #[arg(short = 'j', long = "threads")]
     pub threads: Option<usize>,
     /// Always print the file path with matches; the default unless a
@@ -1772,8 +1773,13 @@ pub fn run() -> anyhow::Result<i32> {
     messages::configure(!args.no_messages, !args.no_ignore_messages);
     if let Some(n) = args.threads {
         // Global rayon pool (sweeps, filters); the search pool reads
-        // SearchOpts::threads. A second init keeps the first (only ever
-        // happens under unit tests calling run() twice).
+        // SearchOpts::threads. Without -j the rayon pool keeps its
+        // one-per-core default rather than `search::default_threads`:
+        // directory sweeps and listing filters still scale past the
+        // performance cores (a kernel-tree --files listing measured about
+        // 4% slower at 5 threads than at 11 on an M3 Pro). A second init
+        // keeps the first (only ever happens under unit tests calling
+        // run() twice).
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global();
