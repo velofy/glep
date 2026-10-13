@@ -2270,3 +2270,50 @@ fn rgignore_files_match_rg() {
     std::fs::write(outer.path().join(".rgignore"), "z.txt\n").unwrap();
     check_cases(&d, "ancestor edit", cases);
 }
+
+/// Adding or removing the `!` rule that rescues a dotfile changes neither
+/// the dotfile nor its directory, yet rg's answer changes with it. The
+/// index keeps every file's hidden flag in step with the rules (the flag
+/// is trusted, so a hidden file is never re-checked rule by rule), on
+/// the search path, the --files listing and the listing cache alike.
+#[test]
+fn whitelist_edits_after_indexing_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // Enough indexed text that one edited ignore file never triggers a
+    // full rebuild (which would recompute every flag anyway).
+    for i in 0..120 {
+        let p = d.join(format!("fill/d{}/f{i:03}.txt", i % 6));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let words: String = (0..40).map(|k| format!("w{i}x{k}y ")).collect();
+        std::fs::write(p, format!("{words}\n")).unwrap();
+    }
+    std::fs::create_dir_all(d.join(".cfg")).unwrap();
+    std::fs::write(d.join(".env"), "token env\n").unwrap();
+    std::fs::write(d.join(".cfg/x.txt"), "token cfg\n").unwrap();
+    std::fs::write(d.join("main.txt"), "token main\n").unwrap();
+    // Indexed while the rules rescue the dotfiles.
+    std::fs::write(d.join(".gitignore"), "*.log\n!.env\n!.cfg/\n").unwrap();
+    let cases: &[&[&str]] = &[
+        &["-l", "token"],
+        &["token"],
+        &["-c", "to"],
+        &["--files"],
+        &["-l", "token", "fill", ".cfg"],
+    ];
+    check_cases(d, "indexed with the rules", cases);
+    warm_listing_cache(d);
+    std::fs::write(d.join(".gitignore"), "*.log\n").unwrap();
+    check_cases(d, "rules removed", cases);
+    std::fs::write(d.join(".gitignore"), "*.log\n!.env\n!.cfg/\n").unwrap();
+    check_cases(d, "rules added back", cases);
+    std::fs::write(d.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(d.join(".rgignore"), "!.env\n").unwrap();
+    check_cases(d, "rgignore rescue", cases);
+    std::fs::write(d.join(".rgignore"), "main.txt\n").unwrap();
+    check_cases(d, "rgignore edited", cases);
+}

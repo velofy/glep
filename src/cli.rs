@@ -1014,8 +1014,13 @@ impl Scope {
                 let all = prefix.as_os_str().is_empty();
                 let filters = &mut self.filters;
                 filters.begin_operand(&prefix);
+                let rescue = filters.may_keep_hidden(&prefix);
                 let mut live = live;
-                live.any(|(f, hidden)| (all || f.starts_with(&prefix)) && filters.keep(f, hidden))
+                live.any(|(f, hidden)| {
+                    (all || f.starts_with(&prefix))
+                        && (rescue || !hidden)
+                        && filters.keep(f, hidden)
+                })
             }
         }
     }

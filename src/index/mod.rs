@@ -596,13 +596,19 @@ impl Index {
         use rayon::prelude::*;
         let mut fresh: Vec<FileMeta> = Vec::new(); // new or changed (order irrelevant)
         let mut changed_old_ids: Vec<u32> = Vec::new();
+        // Unchanged files whose hidden flag the sweep now computes
+        // differently: an ignore file gained or lost the `!` rule that
+        // rescues them, which touches neither the file nor its mtime.
+        let mut hidden_flips: Vec<(u32, bool)> = Vec::new();
         {
             let chunk = (swept.len() / n_shards / 2).max(1024);
-            let results: Vec<(Vec<FileMeta>, Vec<u32>)> = swept
+            type Diff = (Vec<FileMeta>, Vec<u32>, Vec<(u32, bool)>);
+            let results: Vec<Diff> = swept
                 .par_chunks(chunk)
                 .map(|metas| {
                     let mut my_fresh = Vec::new();
                     let mut my_changed = Vec::new();
+                    let mut my_flips = Vec::new();
                     for meta in metas {
                         let h = hash_path(&meta.path) & shard_mask;
                         match shard_maps[h].get(meta.path.as_path()) {
@@ -611,17 +617,20 @@ impl Index {
                                 if e.mtime_ns != meta.mtime_ns || e.size != meta.size {
                                     my_fresh.push(meta.clone());
                                     my_changed.push(e.id);
+                                } else if (e.flags & FLAG_HIDDEN != 0) != meta.hidden {
+                                    my_flips.push((e.id, meta.hidden));
                                 }
                             }
                             None => my_fresh.push(meta.clone()), // brand new
                         }
                     }
-                    (my_fresh, my_changed)
+                    (my_fresh, my_changed, my_flips)
                 })
                 .collect();
-            for (f, c) in results {
+            for (f, c, h) in results {
                 fresh.extend(f);
                 changed_old_ids.extend(c);
+                hidden_flips.extend(h);
             }
         }
         let dead_ids: Vec<u32> = self
@@ -638,6 +647,16 @@ impl Index {
         if let Some(t) = &mut timings {
             t.stage("sweep_diff");
         }
+        // The flags are what queries read, so they flip in memory even
+        // when the manifest cannot be written (read-only mode).
+        for &(id, hidden) in &hidden_flips {
+            let flags = &mut self.manifest.entries[id as usize].flags;
+            if hidden {
+                *flags |= FLAG_HIDDEN;
+            } else {
+                *flags &= !FLAG_HIDDEN;
+            }
+        }
 
         if self.read_only {
             if let Some(t) = &mut timings {
@@ -646,6 +665,8 @@ impl Index {
             return Ok(fresh.into_iter().map(|m| m.path).collect());
         }
         if fresh.is_empty() && dead_ids.is_empty() {
+            // Flipped hidden flags must persist: later queries trust them.
+            let mut save = !hidden_flips.is_empty();
             // Only a full sweep may advance the freshness epoch.
             if !scoped {
                 self.manifest.last_sweep_epoch = now_epoch();
@@ -655,9 +676,10 @@ impl Index {
                 // write-free. A later process may then see a slightly stale
                 // epoch, which can only cause an extra sweep, never a
                 // missed one.
-                if ttl_secs > 0 {
-                    self.manifest.save(&self.dir.join("manifest.bin"))?;
-                }
+                save |= ttl_secs > 0;
+            }
+            if save {
+                self.manifest.save(&self.dir.join("manifest.bin"))?;
             }
             if let Some(t) = &mut timings {
                 t.stage("index_write");
@@ -984,6 +1006,46 @@ mod tests {
             .live_files(true)
             .iter()
             .any(|p| p.starts_with("ignored_dir")));
+    }
+
+    /// Adding or removing the `!` rule that rescues a dotfile flips its
+    /// hidden flag on the next sweep, in place: the file keeps its entry
+    /// and postings (no rebuild, no reindex), and a read-only pass flips
+    /// it for its own queries too.
+    #[test]
+    fn hidden_flag_follows_whitelist_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            let words: String = (0..30).map(|k| format!("w{i}x{k}y ")).collect();
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), words).unwrap();
+        }
+        std::fs::write(dir.path().join(".env"), "token").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "!.env\n").unwrap();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let mut idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        let env = |idx: &Index| {
+            let e = idx
+                .manifest
+                .live_entries()
+                .find(|e| e.path == Path::new(".env"))
+                .unwrap();
+            (e.id, e.flags & FLAG_HIDDEN != 0)
+        };
+        let (id, hidden) = env(&idx);
+        assert!(!hidden, "whitelisted at build time");
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        assert!(idx.has_delta(), "one edited file must not compact");
+        assert_eq!(env(&idx), (id, true), "rule removed: hidden, same entry");
+        let reopened = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert_eq!(env(&reopened), (id, true), "the flip was saved");
+        std::fs::write(dir.path().join(".gitignore"), "!.env\n").unwrap();
+        let mut ro = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        ro.read_only = true;
+        ro.update(1_048_576, 0).unwrap();
+        assert_eq!(env(&ro), (id, false), "read-only pass flips in memory");
+        idx.update(1_048_576, 0).unwrap();
+        assert_eq!(env(&idx), (id, false), "rule restored: visible again");
     }
 
     #[test]

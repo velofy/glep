@@ -136,6 +136,8 @@ pub struct Filters {
     op: PathBuf,
     op_base: usize,
     op_outside_cwd: bool,
+    /// The operand has a dot-named component, which rg never checks.
+    op_hidden: bool,
 }
 
 impl Filters {
@@ -172,6 +174,7 @@ impl Filters {
             op: PathBuf::new(),
             op_base: 0,
             op_outside_cwd: !cwd_rel.as_os_str().is_empty(),
+            op_hidden: false,
         })
     }
 
@@ -193,7 +196,24 @@ impl Filters {
             op: self.op.clone(),
             op_base: self.op_base,
             op_outside_cwd: self.op_outside_cwd,
+            op_hidden: self.op_hidden,
         }
+    }
+
+    /// Whether a file the sweep flagged hidden can survive the walk of the
+    /// operand `op` (root-relative). The flag already folds in every
+    /// ignore file's `!` rescue, so rg keeps such a file only under
+    /// --hidden, through a -g/--iglob, -t or --ignore-file whitelist, or
+    /// when its hidden component is the operand itself or above it (rg
+    /// never checks those). Otherwise the per-level checks could only
+    /// confirm the flag, after loading the ignore files on the way to
+    /// every hidden file.
+    pub fn may_keep_hidden(&self, op: &Path) -> bool {
+        self.show_hidden
+            || self.overrides.is_some()
+            || !self.explicit.is_empty()
+            || self.types.is_some()
+            || crate::walk::path_is_hidden(op)
     }
 
     /// No filter can drop a file the sweep did not flag hidden.
@@ -213,6 +233,7 @@ impl Filters {
             self.op = op.to_path_buf();
             self.op_base = op.components().count();
             self.op_outside_cwd = !op.starts_with(&self.cwd_rel);
+            self.op_hidden = crate::walk::path_is_hidden(op);
             self.dirs.clear();
             self.last_parent = None;
         }
@@ -256,10 +277,49 @@ impl Filters {
         if !rules && !hidden_check {
             return true;
         }
+        // The sweep's flag says some dot-named level of `f` is not
+        // whitelisted by the tree's ignore files. Below a plain operand
+        // only a rule's whitelist can still rescue it; without one the
+        // level checks would just load ignore files to confirm the flag.
+        if hidden_check && !self.op_hidden && !self.rule_whitelists_a_dot_level(f) {
+            return false;
+        }
         if (self.prune_dirs || hidden_check) && depth > 1 && !self.dirs_ok(f, depth, hidden_check) {
             return false;
         }
         self.level_ok(f, false, hidden_check)
+    }
+
+    /// Whether a -g/--iglob, --ignore-file or (for the file itself) -t
+    /// whitelist covers some dot-named level of `f` below the operand,
+    /// the way `level_ok` would see it.
+    fn rule_whitelists_a_dot_level(&self, f: &Path) -> bool {
+        let levels = f.components().count().saturating_sub(self.op_base);
+        f.ancestors().take(levels).any(|l| {
+            if !l
+                .file_name()
+                .is_some_and(|n| n.as_encoded_bytes().first() == Some(&b'.'))
+            {
+                return false;
+            }
+            let is_dir = l != f;
+            let shown = self.walked_path(l);
+            self.overrides
+                .as_ref()
+                .is_some_and(|ov| ov.matched(&*shown, is_dir).is_whitelist())
+                || self
+                    .explicit
+                    .iter()
+                    .rev()
+                    .map(|g| g.matched(&*shown, is_dir))
+                    .find(|m| !m.is_none())
+                    .is_some_and(|m| m.is_whitelist())
+                || (!is_dir
+                    && self
+                        .types
+                        .as_ref()
+                        .is_some_and(|t| t.matched(l, false).is_whitelist()))
+        })
     }
 
     /// Every directory strictly between the operand and `f` survives.
@@ -423,10 +483,14 @@ impl Filters {
             } else {
                 plain.retain(|f| (all || f.starts_with(p)) && self.keep(f, false));
             }
-            let hidden: Vec<PathBuf> = hidden
-                .into_iter()
-                .filter(|f| (all || f.starts_with(p)) && self.keep(f, true))
-                .collect();
+            let hidden: Vec<PathBuf> = if self.may_keep_hidden(p) {
+                hidden
+                    .into_iter()
+                    .filter(|f| (all || f.starts_with(p)) && self.keep(f, true))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             return merge_sorted(plain, hidden);
         }
         let mut out = Vec::new();
@@ -445,9 +509,11 @@ impl Filters {
                         }
                     }
                     let mut mine_hidden = Vec::new();
-                    for f in &hidden {
-                        if (all || f.starts_with(p)) && self.keep(f, true) {
-                            mine_hidden.push(f.clone());
+                    if self.may_keep_hidden(p) {
+                        for f in &hidden {
+                            if (all || f.starts_with(p)) && self.keep(f, true) {
+                                mine_hidden.push(f.clone());
+                            }
                         }
                     }
                     out.extend(merge_sorted(mine, mine_hidden));
@@ -562,6 +628,48 @@ mod tests {
             kind: OperandKind::Dir,
         }];
         assert_eq!(f.select(&ops, plain, Vec::new()), expect);
+    }
+
+    /// A file the sweep flagged hidden stays hidden below a plain operand
+    /// unless a rule whitelists one of its dot-named levels: the flag
+    /// already holds the tree's own whitelists (here the tree's `!.env`
+    /// is not consulted again). Below a hidden operand, or with a rule
+    /// whitelist, the level checks decide.
+    #[test]
+    fn flagged_hidden_files_need_a_rule_or_a_hidden_operand() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "!.env\n").unwrap();
+        let select = |globs: &[String], types: &[TypeChange], op: &str| -> Vec<PathBuf> {
+            let mut s = spec(globs);
+            s.type_changes = types;
+            let mut f = Filters::new(&s, dir.path(), Path::new("")).unwrap();
+            let ops = [Operand {
+                path: PathBuf::from(op),
+                kind: OperandKind::Dir,
+            }];
+            let plain = vec![PathBuf::from("a/b.txt"), PathBuf::from("a/c.o")];
+            let hidden = vec![
+                PathBuf::from(".env"),
+                PathBuf::from("a/.x/y.txt"),
+                PathBuf::from("a/.z"),
+            ];
+            f.select(&ops, plain, hidden)
+        };
+        let names = |v: Vec<PathBuf>| -> Vec<String> {
+            v.iter()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .collect()
+        };
+        assert_eq!(names(select(&[], &[], "")), ["a/b.txt", "a/c.o"]);
+        assert_eq!(names(select(&["!*.o".into()], &[], "")), ["a/b.txt"]);
+        assert_eq!(names(select(&[".env".into()], &[], "")), [".env"]);
+        let dot = [
+            TypeChange::Add("dot:.z".into()),
+            TypeChange::Select("dot".into()),
+        ];
+        assert_eq!(names(select(&[], &dot, "a")), ["a/.z"]);
+        // Inside a hidden operand rg checks nothing above it.
+        assert_eq!(names(select(&[], &[], "a/.x")), ["a/.x/y.txt"]);
     }
 
     #[test]
