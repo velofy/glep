@@ -266,12 +266,13 @@ pub struct Args {
     /// with --null-data, like rg.
     #[arg(long, overrides_with = "null_data")]
     pub crlf: bool,
-    /// Use memory-mapped IO when searching files (rg --mmap). Already
-    /// glep's default: files are searched straight from the page cache.
+    /// Search using memory maps when possible (rg --mmap). Accepted for
+    /// compat: glep already searches each file as one slice, read whole
+    /// into a reused buffer, or mapped when over 1 MiB.
     #[arg(long)]
     pub mmap: bool,
-    /// Never use memory maps: read every file through the searcher's
-    /// buffer instead (rg --no-mmap)
+    /// Never search a file as one slice: stream every file through the
+    /// searcher's buffer instead (rg --no-mmap)
     #[arg(long, overrides_with = "mmap")]
     pub no_mmap: bool,
     /// Accepted for script compat; glep streams output either way
@@ -347,7 +348,8 @@ pub struct Args {
     /// (rg --max-depth/-d; a file operand itself is depth 0)
     #[arg(short = 'd', long, visible_alias = "maxdepth", alias = "depth")]
     pub max_depth: Option<usize>,
-    /// Worker thread count, 0 for auto (rg -j/--threads)
+    /// Worker thread count, 0 for auto: GLEP_THREADS if set, else the
+    /// performance-core count on macOS, else one per core (rg -j/--threads)
     #[arg(short = 'j', long = "threads")]
     pub threads: Option<usize>,
     /// Always print the file path with matches; the default unless a
@@ -761,15 +763,13 @@ fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool
             missing = true;
             if files_mode {
                 messages::error(format!(
-                    "{}: IO error for operation on {}: No such file or directory (os error 2)",
+                    "{}: IO error for operation on {}: {}",
                     p.display(),
-                    p.display()
+                    p.display(),
+                    crate::messages::not_found()
                 ));
             } else {
-                messages::error(format!(
-                    "{}: No such file or directory (os error 2)",
-                    p.display()
-                ));
+                messages::error(format!("{}: {}", p.display(), crate::messages::not_found()));
             }
         }
     }
@@ -1038,8 +1038,9 @@ impl Scope {
 /// printed: relative to the cwd, like -g.
 fn files_glob(args: &Args) -> anyhow::Result<Option<globset::GlobMatcher>> {
     match args.pattern.as_deref() {
+        // `**` (built as `**/**`) matches every path: nothing to filter.
+        Some("**") | None => Ok(None),
         Some(g) => Ok(Some(build_glob_icase(g, args.glob_case_insensitive)?)),
-        None => Ok(None),
     }
 }
 
@@ -1423,6 +1424,330 @@ fn run_live(
     Ok(exit_code(args, had_error || nothing_searched, found))
 }
 
+/// Unindexed trees holding more than this many bytes of files answer
+/// their first query from a sweep and build the index in the background
+/// (see `run`); smaller ones build it inline, which takes about a second
+/// at this size. GLEP_BG_BUILD_MIN_BYTES overrides it.
+#[cfg(unix)]
+const BG_BUILD_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn background_build_min_bytes() -> u64 {
+    parse_bg_build_min_bytes(std::env::var("GLEP_BG_BUILD_MIN_BYTES").ok().as_deref())
+}
+
+/// A GLEP_BG_BUILD_MIN_BYTES value: a byte count with an optional K, M
+/// or G suffix, like --max-filesize; unset or unparsable is the default.
+#[cfg(unix)]
+fn parse_bg_build_min_bytes(v: Option<&str>) -> u64 {
+    v.and_then(|v| parse_human_u64(v.trim()).ok())
+        .unwrap_or(BG_BUILD_MIN_BYTES)
+}
+
+/// The first query on an unindexed tree too big to index inline, answered
+/// from the full sweep that measured the tree the way `run_live` answers
+/// from its walk: every selected file is searched, so binary handling is
+/// the searcher's own. The sweep applies the index's ignore and hidden
+/// rules (it is the sweep a build indexes), so the scope selects from it
+/// exactly as from a fresh manifest, and the rest is the index path's:
+/// directory operands the sweep holds no file under walk live with rg's
+/// rules, then the --files glob and printer, or the search. Nothing here
+/// opens, builds or writes the index.
+#[cfg(unix)]
+fn run_from_sweep(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    swept: Vec<walk::FileMeta>,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    // `Index::has_files_under` over the sweep instead of the manifest:
+    // operands are root-relative and normalized, so one that is not plain
+    // names below the root (`..`, absolute elsewhere) holds no swept file.
+    scope.walk_unserved(args, cwd_rel, |op| {
+        names_below_root(op) && prefixes_with_files(&swept, &[op.to_path_buf()])[0]
+    });
+    timings.stage("operands");
+    // Split by the sweep's hidden flag, as the index splits by
+    // FLAG_HIDDEN; under --hidden every file is plain.
+    use rayon::prelude::*;
+    let (mut hidden, mut plain): (Vec<PathBuf>, Vec<PathBuf>) =
+        swept.into_par_iter().partition_map(|m| {
+            if m.hidden && !args.hidden {
+                rayon::iter::Either::Left(m.path)
+            } else {
+                rayon::iter::Either::Right(m.path)
+            }
+        });
+    sort_swept_paths(&mut plain);
+    sort_swept_paths(&mut hidden);
+    let mut files = scope.select(plain, hidden);
+    if args.files {
+        // With --files the pattern slot is the glob.
+        retain_glob(&mut files, files_glob(args)?.as_ref(), cwd_rel);
+        apply_sort(&mut files, args, root, cwd_rel)?;
+        print_paths(&files, cwd_rel, args)?;
+        timings.stage("listing");
+        return Ok(exit_code(args, had_error, !files.is_empty()));
+    }
+
+    let (pattern, effective_fixed) = resolve_pattern(args);
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    timings.stage("candidates");
+    // Nothing narrowed the selection, so an empty one searched nothing.
+    let nothing_searched = scope.implicit && files.is_empty();
+    if nothing_searched {
+        report_nothing_searched();
+    }
+    let mut opts = search_opts(args, cwd_rel);
+    opts.fixed = effective_fixed;
+    let mut out = search::StdoutOut;
+    let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
+    timings.stage("search");
+    Ok(exit_code(args, had_error || nothing_searched, found))
+}
+
+/// Start building the index of `root` in a detached child (`glep index`
+/// with GLEP_BG set, see `run_background_build`) and return without
+/// waiting for it. Its stdio is the null device, so a pipe or `$(...)`
+/// reading this run sees EOF as soon as this process exits, and it runs in
+/// a process group of its own, so a Ctrl-C at the terminal leaves it
+/// alone. Nothing is spawned when the index dir cannot be written or
+/// another glep holds its lock (a build is running already), and a spawn
+/// that fails is silent: the next query on the tree tries again.
+#[cfg(unix)]
+fn spawn_background_build(root: &Path, cwd: &Path, max_filesize: u64) {
+    if !Index::can_build(root) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("index")
+        .arg("--max-filesize")
+        .arg(max_filesize.to_string())
+        .current_dir(root)
+        .env("GLEP_BG", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // The child finds this run's root from `root`: through the index dir
+    // `can_build` made there, or through GLEP_INDEX_PATH, resolved against
+    // this run's cwd first because the child runs from the root.
+    if let Some(v) = std::env::var_os("GLEP_INDEX_PATH").filter(|v| !v.is_empty()) {
+        cmd.env("GLEP_INDEX_PATH", cwd.join(v));
+    }
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    if let Ok(child) = cmd.spawn() {
+        // Test hook: the builder's pid, for tests that stop it mid-build.
+        if let Some(path) = std::env::var_os("GLEP_BG_PIDFILE") {
+            let _ = std::fs::write(path, format!("{}\n", child.id()));
+        }
+    }
+}
+
+/// `glep index` as the detached build a first query spawned (GLEP_BG set):
+/// at background priority, it builds the index only while none exists,
+/// and exits 0 without building when another glep holds the lock (a
+/// second spawner lost the race).
+fn run_background_build(root: &Path, max_filesize: u64) -> anyhow::Result<i32> {
+    lower_thread_priority();
+    // The sweep's pool threads too (a second init keeps the first).
+    let _ = rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| lower_thread_priority())
+        .build_global();
+    Index::build_if_missing(root, max_filesize)?;
+    Ok(0)
+}
+
+/// Background priority for the calling thread: utility QoS on macOS,
+/// below every interactive thread for CPU and I/O; nice 10 on other Unix
+/// systems (a per-thread setting on Linux, so every pool thread sets it).
+/// Windows never spawns the build (see `run`).
+fn lower_thread_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: a plain call on the current thread; no pointers involved.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    // SAFETY: a plain call on the current thread; no pointers involved.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
+/// True when `p` (root-relative after `normalize_path_filters`) is a path
+/// of plain names below the root: not the root itself, not absolute, no
+/// `.` or `..` component.
+fn names_below_root(p: &Path) -> bool {
+    !p.as_os_str().is_empty()
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Whether some swept path lies under each prefix, in one pass over the
+/// sweep: a path is under a prefix when its bytes start with the
+/// prefix's and the next byte is a separator or the end (both are plain
+/// names joined by single separators). Stops once every prefix has one.
+fn prefixes_with_files(metas: &[walk::FileMeta], prefixes: &[PathBuf]) -> Vec<bool> {
+    let mut found = vec![false; prefixes.len()];
+    let mut missing = prefixes.len();
+    for m in metas {
+        if missing == 0 {
+            break;
+        }
+        for (prefix, seen) in prefixes.iter().zip(found.iter_mut()) {
+            if !*seen && path_is_under(&m.path, prefix) {
+                *seen = true;
+                missing -= 1;
+            }
+        }
+    }
+    found
+}
+
+/// Whether `path` is `prefix` or lies below it, comparing whole names.
+/// On Unix both are plain names joined by single '/' separators, so a byte
+/// comparison is exact and cheap. Windows accepts '/' and '\\' alike and
+/// operands may mix them, so it compares path components instead.
+#[cfg(unix)]
+fn path_is_under(path: &Path, prefix: &Path) -> bool {
+    let path = path.as_os_str().as_encoded_bytes();
+    let prefix = prefix.as_os_str().as_encoded_bytes();
+    path.starts_with(prefix) && path.get(prefix.len()).is_none_or(|&b| b == b'/')
+}
+
+#[cfg(not(unix))]
+fn path_is_under(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix)
+}
+
+/// A scoped --files listing (directory operands below the root, see
+/// `run`) from a live sweep of the operands, never the index: a listing
+/// needs neither postings nor the manifest, and the scoped sweep is the
+/// one `Index::update_scoped` runs (read with names only), whose result
+/// is exactly the set the index path lists under the operands. Nothing
+/// here opens, builds or writes the index (or the listing cache), so an
+/// unindexed tree lists without a build.
+///
+/// Operands the sweep holds no file under are walked live with rg's
+/// rules, as on the index path (`Scope::walk_unserved`), unless the sweep
+/// entered the operand as a directory (every level above it one the walk
+/// from the root enters) and no -g/--iglob is given: rg's walk of such an
+/// operand applies the same ignore rules, and every other filter (-t,
+/// --ignore-file, --max-depth, hidden) only drops files, so it could
+/// yield nothing either. Only a glob override can bring back files that
+/// ignore rules exclude, so with one those operands still walk live,
+/// exactly as on the index path. The rest of the listing is the index
+/// path's: the scope's selection, the --files glob, --sort, the printer.
+fn list_scoped(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    prefixes: &[PathBuf],
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    // The sweep's directory reads contend in the kernel the way a
+    // search's opens and reads do, so without -j (which sized the pool
+    // already) the pool takes the search pool's width: on an M3 Pro the
+    // readdir walk of the kernel's drivers/ takes about 20 ms on the 5
+    // performance cores against 25 ms on all 11.
+    if args.threads.is_none() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(search::default_threads())
+            .build_global();
+    }
+    // Only explicit file operands: nothing to sweep.
+    let swept = if prefixes.is_empty() {
+        walk::ScopedListing {
+            files: Vec::new(),
+            entered: Vec::new(),
+        }
+    } else {
+        walk::sweep_scoped_listing(root, prefixes)?
+    };
+    timings.stage("scoped_sweep");
+    let found = prefixes_with_files(&swept.files, prefixes);
+    let empty_is_final = scope.filters.overrides().is_none();
+    scope.walk_unserved(args, cwd_rel, |op| {
+        prefixes.iter().zip(&found).any(|(p, &has)| has && p == op)
+            || (empty_is_final && swept.entered.iter().any(|p| p == op))
+    });
+    timings.stage("operands");
+    // Split by the sweep's hidden flag, as the index splits by
+    // FLAG_HIDDEN; under --hidden every file is plain.
+    use rayon::prelude::*;
+    let (mut hidden, mut plain): (Vec<PathBuf>, Vec<PathBuf>) =
+        swept.files.into_par_iter().partition_map(|m| {
+            if m.hidden && !args.hidden {
+                rayon::iter::Either::Left(m.path)
+            } else {
+                rayon::iter::Either::Right(m.path)
+            }
+        });
+    sort_swept_paths(&mut plain);
+    sort_swept_paths(&mut hidden);
+    let mut files = scope.select(plain, hidden);
+    // With --files the pattern slot is the glob.
+    retain_glob(&mut files, files_glob(args)?.as_ref(), cwd_rel);
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    print_paths(&files, cwd_rel, args)?;
+    timings.stage("listing");
+    timings.finish();
+    Ok(exit_code(args, had_error, !files.is_empty()))
+}
+
+/// Sort paths a sweep yielded (relative, plain names joined by single
+/// separators, each path once) into `Path` order. For such paths the
+/// component-wise order is byte order with the separator ranked below
+/// every other byte, and no name holds a NUL. On Unix each path's bytes
+/// are sorted in place with the separator swapped for NUL: a plain byte
+/// comparison per pair instead of `Path::cmp`'s component parsing (1.6 ms
+/// against about 0.3 ms for a 6k-file listing).
+fn sort_swept_paths(paths: &mut Vec<PathBuf>) {
+    use rayon::prelude::*;
+    #[cfg(unix)]
+    {
+        let mut keys: Vec<Vec<u8>> = std::mem::take(paths)
+            .into_par_iter()
+            .map(into_sort_key)
+            .collect();
+        keys.par_sort_unstable();
+        *paths = keys.into_par_iter().map(from_sort_key).collect();
+    }
+    #[cfg(not(unix))]
+    paths.par_sort_unstable();
+}
+
+/// A swept path's bytes as its `Path`-order sort key (see
+/// `sort_swept_paths`): the separator becomes NUL, in place.
+#[cfg(unix)]
+fn into_sort_key(p: PathBuf) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt;
+    swap_byte(p.into_os_string().into_vec(), b'/', 0)
+}
+
+/// The path an `into_sort_key` key came from, in the key's own buffer.
+#[cfg(unix)]
+fn from_sort_key(k: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(swap_byte(k, 0, b'/')))
+}
+
+#[cfg(unix)]
+fn swap_byte(mut b: Vec<u8>, from: u8, to: u8) -> Vec<u8> {
+    for c in b.iter_mut().filter(|c| **c == from) {
+        *c = to;
+    }
+    b
+}
+
 /// How the matcher will compare letters, for the index plan. -S always
 /// plans case-insensitively (a safe superset when the pattern's capitals
 /// make the search case-sensitive). Both engines fold with Unicode's
@@ -1437,6 +1762,60 @@ fn plan_case(args: &Args, pattern: &str, fixed: bool) -> plan::Case {
     } else {
         plan::Case::Unicode
     }
+}
+
+/// A content query's resolved patterns and index plan (`plan_query`).
+struct Query {
+    /// The patterns as one (`resolve_pattern`), and whether the matcher
+    /// takes it as a literal.
+    pattern: String,
+    fixed: bool,
+    /// No -E names an encoding other than UTF-8.
+    utf8_only: bool,
+    case: plan::Case,
+    plan: plan::Plan,
+}
+
+/// Resolve the patterns and choose the index plan, from the flags alone:
+/// nothing here reads the index, so the plan is known before it opens.
+/// Several modes must bypass trigram narrowing (each is sound, just scans
+/// more):
+///  -v        : a file with zero literal occurrences still "matches" all lines
+///  --passthru: non-matching lines of searched files must still print
+///  -c --include-zero : every walked file emits `path:0`
+///  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
+///  -P patterns may use pcre2-only syntax (parse failure means Plan::All)
+///  --pre     : the searched stream is a subprocess's output, not the
+///              file's bytes, so index trigrams can't narrow it.
+///  --files-without-match needs no special plan: narrowed-out files
+///    are listed from the universe without being searched
+fn plan_query(args: &Args) -> anyhow::Result<Query> {
+    let (pattern, fixed) = resolve_pattern(args);
+    let utf8_only = match &args.encoding {
+        Some(label) => {
+            grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?
+                == grep_searcher::Encoding::new("utf-8").unwrap()
+        }
+        None => true,
+    };
+    let case = plan_case(args, &pattern, fixed);
+    let plan = if args.invert_match
+        || args.passthru
+        || (args.count && args.include_zero)
+        || !utf8_only
+        || args.pre.is_some()
+    {
+        plan::Plan::All
+    } else {
+        plan::build(&pattern, fixed, case)
+    };
+    Ok(Query {
+        pattern,
+        fixed,
+        utf8_only,
+        case,
+        plan,
+    })
 }
 
 /// rg's nothing-searched warning: with no path operand, a walk that
@@ -1455,14 +1834,19 @@ fn report_nothing_searched() {
 /// live-scan escape hatch before the cache is ever consulted; the
 /// remaining filters (-g, -t/-T/--type-add/--type-clear, --ignore-file,
 /// --max-depth, --hidden, the glob slot) are pure functions of the path
-/// applied identically after either listing. Timestamp sorts need a live
-/// walk order and live metadata, so they bypass the cache.
+/// and the sweep's hidden flag, applied identically to either listing
+/// (inside the cached one, before any path is copied). Timestamp sorts
+/// need a live walk order and live metadata, so they bypass the cache.
 ///
 /// The cache's pruned walk always covers the whole tree, so a scoped
 /// listing (a path operand below the root, or the cwd scope of a
 /// subdirectory run) is cheaper through the index's scoped sweep, which
 /// walks only the operands: on a kernel-scale tree `--files` in `rust/`
-/// takes about 14 ms that way against 64 ms through the cache.
+/// takes about 14 ms that way, while the cache walks the whole tree.
+///
+/// A content query no trigram narrows searches the cache's listing under
+/// the same conditions (see `search_cached_listing`): the files it
+/// searches, and the order it prints them in, are the listing's.
 #[cfg(target_os = "macos")]
 fn listing_cache_eligible(args: &Args) -> bool {
     sort_is_path_order(args) && args.paths.iter().all(|p| p.as_os_str().is_empty())
@@ -1471,21 +1855,24 @@ fn listing_cache_eligible(args: &Args) -> bool {
 /// macOS-only fast listing via the dir-mtime cache (see dircache.rs):
 /// load the cached tree, verify the ignore-source fingerprint, run the
 /// pruned walk (zero-clone: cache-hit entries borrow the loaded tree),
-/// filter the result with `keep`, save the rebuilt tree if anything
-/// changed, and return the matching paths (unsorted; caller sorts).
+/// save the walked tree when some directory changed, and return the paths
+/// `keep` accepts, in path order. `keep` runs across the pool with one
+/// `init()` state per rayon job, and only the paths it keeps are copied.
 /// None = cache miss for any reason: caller falls back to the full
-/// freshness-sweep path. Filtering inside keeps the loaded tree's
-/// ownership local to this function.
+/// freshness-sweep path.
 #[cfg(target_os = "macos")]
-fn listing_via_cache<F>(
+fn listing_via_cache<S, I, F>(
     root: &Path,
     index_dir: &Path,
+    init: I,
     keep: F,
     timings: &mut Timings,
 ) -> Option<CachedListing>
 where
-    F: Fn(&crate::walk::FileMeta) -> bool + Sync,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, &crate::walk::FileMeta) -> bool + Sync + Send,
 {
+    use rayon::prelude::*;
     let t0 = std::time::Instant::now();
     let tree = crate::dircache::DirTree::load(index_dir)?;
     let t1 = std::time::Instant::now();
@@ -1496,55 +1883,160 @@ where
     if outcome.aborted {
         return None;
     }
-    let t_cmp = std::time::Instant::now();
-    let changed = outcome.tree != tree.root;
-    if std::env::var_os("GLEP_TIMING").is_some() {
-        eprintln!(
-            "glep timing: tree compare {:.1}ms ({changed})",
-            t_cmp.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    if changed {
+    let t_walk = std::time::Instant::now();
+    if let Some(walked) = outcome.tree {
         let updated = crate::dircache::DirTree {
             schema: crate::dircache::SCHEMA,
             fingerprint: tree.fingerprint.clone(),
-            root: outcome.tree,
+            root: walked,
         };
         let _ = updated.save(index_dir);
+        // The listing prints and the process exits right after: leave the
+        // copy to the exit (see the cache branch in `run`).
+        std::mem::forget(updated);
     }
-    use rayon::prelude::*;
+    let t_save = std::time::Instant::now();
     // Parallel filter: 86k globset matches on a kernel-scale tree cost
-    // ~15ms serial, ~2ms across the pool. Only the kept paths are cloned,
-    // split by the sweep's hidden flag like the index's live_files_split.
-    let (hidden, plain): (Vec<PathBuf>, Vec<PathBuf>) = outcome
+    // ~15ms serial, ~2ms across the pool. Only the kept paths are copied,
+    // straight into their sort keys.
+    let mut keys: Vec<Vec<u8>> = outcome
         .files
         .par_iter()
-        .filter(|m| keep(m))
-        .map(|m| (m.hidden, m.path.clone()))
-        .partition_map(|(h, p)| {
-            if h {
-                rayon::iter::Either::Left(p)
-            } else {
-                rayon::iter::Either::Right(p)
-            }
-        });
+        .map_init(&init, |state, m| {
+            keep(state, m).then(|| into_sort_key(m.path.clone()))
+        })
+        .filter_map(std::convert::identity)
+        .collect();
+    let t_filter = std::time::Instant::now();
+    keys.par_sort_unstable();
+    let files: Vec<PathBuf> = keys.into_par_iter().map(from_sort_key).collect();
+    // The entries borrow `tree`, which the caller leaves to the exit too.
+    std::mem::forget(outcome.files);
     timings.stage("listing_cache_walk");
     if std::env::var_os("GLEP_TIMING").is_some() {
+        let ms = |a: std::time::Instant, b: std::time::Instant| {
+            b.duration_since(a).as_secs_f64() * 1000.0
+        };
         eprintln!(
-            "glep timing: cache load {:.1}ms, pruned walk+filter {:.1}ms",
-            t1.duration_since(t0).as_secs_f64() * 1000.0,
-            t1.elapsed().as_secs_f64() * 1000.0
+            "glep timing: cache load {:.1}ms, pruned walk {:.1}ms, save {:.1}ms, filter {:.1}ms, sort {:.1}ms",
+            ms(t0, t1),
+            ms(t1, t_walk),
+            ms(t_walk, t_save),
+            ms(t_save, t_filter),
+            ms(t_filter, std::time::Instant::now())
         );
     }
-    Some(CachedListing { plain, hidden })
+    Some(CachedListing { files, tree })
 }
 
-/// A listing served by the dir-mtime cache: the kept paths split by the
-/// hidden flag (unsorted).
+/// The listing cache's file set for a run whose every operand is the root
+/// (`listing_cache_eligible`), in path order, once per operand (rg lists
+/// a root named twice twice). rg's filters for the root (-g/--iglob,
+/// -t/-T, --ignore-file, --max-depth and the hidden rule, as
+/// `Filters::select` applies them) and `glob`, the --files glob, all apply
+/// inside the listing, before any path is copied: each rayon job filters
+/// with its own copy of the scope's filters, whose verdict caches are per
+/// copy. None on a cache miss.
+#[cfg(target_os = "macos")]
+fn cached_root_listing(
+    root: &Path,
+    cwd_rel: &Path,
+    scope: &mut Scope,
+    glob: Option<globset::GlobMatcher>,
+    timings: &mut Timings,
+) -> Option<CachedListing> {
+    scope.filters.begin_operand(Path::new(""));
+    let rescue = scope.filters.may_keep_hidden(Path::new(""));
+    let template = &scope.filters;
+    let keep = |flt: &mut filters::Filters, m: &crate::walk::FileMeta| -> bool {
+        (rescue || !m.hidden)
+            && glob
+                .as_ref()
+                .is_none_or(|g| g.is_match(&*search::display_rel(&m.path, cwd_rel)))
+            && flt.keep(&m.path, m.hidden)
+    };
+    let mut listing =
+        listing_via_cache(root, &root.join(".glep"), || template.fork(), keep, timings)?;
+    if scope.operands.len() > 1 {
+        let once = listing.files.clone();
+        for _ in 1..scope.operands.len() {
+            listing.files.extend_from_slice(&once);
+        }
+    }
+    Some(listing)
+}
+
+/// A root-wide content query whose plan no trigram narrows (Plan::All; see
+/// `run` for when it comes here), searched over the listing cache's file
+/// set. The index would hand back every file it holds, after the full
+/// freshness sweep that makes sure of them; the cache lists the same set
+/// (its listings are the index's, as --files compares them), filtered as
+/// the scope selects from the index's (`cached_root_listing`). glep's
+/// --max-filesize only caps what the index stores, so no file is left out
+/// for its size. Every listed file is searched, binary ones included, as
+/// `run_live` searches its walk: the searcher's binary detection decides
+/// what they print, and no content flag of the index is read that could
+/// be stale. Nothing here opens, sweeps or writes the index, so its
+/// manifest and sweep epoch stay as they were and the next narrowed query
+/// sweeps as before. None on a cache miss, before anything is printed.
+#[cfg(target_os = "macos")]
+fn search_cached_listing(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    query: &Query,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<Option<i32>> {
+    let Some(CachedListing { mut files, tree }) =
+        cached_root_listing(root, cwd_rel, scope, None, timings)
+    else {
+        return Ok(None);
+    };
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    timings.stage("candidates");
+    // Nothing narrowed the selection, so an empty one searched nothing.
+    let nothing_searched = scope.implicit && files.is_empty();
+    if nothing_searched {
+        report_nothing_searched();
+    }
+    let mut opts = search_opts(args, cwd_rel);
+    opts.fixed = query.fixed;
+    let mut out = search::StdoutOut;
+    let found = search::run(&query.pattern, root, &files, None, &opts, &mut out)?;
+    timings.stage("search");
+    timings.finish();
+    // The process exits right after this returns: the file list and the
+    // loaded tree are left to the exit, as in the --files cache branch.
+    std::mem::forget(files);
+    std::mem::forget(tree);
+    Ok(Some(exit_code(args, had_error || nothing_searched, found)))
+}
+
+/// Debug builds only, for tests: when the environment variable `var`
+/// names a directory, create `reached` in it, then wait (a minute at
+/// most) until `resume` appears there, so a test can change the tree at
+/// that exact point of a run.
+#[cfg(all(target_os = "macos", debug_assertions))]
+fn test_pause(var: &str) {
+    let Some(dir) = std::env::var_os(var).map(PathBuf::from) else {
+        return;
+    };
+    let _ = std::fs::write(dir.join("reached"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A listing served by the dir-mtime cache: the kept paths in path order,
+/// and the loaded tree they were listed from, which the caller leaves to
+/// the process exit.
 #[cfg(target_os = "macos")]
 struct CachedListing {
-    plain: Vec<PathBuf>,
-    hidden: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    tree: crate::dircache::DirTree,
 }
 
 /// Every --type-add, --type-clear, -t and -T in command-line order (rg
@@ -1772,8 +2264,13 @@ pub fn run() -> anyhow::Result<i32> {
     messages::configure(!args.no_messages, !args.no_ignore_messages);
     if let Some(n) = args.threads {
         // Global rayon pool (sweeps, filters); the search pool reads
-        // SearchOpts::threads. A second init keeps the first (only ever
-        // happens under unit tests calling run() twice).
+        // SearchOpts::threads. Without -j the rayon pool keeps its
+        // one-per-core default rather than `search::default_threads`:
+        // directory sweeps and listing filters still scale past the
+        // performance cores (a kernel-tree --files listing measured about
+        // 4% slower at 5 threads than at 11 on an M3 Pro). A second init
+        // keeps the first (only ever happens under unit tests calling
+        // run() twice).
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global();
@@ -1981,6 +2478,9 @@ pub fn run() -> anyhow::Result<i32> {
     if subcommand {
         match args.pattern.as_deref() {
             Some("index") => {
+                if std::env::var_os("GLEP_BG").is_some() {
+                    return run_background_build(&root, args.max_filesize);
+                }
                 let idx = Index::build(&root, args.max_filesize)?;
                 eprintln!(
                     "glep: indexed {} files",
@@ -1990,7 +2490,8 @@ pub fn run() -> anyhow::Result<i32> {
             }
             Some("status") => {
                 let mut idx = Index::open_or_build(&root, args.max_filesize)?;
-                if !idx.read_only {
+                // A build just now swept the tree itself.
+                if !idx.read_only && !idx.swept_full() {
                     idx.update(args.max_filesize, 0)?;
                 }
                 let live = idx.manifest.live_entries().count();
@@ -2039,42 +2540,153 @@ pub fn run() -> anyhow::Result<i32> {
     // manifest, no postings, no freshness sweep, just the cache and the
     // pruned walk. The index opens below only on cache miss, and serves
     // every scoped listing (see `listing_cache_eligible`). The cache
-    // lives in the discovered index dir, so GLEP_INDEX_PATH shares it;
-    // every filter applies after the listing.
+    // lives in the discovered index dir, so GLEP_INDEX_PATH shares it.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
-        // The --files glob applies inside the listing (only its matches
-        // are cloned and sorted).
-        let glob_matcher = files_glob(&args)?;
-        let glob_cwd = cwd_rel.clone();
-        let keep = move |m: &crate::walk::FileMeta| -> bool {
-            match &glob_matcher {
-                Some(g) => g.is_match(&*search::display_rel(&m.path, &glob_cwd)),
-                None => true,
-            }
-        };
-        if let Some(listing) = listing_via_cache(&root, &root.join(".glep"), keep, &mut timings) {
-            use rayon::prelude::*;
-            let CachedListing {
-                mut plain,
-                mut hidden,
-            } = listing;
-            if args.hidden {
-                plain.append(&mut hidden);
-            }
-            // Path order: the scope groups operands from it.
-            plain.par_sort();
-            hidden.sort();
-            let mut files = scope.select(plain, hidden);
+        let glob = files_glob(&args)?;
+        if let Some(listing) = cached_root_listing(&root, &cwd_rel, &mut scope, glob, &mut timings)
+        {
+            let CachedListing { mut files, tree } = listing;
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
             timings.finish();
-            return Ok(exit_code(&args, had_error, !files.is_empty()));
+            let code = exit_code(&args, had_error, !files.is_empty());
+            // The run returns right here and the process exits: the
+            // listing and the loaded tree (about 100k allocations on a
+            // kernel-scale tree) are left to the exit instead of being
+            // freed one by one. Nothing may use them, or run at all,
+            // between this and the return.
+            std::mem::forget(files);
+            std::mem::forget(tree);
+            return Ok(code);
         }
     }
 
-    let mut idx = match Index::open_or_build(&root, args.max_filesize) {
+    // A scoped listing (every directory operand below the root, spelled as
+    // plain names: no `..`, nothing absolute outside the tree) lists
+    // straight from a live sweep of its operands, without the index; see
+    // `list_scoped`. A root-wide listing never gets here with operands
+    // like these: its only operand is the root itself.
+    if args.files {
+        if let Some(prefixes) = scope.dir_prefixes() {
+            if prefixes.iter().all(|p| names_below_root(p)) {
+                return list_scoped(
+                    &root,
+                    &cwd_rel,
+                    &args,
+                    &mut scope,
+                    &prefixes,
+                    &mut timings,
+                    had_error,
+                );
+            }
+        }
+    }
+
+    // A content query resolves its patterns and chooses its index plan
+    // now, before the index opens: none of that reads the index. A plan no
+    // trigram narrows (Plan::All) gets nothing from the index but its file
+    // set, which a full freshness sweep has to refresh first. A root-wide
+    // one on macOS searches the listing cache's file set instead, which
+    // the cache's pruned walk lists for a fraction of that sweep (see
+    // `search_cached_listing`), unless --ttl is given: within its window
+    // the index answers without a sweep, faster still. On a cache miss the
+    // index answers as before. On a tree with no index yet the query
+    // searches a live walk, as --no-index does, and builds nothing: the
+    // first narrowed query builds the index.
+    let query = if args.files {
+        None
+    } else {
+        Some(plan_query(&args)?)
+    };
+    if let Some(q) = &query {
+        timings.stage("plan");
+        if q.plan == plan::Plan::All {
+            #[cfg(target_os = "macos")]
+            if listing_cache_eligible(&args) && args.ttl == 0 {
+                if let Some(code) = search_cached_listing(
+                    &root,
+                    &cwd_rel,
+                    &args,
+                    &mut scope,
+                    q,
+                    &mut timings,
+                    had_error,
+                )? {
+                    return Ok(code);
+                }
+            }
+            if !root.join(".glep/manifest.bin").exists() {
+                return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
+            }
+        }
+    }
+
+    // A listing rebuilds the listing cache below from the sweep that
+    // builds or refreshes the index. That build stats directories after
+    // the sweep, so it trusts no mtime from about when the sweep starts
+    // on, and it records the ignore sources above the root as they stood
+    // before the sweep read them (see `dircache::build_from_listing`).
+    #[cfg(target_os = "macos")]
+    let cache_seed = args.files.then(|| {
+        (
+            std::time::SystemTime::now(),
+            crate::dircache::source_fingerprint(&root),
+        )
+    });
+
+    // First query on a tree with no index yet: one sweep measures it. A
+    // small tree builds its index inline from that same sweep. A bigger
+    // one is answered from the sweep alone, at full-scan cost, and its
+    // index is built afterwards by a detached low-priority child. The
+    // manifest is the build's last write, so queries that arrive
+    // meanwhile find none and take this path again, and the first query
+    // after the build opens the index. GLEP_SYNC_BUILD forces the inline
+    // build. Unix only: a Windows child inherits every inheritable
+    // handle, the parent's stdout pipe included, so a reader would wait
+    // for the whole build.
+    #[cfg(unix)]
+    let first_sweep = if std::env::var_os("GLEP_SYNC_BUILD").is_none()
+        && !root.join(".glep/manifest.bin").exists()
+    {
+        let swept = walk::sweep_unsorted(&root)?;
+        timings.stage("first_sweep");
+        let bytes: u64 = swept.iter().map(|m| m.size).sum();
+        let deferred = bytes > background_build_min_bytes();
+        if std::env::var_os("GLEP_TIMING").is_some() {
+            eprintln!(
+                "glep timing: unindexed tree {} files, {bytes} bytes ({} build)",
+                swept.len(),
+                if deferred { "background" } else { "inline" }
+            );
+        }
+        if deferred {
+            let result = run_from_sweep(
+                &root,
+                &cwd_rel,
+                &args,
+                &mut scope,
+                swept,
+                &mut timings,
+                had_error,
+            );
+            // The output is flushed by now: its reader never waits for the
+            // spawn, let alone the build. A failed query spawns it too, as
+            // an inline build ran before the search could fail.
+            spawn_background_build(&root, &cwd, args.max_filesize);
+            timings.stage("bg_spawn");
+            timings.finish();
+            return result;
+        }
+        Some(swept)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let first_sweep = None;
+
+    let mut idx = match Index::open_or_build_swept(&root, args.max_filesize, first_sweep) {
         Ok(idx) => idx,
         // Another glep is building the index right now (parallel first
         // queries on a new tree): answer with a live scan, as --no-index
@@ -2086,8 +2698,13 @@ pub fn run() -> anyhow::Result<i32> {
     };
     timings.stage("index_open");
     // Path filters scope the freshness sweep too: subtrees outside the
-    // filter can't produce results, so sweeping them is wasted work.
-    let extra = if args.paths.is_empty() {
+    // filter can't produce results, so sweeping them is wasted work. An
+    // index this process just built needs no sweep at all: the build's
+    // own sweep is the freshest there is (a later process starts with
+    // swept_full unset), and the manifest answers every operand.
+    let extra = if idx.swept_full() {
+        Vec::new()
+    } else if args.paths.is_empty() {
         idx.update_timed(args.max_filesize, args.ttl, &mut timings)?
     } else {
         idx.update_scoped(args.max_filesize, args.ttl, &args.paths, &mut timings)?
@@ -2124,13 +2741,16 @@ pub fn run() -> anyhow::Result<i32> {
         // pass can leave entries stale, and stale entries must never be
         // re-certified by current directory mtimes.
         #[cfg(target_os = "macos")]
-        {
+        if let Some((sweep_started, fingerprint)) = cache_seed {
             if idx.swept_full() && extra.is_empty() {
+                #[cfg(debug_assertions)]
+                test_pause("GLEP_TEST_PAUSE_BEFORE_DIRCACHE_BUILD");
                 let listing = idx.live_file_metas(true);
                 let tree = crate::dircache::build_from_listing(
                     &root,
                     &listing,
-                    crate::dircache::source_fingerprint(&root),
+                    fingerprint,
+                    sweep_started,
                 );
                 let _ = tree.save(&idx.dir);
             }
@@ -2138,38 +2758,18 @@ pub fn run() -> anyhow::Result<i32> {
         return Ok(exit_code(&args, had_error, !files.is_empty()));
     }
 
-    let (pattern, effective_fixed) = resolve_pattern(&args);
-
-    // Plan selection: several modes must bypass trigram narrowing
-    // (each is sound, just scans more):
-    //  -v        : a file with zero literal occurrences still "matches" all lines
-    //  --passthru: non-matching lines of searched files must still print
-    //  -c --include-zero : every walked file emits `path:0`
-    //  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
-    //  -P patterns may use pcre2-only syntax (parse failure means Plan::All)
-    //  --pre     : the searched stream is a subprocess's output, not the
-    //              file's bytes, so index trigrams can't narrow it.
-    //  --files-without-match needs no special plan: narrowed-out files
-    //    are listed from the universe without being searched
-    let utf8_only = match &args.encoding {
-        Some(label) => {
-            grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?
-                == grep_searcher::Encoding::new("utf-8").unwrap()
-        }
-        None => true,
+    // Every --files run returned above: this is the content query planned
+    // before the index opened.
+    let Some(Query {
+        pattern,
+        fixed: effective_fixed,
+        utf8_only,
+        case: plan_case,
+        plan: query_plan,
+    }) = query
+    else {
+        unreachable!("a content query is planned before the index opens");
     };
-    let plan_case = plan_case(&args, &pattern, effective_fixed);
-    let query_plan = if args.invert_match
-        || args.passthru
-        || (args.count && args.include_zero)
-        || !utf8_only
-        || args.pre.is_some()
-    {
-        crate::plan::Plan::All
-    } else {
-        plan::build(&pattern, effective_fixed, plan_case)
-    };
-    timings.stage("plan");
 
     // Binary-flagged files are candidates only when the mode can surface
     // them: -a/--binary, --null-data (NUL is a separator, not binary),
@@ -2287,5 +2887,202 @@ mod tests {
         );
         let abs = std::env::temp_dir();
         assert_eq!(root_relative(Path::new("a"), &abs), abs);
+    }
+
+    /// Paths with names that sort before the separator byte (`-`, `.`,
+    /// space, `!`), shared prefixes and, on Unix, non-UTF-8 bytes: the
+    /// swept-path sort gives `Path` order.
+    #[test]
+    fn swept_paths_sort_in_path_order() {
+        let mut paths: Vec<PathBuf> = [
+            "a/y.rs",
+            "a-b/x.rs",
+            "a.c/z.rs",
+            "a.rs",
+            "a",
+            "a b/c",
+            "a!/d",
+            "ab",
+            "a/b/c/d",
+            "a/b",
+            "a/b.c",
+            "a/b-c/e",
+            "a/b/c",
+            "z",
+            ".hidden/x",
+            ".a",
+            "-",
+            "a/.b",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            for raw in [&b"a/\xff/x"[..], b"a\xfe", b"\xc3\xa9/b", b"e/\x01"] {
+                paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(raw)));
+            }
+        }
+        let mut expected = paths.clone();
+        expected.sort();
+        for rotate in 0..paths.len() {
+            let mut v = paths.clone();
+            v.rotate_left(rotate);
+            v.reverse();
+            sort_swept_paths(&mut v);
+            assert_eq!(v, expected);
+        }
+    }
+
+    /// `--files '**'` filters nothing, which `files_glob` relies on to
+    /// skip it: the glob it builds (`**/**`) matches every path, dotted,
+    /// with a newline or non-UTF-8 bytes, at any depth, either case mode.
+    #[test]
+    fn match_all_glob_matches_every_path() {
+        let mut paths: Vec<PathBuf> = ["a", ".a", "a/b/c", "a\nb", "-x", ".git/x", "a b/.c d"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(b"\xff/\xfe.c")));
+        }
+        for icase in [false, true] {
+            let g = build_glob_icase("**", icase).unwrap();
+            for p in &paths {
+                assert!(g.is_match(p), "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefixes_with_files_compares_whole_names() {
+        let meta = |p: &str| walk::FileMeta {
+            path: PathBuf::from(p),
+            mtime_ns: 0,
+            size: 0,
+            hidden: false,
+        };
+        let metas = [meta("src/a.rs"), meta("srcx/b.rs"), meta("src2/c/d")];
+        let prefixes: Vec<PathBuf> = ["src", "srcx", "sr", "src/a.rs", "src2/c", "nope", "src"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            prefixes_with_files(&metas, &prefixes),
+            [true, true, false, true, true, false, true]
+        );
+        assert_eq!(prefixes_with_files(&[], &prefixes), [false; 7]);
+    }
+
+    /// Windows takes either separator in operands and swept paths alike.
+    #[cfg(windows)]
+    #[test]
+    fn prefixes_with_files_takes_either_separator_on_windows() {
+        let meta = |p: &str| walk::FileMeta {
+            path: PathBuf::from(p),
+            mtime_ns: 0,
+            size: 0,
+            hidden: false,
+        };
+        let metas = [meta("src\\a.rs"), meta("srcx\\b.rs"), meta("src2\\c\\d")];
+        let prefixes: Vec<PathBuf> = ["src", "src2/c", "src2\\c", "sr", "src\\a.rs"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            prefixes_with_files(&metas, &prefixes),
+            [true, true, true, false, true]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bg_build_min_bytes_parses_like_max_filesize() {
+        assert_eq!(parse_bg_build_min_bytes(None), 64 * 1024 * 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some("0")), 0);
+        assert_eq!(parse_bg_build_min_bytes(Some("4096")), 4096);
+        assert_eq!(parse_bg_build_min_bytes(Some("1K")), 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some(" 2M ")), 2 * 1024 * 1024);
+        assert_eq!(parse_bg_build_min_bytes(Some("1G")), 1 << 30);
+        for junk in ["", "junk", "-1", "1.5M", "64MB"] {
+            assert_eq!(
+                parse_bg_build_min_bytes(Some(junk)),
+                BG_BUILD_MIN_BYTES,
+                "{junk:?}"
+            );
+        }
+    }
+
+    /// `args` parsed as `run` parses them, patterns resolved.
+    fn parsed(args: &[&str]) -> Args {
+        use clap::FromArgMatches;
+        let matches = command()
+            .try_get_matches_from(std::iter::once("glep").chain(args.iter().copied()))
+            .unwrap();
+        let mut a = Args::from_arg_matches(&matches).unwrap();
+        resolve_flag_families(&mut a, &matches).unwrap();
+        a.pattern_set = pattern_list(&a).unwrap();
+        a
+    }
+
+    /// The plan comes from the flags and patterns alone, so `run` knows
+    /// it before the index opens: no trigram narrows a letter, a
+    /// two-letter literal, `.*`, `\w+` or `[0-9]{2}`, nor any pattern
+    /// under -v, --passthru, -c --include-zero, a non-UTF-8 -E or --pre,
+    /// nor an alternation with such an arm. A three-letter literal
+    /// narrows, also under -c, -l, --files-without-match, -i and -E
+    /// utf-8.
+    #[test]
+    fn plan_query_decides_from_the_flags_alone() {
+        for args in [
+            &["q"][..],
+            &["-c", "ab"],
+            &["-c", ".*"],
+            &["\\w+"],
+            &["-c", "[0-9]{2}"],
+            &["--files-without-match", ".*"],
+            &["-v", "-c", "hello"],
+            &["--passthru", "hello"],
+            &["-c", "--include-zero", "hello"],
+            &["-E", "utf-16le", "hello"],
+            &["--pre", "cat", "hello"],
+            &["-e", "hello", "-e", "q"],
+        ] {
+            let q = plan_query(&parsed(args)).unwrap();
+            assert_eq!(q.plan, plan::Plan::All, "{args:?}");
+        }
+        for args in [
+            &["hello"][..],
+            &["-c", "hello"],
+            &["-l", "hello"],
+            &["--files-without-match", "hello"],
+            &["-i", "HELLO"],
+            &["-E", "utf-8", "hello"],
+            &["-e", "hello", "-e", "world"],
+        ] {
+            let q = plan_query(&parsed(args)).unwrap();
+            assert!(matches!(q.plan, plan::Plan::Groups(_)), "{args:?}");
+        }
+        let q = plan_query(&parsed(&["-F", "a.b"])).unwrap();
+        assert!(q.fixed && q.utf8_only && q.pattern == "a.b");
+        assert_eq!(q.case, plan::Case::Sensitive);
+        let q = plan_query(&parsed(&["-F", "-i", "-e", "a.b", "-e", "c"])).unwrap();
+        assert!(!q.fixed, "a union of literals is a regex");
+        assert_eq!(q.case, plan::Case::Unicode);
+        let q = plan_query(&parsed(&["-E", "utf-16le", "x"])).unwrap();
+        assert!(!q.utf8_only);
+    }
+
+    #[test]
+    fn names_below_root_takes_plain_names_only() {
+        for p in ["src", "src/deep", ".github/workflows", "a b"] {
+            assert!(names_below_root(Path::new(p)), "{p}");
+        }
+        for p in ["", "..", "../x", "/abs", "./src"] {
+            assert!(!names_below_root(Path::new(p)), "{p}");
+        }
     }
 }

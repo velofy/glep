@@ -150,6 +150,23 @@ fn glep_out(dir: &Path, args: &[&str]) -> (String, i32) {
     )
 }
 
+/// `glep_out` with GLEP_SYNC_BUILD set: a first query on the tree builds
+/// the index inline, whatever GLEP_BG_BUILD_MIN_BYTES says, for tests
+/// that read the index (or the listing cache) right after it.
+fn glep_out_sync(dir: &Path, args: &[&str]) -> (String, i32) {
+    let out = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(dir)
+        .env("GLEP_SYNC_BUILD", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 fn rg_out(dir: &Path, args: &[&str]) -> (String, i32) {
     let out = std::process::Command::new("rg")
         .current_dir(dir)
@@ -556,6 +573,156 @@ fn check_cases(dir: &Path, label: &str, cases: &[&[&str]]) {
         let (r, rc) = rg_out(dir, args);
         assert_eq!(g, r, "{label}: stdout diverged for {:?}", args);
         assert_eq!(gc, rc, "{label}: exit code diverged for {:?}", args);
+    }
+}
+
+/// `pool_corpus()` plus WIDE_FILES files over 16 directories, a third of
+/// them carrying `hello`: enough candidates that every worker of the
+/// widest pool gets files and the in-order printer's window wraps.
+const WIDE_FILES: usize = 256;
+
+fn wide_pool_corpus() -> tempfile::TempDir {
+    let dir = pool_corpus();
+    for i in 0..WIDE_FILES {
+        let p = dir.path().join(format!("wide/d{:02}/w{i:03}.txt", i % 16));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let body = match i % 3 {
+            0 => format!("hello wide {i}\nfoo {i} bar\n"),
+            1 => format!("no greeting {i}\nmatch {i} line\nbbb\n"),
+            _ => format!("x{i}\n"),
+        };
+        std::fs::write(&p, body).unwrap();
+    }
+    dir
+}
+
+/// glep in `dir` with GLEP_THREADS set to `threads`, or removed.
+fn glep_threads_cmd(dir: &Path, args: &[&str], threads: Option<&str>) -> Command {
+    let mut cmd = Command::cargo_bin("glep").unwrap();
+    cmd.current_dir(dir).args(args);
+    match threads {
+        Some(v) => cmd.env("GLEP_THREADS", v),
+        None => cmd.env_remove("GLEP_THREADS"),
+    };
+    cmd
+}
+
+/// A pool search's (candidate files, workers) from GLEP_TIMING; None
+/// when the search ran on the calling thread.
+fn pool_width(dir: &Path, args: &[&str], threads: Option<&str>) -> Option<(usize, usize)> {
+    let out = glep_threads_cmd(dir, args, threads)
+        .env("GLEP_TIMING", "1")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let rest = err
+        .lines()
+        .find_map(|l| l.strip_prefix("glep timing: search path pool ("))?
+        .to_string();
+    let mut nums = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.parse::<usize>().unwrap());
+    Some((nums.next()?, nums.next()?))
+}
+
+/// The worker count never shows in the output: the default width
+/// (`default_threads`: GLEP_THREADS, else the performance-core count on
+/// macOS, else one per core), GLEP_THREADS overrides, and explicit -j
+/// widths all print rg's exact bytes, searches and listings alike. -j
+/// above 0 beats GLEP_THREADS, which beats the platform default, and
+/// GLEP_THREADS=0 or garbage falls through to the default.
+#[test]
+fn worker_count_never_changes_output() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = wide_pool_corpus();
+    let d = dir.path();
+    let ap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let wide = (ap + 2).to_string();
+    let wide = wide.as_str();
+    // The candidate counts below are the index's narrowing.
+    assert_eq!(glep_out_sync(d, &["index"]).1, 0);
+
+    // The pool's width per variant, on a `hello` search.
+    let (n, default_w) = pool_width(d, &["hello"], None).expect("hello must take the pool path");
+    assert!((1..=ap).contains(&default_w), "default width {default_w}");
+    #[cfg(target_os = "macos")]
+    {
+        let perf = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&p| p >= 1);
+        assert_eq!(default_w, perf.map_or(ap, |p| p.min(ap)).min(n));
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(default_w, ap.min(n));
+    let widths: &[(&[&str], Option<&str>, usize)] = &[
+        (&["hello"], Some("3"), 3),
+        (&["hello"], Some(wide), ap + 2),
+        (&["hello"], Some("0"), default_w),
+        (&["hello"], Some("junk"), default_w),
+        (&["-j", "1", "hello"], None, 1),
+        (&["-j", "2", "hello"], Some("3"), 2),
+        (&["-j", "0", "hello"], Some("3"), 3),
+        (&["-j", "0", "hello"], None, default_w),
+    ];
+    for &(args, threads, want) in widths {
+        assert_eq!(
+            pool_width(d, args, threads),
+            Some((n, want.min(n))),
+            "GLEP_THREADS={threads:?} {args:?}"
+        );
+    }
+
+    // Every width prints rg's bytes.
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-c", "hello"],
+        &["-l", "foo"],
+        &["-c", ".*"],
+        &["-v", "-c", "a"],
+        &["-c", "[0-9]{2}"],
+        &["-C", "1", "match"],
+        &["--files"],
+        &["--files", "-g", "w0*.txt"],
+    ];
+    let variants: &[(Option<&str>, &[&str])] = &[
+        (None, &[]),
+        (Some("1"), &[]),
+        (Some("3"), &[]),
+        (Some(wide), &[]),
+        (Some("0"), &[]),
+        (Some("junk"), &[]),
+        (None, &["-j", "1"]),
+        (None, &["-j", "2"]),
+        (None, &["-j", "0"]),
+        (Some("3"), &["-j", "2"]),
+        (None, &["-j", wide]),
+    ];
+    for args in cases {
+        let (r, rc) = rg_out(d, args);
+        for &(threads, extra) in variants {
+            let full: Vec<&str> = extra.iter().chain(args.iter()).copied().collect();
+            let out = glep_threads_cmd(d, &full, threads).output().unwrap();
+            let g = String::from_utf8(out.stdout).unwrap();
+            let gc = out.status.code().unwrap_or(-1);
+            assert_eq!(
+                g, r,
+                "GLEP_THREADS={threads:?}: stdout diverged for {full:?}"
+            );
+            assert_eq!(
+                gc, rc,
+                "GLEP_THREADS={threads:?}: exit code diverged for {full:?}"
+            );
+        }
     }
 }
 
@@ -1118,46 +1285,49 @@ fn binary_files_match_rg() {
         eprintln!("parity: rg not installed, skipping");
         return;
     }
-    let cases: &[&[&str]] = &[
-        &["hello"],
-        &["-c", "hello"],
-        &["-c", "--include-zero", "hello"],
-        &["-c", "--include-zero", "zz_absent_zz"],
-        &["--count-matches", "hello"],
-        &["-l", "hello"],
-        &["--files-without-match", "hello"],
-        &["--files-without-match", "zz_absent_zz"],
-        &["--files-without-match", "-c", "zz_absent_zz"],
-        &["-c", "--files-without-match", "zz_absent_zz"],
-        &["-l", "--files-without-match", "hello"],
-        &["--files-without-match", "-l", "hello"],
-        &["-q", "late"],
-        &["late"],
-        &["-o", "hello"],
-        &["-m", "1", "hello"],
-        &["-A", "1", "hello"],
-        &["-v", "-c", "hello"],
-        &["-U", "hello"],
-        &["--no-mmap", "hello"],
-        &["-a", "hello"],
-        &["-a", "-c", "hello"],
-        &["-a", "--files-without-match", "zz_absent_zz"],
-        &["--binary", "hello"],
-        &["--binary", "-c", "hello"],
-        &["--binary", "--files-without-match", "zz_absent_zz"],
-        &["utf16token"],
-        &["-c", "utf16token"],
-        &["-l", "utf16"],
-        &["-E", "none", "hello"],
-        &["-E", "none", "-c", "hello"],
-        &["-E", "auto", "-c", "hello"],
-        &["--no-encoding", "-c", "hello"],
-    ];
+    let cases = BINARY_CASES;
     check_cases(binary_corpus(false).path(), "small", cases);
     let pool = binary_corpus(true);
     assert_eq!(search_path(pool.path(), &["hello"]), "pool");
     check_cases(pool.path(), "pool", cases);
 }
+
+/// `binary_corpus`'s cases: every search mode and binary-detection mode.
+const BINARY_CASES: &[&[&str]] = &[
+    &["hello"],
+    &["-c", "hello"],
+    &["-c", "--include-zero", "hello"],
+    &["-c", "--include-zero", "zz_absent_zz"],
+    &["--count-matches", "hello"],
+    &["-l", "hello"],
+    &["--files-without-match", "hello"],
+    &["--files-without-match", "zz_absent_zz"],
+    &["--files-without-match", "-c", "zz_absent_zz"],
+    &["-c", "--files-without-match", "zz_absent_zz"],
+    &["-l", "--files-without-match", "hello"],
+    &["--files-without-match", "-l", "hello"],
+    &["-q", "late"],
+    &["late"],
+    &["-o", "hello"],
+    &["-m", "1", "hello"],
+    &["-A", "1", "hello"],
+    &["-v", "-c", "hello"],
+    &["-U", "hello"],
+    &["--no-mmap", "hello"],
+    &["-a", "hello"],
+    &["-a", "-c", "hello"],
+    &["-a", "--files-without-match", "zz_absent_zz"],
+    &["--binary", "hello"],
+    &["--binary", "-c", "hello"],
+    &["--binary", "--files-without-match", "zz_absent_zz"],
+    &["utf16token"],
+    &["-c", "utf16token"],
+    &["-l", "utf16"],
+    &["-E", "none", "hello"],
+    &["-E", "none", "-c", "hello"],
+    &["-E", "auto", "-c", "hello"],
+    &["--no-encoding", "-c", "hello"],
+];
 
 /// rg's search modes (-l, --files-without-match, -c, --count-matches,
 /// --json) are last-wins: the later flag decides the output.
@@ -1775,7 +1945,7 @@ fn operands_the_index_cannot_serve_match_rg() {
 /// `--files` could be answered from it.
 fn warm_listing_cache(dir: &Path) {
     for _ in 0..2 {
-        let (_, code) = glep_out(dir, &["--files"]);
+        let (_, code) = glep_out_sync(dir, &["--files"]);
         assert_eq!(code, 0);
     }
     #[cfg(target_os = "macos")]
@@ -1935,6 +2105,10 @@ fn listing_cache_with_ancestor_dot_ignore() {
     check_cases(&inner, "cache edited", cases);
     #[cfg(target_os = "macos")]
     {
+        // The ancestor .ignore was just edited; the cache distrusts mtimes
+        // within two seconds of a sweep (dircache::RACY_SLACK), so wait
+        // that out before expecting a listing to be served from it.
+        std::thread::sleep(std::time::Duration::from_millis(2200));
         let cache = inner.join(".glep/dirtree.bin");
         let (_, code) = glep_out(&inner, &["--files"]);
         assert_eq!(code, 0);
@@ -2387,5 +2561,1130 @@ fn empty_matching_patterns_count_like_rg() {
         let g = shared(args, false);
         assert_eq!(g.len(), 3, "{args:?}: {g:?}");
         assert_eq!(g, shared(args, true), "stats diverged for {args:?}");
+    }
+}
+
+/// Files appended to after the index was built are searched to their
+/// end, as rg searches them, whatever size the index recorded: also
+/// under --ttl, which trusts the index without a freshness sweep. One
+/// file grows past the searcher's 64 KiB first buffer and one past
+/// glep's 1 MiB read buffer, and the search runs on the worker pool.
+#[test]
+fn files_appended_after_indexing_are_searched_whole() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    use std::io::Write;
+    let dir = pool_corpus();
+    let d = dir.path();
+    // The first search builds the index.
+    assert_eq!(glep_out(d, &["hello"]).1, 0);
+    let append = |rel: &str, extra: &[u8]| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.join(rel))
+            .unwrap()
+            .write_all(extra)
+            .unwrap();
+    };
+    let filler = |lines: usize| -> Vec<u8> {
+        (0..lines)
+            .flat_map(|i| format!("filler line {i}\n").into_bytes())
+            .collect()
+    };
+    append("pool/d0/f00.txt", b"hello appended\n");
+    let mut past_64k = filler(6_000);
+    past_64k.extend_from_slice(b"hello past the first buffer\n");
+    append("pool/d1/f01.txt", &past_64k);
+    let mut past_1m = filler(80_000);
+    past_1m.extend_from_slice(b"hello past the read buffer\n");
+    append("pool/d2/f02.txt", &past_1m);
+    assert_eq!(search_path(d, &["--ttl", "60", "hello"]), "pool");
+    // Every pattern hits these files before the append too, so a stale
+    // index (--ttl) still lists them as candidates.
+    for args in [
+        &["hello"][..],
+        &["-c", "hello"],
+        &["--count-matches", "hello"],
+        &["-B", "1", "hello"],
+    ] {
+        let (r, rc) = rg_out(d, args);
+        for ttl in [true, false] {
+            let mut full: Vec<&str> = if ttl { vec!["--ttl", "60"] } else { vec![] };
+            full.extend_from_slice(args);
+            let (g, gc) = glep_out(d, &full);
+            assert_eq!(g, r, "stdout diverged for {full:?}");
+            assert_eq!(gc, rc, "exit code diverged for {full:?}");
+        }
+    }
+}
+
+/// A tree for scoped listings. Unlike `corpus()`, nothing at its root is
+/// an `.ignore`, which would send every bulk sweep to the walker, so the
+/// operand-start sweep serves these listings: 40-odd sources over nested
+/// directories (names that sort around the separator: `a`, `a-b`, `a.c`,
+/// `a.rs`), ignored and hidden directories, a `!.github/` whitelist, a
+/// directory of ignored files only, one of symlinks only, an empty one,
+/// an `.ignore` inside one operand and one on the way to another.
+fn listing_corpus() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write = |rel: &str, body: &str| {
+        let p = d.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(".gitignore", "*.log\nbuild/\ndrivers/\n");
+    write("README.md", "readme\n");
+    for i in 0..POOL_FILES {
+        write(&format!("src/m{}/f{i:02}.rs", i % 5), "fn f() {}\n");
+    }
+    write("src/main.rs", "fn main() {}\n");
+    write("src/deep/util.rs", "pub fn u() {}\n");
+    write("src/deep/notes.txt", "notes\n");
+    write("src/deep/trace.log", "ignored\n");
+    write("src/.env", "hidden\n");
+    write("src/a/y.rs", "y\n");
+    write("src/a-b/x.rs", "x\n");
+    write("src/a.c/z.rs", "z\n");
+    write("src/a.rs", "a\n");
+    write("build/out.txt", "ignored dir\n");
+    write("build/sub/deeper.txt", "ignored dir\n");
+    write("drivers/net/eth.c", "ignored at the root\n");
+    write("drivers/net/wifi/w.c", "ignored at the root\n");
+    write(".hdir/top.txt", "hidden dir\n");
+    write(".hdir/sub/inner.txt", "hidden dir\n");
+    write(".hdir/sub/.dot.txt", "hidden twice\n");
+    write("wl/.gitignore", ".*\n!.gitignore\n!.github/\n");
+    write("wl/.github/workflows/ci.yml", "whitelisted\n");
+    write("wl/.secret/key.txt", "ignored dot dir\n");
+    write("wl/.dotfile", "ignored dotfile\n");
+    write("wl/plain.txt", "plain\n");
+    write("logs/a.log", "ignored\n");
+    write("logs/b.log", "ignored\n");
+    write("ign/.ignore", "skip.txt\n");
+    write("ign/skip.txt", "dot-ignored\n");
+    write("ign/keep.txt", "kept\n");
+    write("chain/.ignore", "x.txt\n");
+    write("chain/sub/x.txt", "dot-ignored from above\n");
+    write("chain/sub/y.txt", "kept\n");
+    std::fs::create_dir_all(d.join("empty")).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(d.join("links")).unwrap();
+        std::os::unix::fs::symlink("../src/deep", d.join("links/to_deep")).unwrap();
+        std::os::unix::fs::symlink("../README.md", d.join("links/to_readme")).unwrap();
+    }
+    dir
+}
+
+/// One listing run: stdout, stderr and exit code.
+type Listed = (String, String, i32);
+
+/// glep's `--files '**' OPERANDS` and `rg --files OPERANDS`, both with
+/// `flags`, in `cwd`. glep runs with GLEP_TIMING: the second value says
+/// whether the scoped sweep served the listing, and its timing lines are
+/// dropped from stderr. rg's `rg: ` message prefix reads as glep's, and
+/// `rg_line`, when given, maps each line of rg's stdout (for spellings
+/// glep prints relative to the cwd, see README).
+fn listings(
+    cwd: &Path,
+    flags: &[&str],
+    operands: &[&str],
+    rg_line: Option<fn(&str) -> String>,
+) -> (Listed, bool, Listed) {
+    let g = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(cwd)
+        .env("GLEP_TIMING", "1")
+        .args(flags)
+        .args(["--files", "**"])
+        .args(operands)
+        .output()
+        .unwrap();
+    let g_err = String::from_utf8_lossy(&g.stderr).into_owned();
+    let scoped = g_err
+        .lines()
+        .any(|l| l.starts_with("glep timing: scoped_sweep"));
+    let g_err: String = g_err
+        .lines()
+        .filter(|l| !l.starts_with("glep timing: "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let r = std::process::Command::new("rg")
+        .current_dir(cwd)
+        .args(["--sort", "path", "--no-require-git"])
+        .args(flags)
+        .arg("--files")
+        .args(operands)
+        .output()
+        .unwrap();
+    let r_out = String::from_utf8(r.stdout).unwrap();
+    let r_out: String = match rg_line {
+        Some(f) => r_out.lines().map(|l| format!("{}\n", f(l))).collect(),
+        None => r_out,
+    };
+    let r_err: String = String::from_utf8_lossy(&r.stderr)
+        .lines()
+        .map(|l| {
+            format!(
+                "{}\n",
+                l.strip_prefix("rg: ")
+                    .map_or(l.to_string(), |m| format!("glep: {m}"))
+            )
+        })
+        .collect();
+    (
+        (
+            String::from_utf8(g.stdout).unwrap(),
+            g_err,
+            g.status.code().unwrap_or(-1),
+        ),
+        scoped,
+        (r_out, r_err, r.status.code().unwrap_or(-1)),
+    )
+}
+
+/// Assert each (flags, operands) listing matches rg's and was served by
+/// the scoped sweep.
+fn check_scoped_listings(cwd: &Path, label: &str, cases: &[(&[&str], &[&str])]) {
+    for (flags, operands) in cases {
+        let (g, scoped, r) = listings(cwd, flags, operands, None);
+        assert_eq!(g, r, "{label}: {flags:?} --files {operands:?}");
+        assert!(
+            scoped,
+            "{label}: {flags:?} --files {operands:?} took the index path"
+        );
+    }
+}
+
+/// Scoped --files listings come from a live sweep that starts at each
+/// operand, never from the index (the tree stays unindexed), and print
+/// what rg prints: overlapping, repeated and file operands, operands rg
+/// walks itself (ignored, inside ignored or hidden directories, behind
+/// an ignore rule above them, symlinked, empty or holding ignored files
+/// only), `.ignore` files on the walker fallback, filters, sorts, and
+/// subdirectory runs.
+#[test]
+fn scoped_listings_from_the_sweep_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = listing_corpus();
+    let d = dir.path();
+    let none: &[&str] = &[];
+    let hidden: &[&str] = &["--hidden"];
+    let mut cases: Vec<(&[&str], &[&str])> = vec![
+        (none, &["src"]),
+        (none, &["src", "src"]),
+        (none, &["build"]),
+        (none, &["logs"]),
+        (&["-g", "*.log"], &["logs"]),
+        (&["-t", "rust"], &["logs"]),
+        (none, &["empty"]),
+        (none, &["ign"]),
+        (none, &["wl"]),
+        (hidden, &["wl"]),
+        (none, &[".hdir"]),
+        (hidden, &[".hdir"]),
+        (&["-g", "*.rs"], &["src"]),
+        (&["-g", "!m1"], &["src"]),
+        (&["-t", "rust"], &["src", "wl"]),
+        (&["--max-depth", "1"], &["src"]),
+        (&["--max-depth", "2"], &["src", "wl"]),
+        (&["--sortr", "path"], &["src", "wl"]),
+        (&["--sort", "modified"], &["src"]),
+        (&["-0"], &["src"]),
+        (none, &["src", "nope"]),
+    ];
+    #[cfg(unix)]
+    cases.extend_from_slice(&[
+        (none, &["src/deep"]),
+        (none, &["src", "src/deep"]),
+        (none, &["src/deep", "src"]),
+        (none, &["src/main.rs"]),
+        (none, &["README.md", "src/deep"]),
+        (none, &["build/sub"]),
+        (none, &["drivers/net"]),
+        (none, &[".hdir/sub"]),
+        (hidden, &[".hdir/sub"]),
+        (none, &["wl/.github"]),
+        (none, &["wl/.github/workflows"]),
+        (none, &["wl/.secret"]),
+        (hidden, &["wl/.secret"]),
+        (none, &["chain/sub"]),
+        (none, &["links"]),
+        (none, &["links/to_deep"]),
+        (&["-g", "!*.txt"], &["src/deep", "wl"]),
+        (&["--sort", "modified"], &["src/deep", "wl"]),
+        (&["--path-separator", "%"], &["src/deep"]),
+    ]);
+    check_scoped_listings(d, "scoped", &cases);
+    // None of that opened, built or wrote the index.
+    assert!(!d.join(".glep").exists());
+    #[cfg(unix)]
+    {
+        // `./src/` prints as `src/...` (cwd-relative, see README).
+        let (g, scoped, r) = listings(
+            d,
+            &[],
+            &["./src/"],
+            Some(|l| l.strip_prefix("./").unwrap_or(l).to_string()),
+        );
+        assert_eq!(g, r, "./src/");
+        assert!(scoped);
+        // A subdirectory run finds the tree's root by its index: build it
+        // (with a query trigrams narrow: one they cannot, like `-c fn`,
+        // builds no index), and the scoped listings below leave it
+        // untouched.
+        let (_, code) = glep_out_sync(d, &["-c", "fn f"]);
+        assert_eq!(code, 0);
+        let manifest = std::fs::read(d.join(".glep/manifest.bin")).unwrap();
+        // From a subdirectory: the cwd scope, operands below it and one
+        // beside it.
+        let sub = d.join("src");
+        check_scoped_listings(
+            &sub,
+            "src",
+            &[
+                (none, &[]),
+                (none, &["deep"]),
+                (none, &["../wl"]),
+                (hidden, &["a", "../wl"]),
+            ],
+        );
+        // The cwd inside an ignored and inside a hidden directory.
+        check_scoped_listings(&d.join("build"), "build", &[(none, &[]), (none, &["sub"])]);
+        check_scoped_listings(&d.join(".hdir"), ".hdir", &[(none, &[]), (hidden, &[])]);
+        check_scoped_listings(d, "indexed", &cases);
+        assert_eq!(
+            std::fs::read(d.join(".glep/manifest.bin")).unwrap(),
+            manifest
+        );
+        assert!(!d.join("src/.glep").exists());
+        // `..` from a subdirectory is the root: the index path, which
+        // prints cwd-relative paths (README).
+        let (g, scoped, r) = listings(
+            &sub,
+            &[],
+            &[".."],
+            Some(|l| l.strip_prefix("../src/").unwrap_or(l).to_string()),
+        );
+        assert_eq!(g, r, "..");
+        assert!(!scoped, "a root operand must take the index path");
+    }
+}
+
+/// An ignore rule above an operand that names the operand itself (here
+/// `net/` in drivers/.gitignore): rg walks the operand anyway, and the
+/// rule still applies below it.
+#[cfg(unix)]
+#[test]
+fn scoped_listings_under_a_rule_naming_the_operand_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write = |rel: &str| {
+        let p = d.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x\n").unwrap();
+    };
+    write("drivers/net/eth.c");
+    write("drivers/net/net/inner.c");
+    write("drivers/net/phy/p.c");
+    for i in 0..POOL_FILES {
+        write(&format!("drivers/gpu/g{}/f{i:02}.c", i % 3));
+    }
+    std::fs::write(d.join("drivers/.gitignore"), "net/\n").unwrap();
+    let none: &[&str] = &[];
+    check_scoped_listings(
+        d,
+        "net",
+        &[
+            (none, &["drivers/net"]),
+            (none, &["drivers/net/phy"]),
+            (none, &["drivers"]),
+            (none, &["drivers/gpu", "drivers/net"]),
+            (&["--max-depth", "1"], &["drivers/net"]),
+        ],
+    );
+    assert!(!d.join(".glep").exists());
+}
+
+/// glep in `dir` with every first query deferred to a background build
+/// (GLEP_BG_BUILD_MIN_BYTES=0, GLEP_SYNC_BUILD removed), GLEP_TIMING on
+/// and the builder's pid recorded in `pidfile`: (stdout, exit code,
+/// stderr).
+#[cfg(unix)]
+fn deferred(dir: &Path, args: &[&str], pidfile: &Path) -> (String, i32, String) {
+    let out = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(dir)
+        .env("GLEP_BG_BUILD_MIN_BYTES", "0")
+        .env_remove("GLEP_SYNC_BUILD")
+        .env("GLEP_TIMING", "1")
+        .env("GLEP_BG_PIDFILE", pidfile)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Take the index lock of `dir` the way a running build holds it: while
+/// the returned file stays open no build can start, so every query on an
+/// unindexed tree answers from its sweep.
+#[cfg(unix)]
+fn hold_index_lock(dir: &Path) -> std::fs::File {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir.join(".glep")).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".glep/lock"))
+        .unwrap();
+    f.lock_exclusive().unwrap();
+    f
+}
+
+/// Whether some process holds the index lock of `dir` (a build running).
+#[cfg(unix)]
+fn index_lock_held(dir: &Path) -> bool {
+    use fs2::FileExt;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(".glep/lock"))
+    else {
+        return false;
+    };
+    match f.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&f).unwrap();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Poll until `cond` holds, failing with `what` after `secs` seconds.
+#[cfg(unix)]
+fn wait_until(secs: u64, what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} after {secs} s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Wait for the background build of `dir` to finish: its manifest
+/// written and its lock released.
+#[cfg(unix)]
+fn wait_for_background_build(dir: &Path, secs: u64) {
+    wait_until(secs, "no finished background build", || {
+        dir.join(".glep/manifest.bin").exists() && !index_lock_held(dir)
+    });
+}
+
+/// The builder pid a deferred query recorded (GLEP_BG_PIDFILE).
+#[cfg(unix)]
+fn builder_pid(pidfile: &Path) -> u32 {
+    let text = std::fs::read_to_string(pidfile).unwrap();
+    text.trim().parse().unwrap()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `files` text files of about 44 KB over 20 directories, every 50th
+/// with a `needle_` line: a search of them takes milliseconds, a debug
+/// build of their index seconds.
+#[cfg(unix)]
+fn big_fixture(dir: &Path, files: usize) {
+    use std::fmt::Write;
+    for i in 0..files {
+        let sub = dir.join(format!("d{:02}", i % 20));
+        std::fs::create_dir_all(&sub).unwrap();
+        let mut body = String::with_capacity(48 * 1024);
+        for j in 0..1000 {
+            let (a, b, c) = ((i * 7 + j) % 97, (i * 13 + j * 3) % 101, j % 89);
+            writeln!(body, "line {j} of file {i}: alpha{a} beta{b} gamma{c}").unwrap();
+        }
+        if i % 50 == 0 {
+            writeln!(body, "the needle_{i} sits here").unwrap();
+        }
+        std::fs::write(sub.join(format!("f{i:03}.txt")), body).unwrap();
+    }
+}
+
+/// A first query on an unindexed tree too big to index inline answers
+/// from the sweep that measured the tree: rg's bytes and exit code for
+/// every case, on the small path and the worker pool, binary files, an
+/// ignored directory operand (walked live) and subdirectory runs
+/// included. A held index lock stands in for a running build, so every
+/// query takes that path and none spawns a builder or writes an index.
+#[cfg(unix)]
+#[test]
+fn first_queries_answer_from_the_sweep_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let pool = pool_corpus();
+    std::fs::write(pool.path().join(".gitignore"), "*.log\nbuilt/\n").unwrap();
+    std::fs::create_dir_all(pool.path().join("built")).unwrap();
+    std::fs::write(pool.path().join("built/out.txt"), "hello built\n").unwrap();
+    let extra: &[&[&str]] = &[
+        &["hello", "built"],
+        &["-l", "hello", "built", "src"],
+        &["hello", "src", "pool/d1"],
+        &["-c", "foo", "pool/d2", "README.md"],
+        &["--files", "-g", "*.rs"],
+        &["--files-without-match", "hello"],
+        &["--stats", "-c", "foo"],
+    ];
+    let corpora = [
+        ("small", corpus(), BASE_CASES),
+        ("pool", pool, BASE_CASES),
+        ("binary", binary_corpus(true), BINARY_CASES),
+    ];
+    for (label, dir, cases) in &corpora {
+        let d = dir.path();
+        let lock = hold_index_lock(d);
+        let (_, _, err) = deferred(d, &["hello"], &pidfile);
+        assert!(
+            err.contains("first_sweep")
+                && err.contains("(background build)")
+                && err.contains("bg_spawn")
+                && !err.contains("index_open"),
+            "{label}: {err}"
+        );
+        if *label != "small" {
+            assert!(err.contains("search path pool"), "{label}: {err}");
+        }
+        let extra = if *label == "pool" { extra } else { &[] };
+        for args in cases.iter().chain(extra) {
+            let (g, gc, _) = deferred(d, args, &pidfile);
+            let (r, rc) = rg_out(d, args);
+            if args.contains(&"--stats") {
+                // Timings differ; every counter matches.
+                let keep = |s: &str| -> String {
+                    s.lines()
+                        .filter(|l| !l.contains("seconds"))
+                        .map(|l| format!("{l}\n"))
+                        .collect()
+                };
+                assert_eq!(keep(&g), keep(&r), "{label}: stdout diverged for {args:?}");
+            } else {
+                assert_eq!(g, r, "{label}: stdout diverged for {args:?}");
+            }
+            assert_eq!(gc, rc, "{label}: exit code diverged for {args:?}");
+        }
+        if *label == "pool" {
+            let sub = d.join("pool");
+            for args in [&["hello"][..], &["-c", "foo"], &["hello", "../src"]] {
+                let (g, gc, err) = deferred(&sub, args, &pidfile);
+                assert!(err.contains("first_sweep"), "{err}");
+                assert_eq!((g, gc), rg_out(&sub, args), "pool/: {args:?}");
+            }
+        }
+        assert!(!d.join(".glep/manifest.bin").exists(), "{label}");
+        assert!(!pidfile.exists(), "{label}: spawned under a held lock");
+        drop(lock);
+    }
+}
+
+/// Queries no trigram narrows (Plan::All): a single letter, a two-letter
+/// literal, -v, --files-without-match and -c --include-zero over every
+/// file, --passthru, and a class repeat.
+const PLAN_ALL_CASES: &[&[&str]] = &[
+    &["q"],
+    &["-c", "ab"],
+    &["-v", "-c", "a"],
+    &["--files-without-match", ".*"],
+    &["-c", "--include-zero", "x"],
+    &["--passthru", "a"],
+    &["-c", "[0-9]{2}"],
+];
+
+/// One search run: stdout, stderr and exit code.
+type Searched = (String, String, i32);
+
+fn searched(out: std::process::Output) -> Searched {
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `rg_out`'s run, stdin from the null device, with its stderr.
+fn rg_searched(dir: &Path, args: &[&str]) -> Searched {
+    let out = std::process::Command::new("rg")
+        .current_dir(dir)
+        .args([
+            "-n",
+            "--no-heading",
+            "--color=never",
+            "--sort",
+            "path",
+            "--no-require-git",
+        ])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    searched(out)
+}
+
+/// A query no trigram narrows gets nothing from an index, so on a tree
+/// with none yet it searches a live walk, as --no-index does, and builds
+/// nothing: no inline build on a small tree, no background build on one
+/// above GLEP_BG_BUILD_MIN_BYTES. It prints rg's bytes on the worker
+/// pool, binary and empty files included, and the first narrowed query
+/// builds the index as before.
+#[test]
+fn plan_all_queries_on_an_unindexed_tree_build_nothing() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = pool_corpus();
+    let d = dir.path();
+    std::fs::write(d.join("pool/q.txt"), "q ab 12 x a\n").unwrap();
+    std::fs::write(d.join("pool/empty.txt"), "").unwrap();
+    assert_eq!(search_path(d, &["q"]), "pool");
+    for args in PLAN_ALL_CASES {
+        let out = Command::cargo_bin("glep")
+            .unwrap()
+            .current_dir(d)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(searched(out), rg_searched(d, args), "{args:?}");
+        assert!(!d.join(".glep").exists(), "{args:?} built an index");
+    }
+    #[cfg(unix)]
+    {
+        let aux = tempfile::tempdir().unwrap();
+        let pidfile = aux.path().join("pid");
+        for args in PLAN_ALL_CASES {
+            let (g, gc, err) = deferred(d, args, &pidfile);
+            let (r, _, rc) = rg_searched(d, args);
+            assert_eq!((g, gc), (r, rc), "{args:?}");
+            assert!(
+                err.contains("live_walk") && !err.contains("first_sweep"),
+                "{args:?}: {err}"
+            );
+        }
+        assert!(!pidfile.exists(), "a Plan::All query spawned a build");
+        assert!(!d.join(".glep").exists());
+    }
+    assert_eq!(glep_out_sync(d, &["hello"]), rg_out(d, &["hello"]));
+    assert!(
+        d.join(".glep/manifest.bin").exists(),
+        "the first narrowed query built no index"
+    );
+}
+
+/// The first query on an unindexed tree spawns the build and returns
+/// without it: the index appears with no further query, and the next
+/// query opens it and prints what rg prints.
+#[cfg(unix)]
+#[test]
+fn first_query_builds_the_index_in_the_background() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = pool_corpus();
+    let d = dir.path();
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let (r, rc) = rg_out(d, &["hello"]);
+    let (g, gc, err) = deferred(d, &["hello"], &pidfile);
+    assert_eq!((&g, gc), (&r, rc));
+    assert!(
+        err.contains("first_sweep")
+            && err.contains("bg_spawn")
+            && err.contains("search path pool")
+            && !err.contains("index_open"),
+        "{err}"
+    );
+    assert!(pidfile.exists(), "no builder spawned: {err}");
+    wait_for_background_build(d, 30);
+    let (g, gc, err) = deferred(d, &["hello"], &pidfile);
+    assert_eq!((&g, gc), (&r, rc));
+    assert!(
+        err.contains("index_open") && !err.contains("first_sweep"),
+        "{err}"
+    );
+    for args in [&["-l", "foo"][..], &["-c", "hello"], &["--files"]] {
+        let (g, gc, _) = deferred(d, args, &pidfile);
+        assert_eq!((g, gc), rg_out(d, args), "{args:?}");
+    }
+}
+
+/// A deferred first query never keeps its reader waiting for the build:
+/// `$(...)` and a pipe into `head -1` return while the builder still
+/// runs, since its stdio is the null device, not the query's pipes.
+#[cfg(unix)]
+#[test]
+fn first_query_output_never_waits_for_the_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    big_fixture(d, 600);
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let bin = assert_cmd::cargo::cargo_bin("glep");
+    // `$0` is glep in each script.
+    let sh = |script: &str| -> (String, std::time::Duration) {
+        let start = std::time::Instant::now();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg(&bin)
+            .current_dir(d)
+            .env("GLEP_BG_BUILD_MIN_BYTES", "0")
+            .env_remove("GLEP_SYNC_BUILD")
+            .env("GLEP_BG_PIDFILE", &pidfile)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let took = start.elapsed();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{script}: {err}");
+        (String::from_utf8(out.stdout).unwrap(), took)
+    };
+    let (all, took) = sh(r#"out=$("$0" needle_); printf '%s\n' "$out""#);
+    let pid = builder_pid(&pidfile);
+    assert!(
+        process_alive(pid),
+        "the build was over when $(...) returned"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "$(...) took {took:?}"
+    );
+    assert_eq!(all.lines().count(), 12, "{all}");
+    if have_rg() {
+        assert_eq!(all, rg_out(d, &["needle_"]).0);
+    }
+    let (first, took) = sh(r#""$0" needle_ | head -1"#);
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "| head -1 took {took:?}"
+    );
+    assert_eq!(first, "d00/f000.txt:1001:the needle_0 sits here\n");
+    // The tree goes away with this test: stop its builder (the second
+    // query found it holding the lock, or spawned one that lost the race).
+    kill_process(pid);
+    let last = builder_pid(&pidfile);
+    if last != pid {
+        kill_process(last);
+    }
+}
+
+/// A background build killed partway leaves no index, and leftovers of
+/// interrupted writes harm nothing: the next query prints the same as a
+/// live scan, from a fresh sweep, and spawns a new build, whose index the
+/// query after it opens.
+#[cfg(unix)]
+#[test]
+fn killed_background_build_is_redone_and_queries_stay_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    big_fixture(d, 200);
+    let aux = tempfile::tempdir().unwrap();
+    let pidfile = aux.path().join("pid");
+    let live = |args: &[&str]| -> (String, i32) {
+        let mut full = vec!["--no-index"];
+        full.extend_from_slice(args);
+        glep_out(d, &full)
+    };
+    let expected = live(&["needle_"]);
+    assert_eq!(expected.1, 0);
+    let (g, gc, err) = deferred(d, &["needle_"], &pidfile);
+    assert_eq!((g, gc), expected, "{err}");
+    let pid = builder_pid(&pidfile);
+    // Kill it once it holds the lock, mid-build: a debug build of this
+    // tree takes about a second, and the manifest is its last write.
+    wait_until(10, "the builder never took the lock", || index_lock_held(d));
+    kill_process(pid);
+    wait_until(10, "the killed builder kept the lock", || {
+        !index_lock_held(d)
+    });
+    assert!(
+        !d.join(".glep/manifest.bin").exists(),
+        "built before the kill"
+    );
+    // What a build killed while writing leaves: a postings file without
+    // its manifest, and a half-written manifest under its temp name.
+    std::fs::write(d.join(".glep/postings.bin"), b"torn").unwrap();
+    std::fs::write(d.join(".glep/manifest.tmp"), b"torn").unwrap();
+    std::fs::remove_file(&pidfile).unwrap();
+    let (g, gc, err) = deferred(d, &["needle_"], &pidfile);
+    assert_eq!((g, gc), expected, "{err}");
+    assert!(
+        err.contains("first_sweep") && err.contains("bg_spawn"),
+        "{err}"
+    );
+    assert!(pidfile.exists(), "no new builder: {err}");
+    wait_for_background_build(d, 60);
+    for args in [&["needle_"][..], &["-l", "needle_"], &["-c", "alpha5 beta"]] {
+        let (g, gc, err) = deferred(d, args, &pidfile);
+        assert_eq!((g, gc), live(args), "{args:?}: {err}");
+        assert!(
+            err.contains("index_open") && !err.contains("first_sweep"),
+            "{err}"
+        );
+    }
+}
+
+/// Where rg's reader stops searching a file under quit detection, with
+/// no context lines kept and the 64 KiB buffer it starts every search
+/// with: it fills the buffer whole (tripling it while no line ends in
+/// it) and searches the complete lines in it, and a fill that finds a NUL
+/// ends the search before anything in it is searched. Returns how many
+/// bytes were searched and the NUL's offset, if the search stopped at
+/// one. This is rg 15.0's reader; rg 15.1 and later search after any read
+/// that ends a line and read a file's first three bytes on their own.
+fn rg_reader_stop(data: &[u8]) -> (usize, Option<usize>) {
+    let mut cap = 64 * 1024;
+    let (mut start, mut end) = (0usize, 0usize);
+    loop {
+        if cap == end - start {
+            cap *= 3;
+        }
+        let k = (cap - (end - start)).min(data.len() - end);
+        if k == 0 {
+            return (data.len(), None);
+        }
+        if let Some(i) = data[end..end + k].iter().position(|&b| b == 0) {
+            return (start, Some(end + i));
+        }
+        end += k;
+        if end - start == cap {
+            if let Some(j) = data[start..end].iter().rposition(|&b| b == b'\n') {
+                start += j + 1;
+            }
+        }
+    }
+}
+
+/// `rg -n PATTERN` over one file as rg 15.0 prints it, for a literal
+/// PATTERN: every searched line holding it, then the binary warning when
+/// a NUL ended the search after a match.
+fn rg_15_0_lines(name: &str, data: &[u8], pattern: &[u8]) -> Vec<u8> {
+    let (searched, nul) = rg_reader_stop(data);
+    let mut out = Vec::new();
+    let mut matched = false;
+    for (i, line) in data[..searched]
+        .split_inclusive(|&b| b == b'\n')
+        .enumerate()
+    {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        if text.windows(pattern.len()).any(|w| w == pattern) {
+            matched = true;
+            out.extend_from_slice(format!("{name}:{}:", i + 1).as_bytes());
+            out.extend_from_slice(text);
+            out.push(b'\n');
+        }
+    }
+    if let (true, Some(at)) = (matched, nul) {
+        out.extend_from_slice(
+            format!(
+                "{name}: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset {at})\n"
+            )
+            .as_bytes(),
+        );
+    }
+    out
+}
+
+/// Whether the rg on PATH reads files the way rg 15.0 does
+/// (`rg_reader_stop`): it prints nothing from a binary file whose first
+/// line is one byte long, where rg 15.1 and later print that line.
+fn rg_reads_like_15_0() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("probe.bin"), b"a\nab\x00cd\n").unwrap();
+    let (out, code) = rg_out(dir.path(), &["a"]);
+    out.is_empty() && code == 1
+}
+
+/// Binary files whose NUL sits past the first 64 KiB, or behind a first
+/// line one or two bytes long, with lines one to eight bytes long and
+/// NULs on both sides of the buffer boundaries; plain text files to fill
+/// the worker pool; a UTF-16 and a UTF-8 file with a byte-order mark and
+/// a late NUL. No line is 64 KiB long: one that long would grow rg's
+/// buffer for every file it searches after it (see the README).
+fn late_nul_corpus() -> (tempfile::TempDir, Vec<(String, Vec<u8>)>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for len in [1usize, 2, 3, 4, 8] {
+        for nul in [
+            65_536usize,
+            65_537,
+            65_538,
+            65_539,
+            70_000,
+            131_071,
+            131_072,
+            140_000,
+        ] {
+            let mut d = if len == 1 {
+                b"\n".repeat(nul)
+            } else {
+                let mut line = vec![b'a'; len - 1];
+                line.push(b'\n');
+                let mut d = line.repeat(nul / len + 1);
+                d.truncate(nul);
+                d
+            };
+            d.push(0);
+            d.extend_from_slice(&b"a\n".repeat(100));
+            files.push((format!("l{len}_n{nul}.bin"), d));
+        }
+    }
+    let mut short_first = |name: &str, d: &[u8]| files.push((name.to_string(), d.to_vec()));
+    short_first("s1.bin", b"a\nab\x00cd\n");
+    short_first("s2.bin", b"a\n\x00\n");
+    short_first("s3.bin", b"\n\na\x00\n");
+    let mut s4 = b"a\n".to_vec();
+    s4.extend_from_slice(&b"ab\n".repeat(30_000));
+    s4.push(0);
+    short_first("s4.bin", &s4);
+    for i in 0..12 {
+        files.push((format!("t{i:02}.txt"), b"a\nb\nab\n".repeat(50 * (i + 1))));
+    }
+    let mut u16 = vec![0xFF, 0xFE];
+    for b in "a\n".repeat(40_000).bytes().chain(*b"\0a\n") {
+        u16.extend_from_slice(&[b, 0]);
+    }
+    files.push(("u16.bin".to_string(), u16));
+    let mut u8bom = vec![0xEF, 0xBB, 0xBF];
+    u8bom.extend_from_slice(&b"a\n".repeat(40_000));
+    u8bom.extend_from_slice(b"\0a\n");
+    files.push(("u8bom.bin".to_string(), u8bom));
+    for (name, d) in &files {
+        std::fs::write(dir.path().join(name), d).unwrap();
+    }
+    files.sort();
+    (dir, files)
+}
+
+/// Binary files stop where rg's reader stops, through the slice search,
+/// its reread of a file with a late NUL, `--no-mmap`'s reader, the worker
+/// pool, the small path, and with and without the index: `-n a` prints
+/// what `rg_reader_stop` says rg 15.0 prints. When the rg on PATH reads
+/// like rg 15.0, every mode also prints rg's bytes and exit code: the
+/// summary modes, `--stats`, context, `-m`, `-v`, `-E latin1` and the
+/// transcoded files among them. (rg 15.1 and later read differently
+/// here; see the README.)
+#[test]
+fn binary_files_stop_where_rgs_reader_stops() {
+    let (dir, files) = late_nul_corpus();
+    let d = dir.path();
+    let model: Vec<u8> = files
+        .iter()
+        .filter(|(name, _)| !name.starts_with('u'))
+        .flat_map(|(name, data)| rg_15_0_lines(name, data, b"a"))
+        .collect();
+    let bytes_out = |args: &[&str], sync: bool| -> (Vec<u8>, i32) {
+        let mut c = Command::cargo_bin("glep").unwrap();
+        c.current_dir(d).args(args);
+        if sync {
+            c.env("GLEP_SYNC_BUILD", "1");
+        }
+        let out = c.output().unwrap();
+        (out.stdout, out.status.code().unwrap_or(-1))
+    };
+    for extra in [&[][..], &["--no-mmap"], &["-j1"]] {
+        for index in [false, true] {
+            let mut args: Vec<&str> = vec!["-g", "!u*", "a"];
+            args.extend_from_slice(extra);
+            if !index {
+                args.insert(0, "--no-index");
+            }
+            let (out, code) = bytes_out(&args, true);
+            assert_eq!(code, 0, "{args:?}");
+            assert!(
+                out == model,
+                "{args:?}: {} lines printed, {} expected",
+                out.split(|&b| b == b'\n').count(),
+                model.split(|&b| b == b'\n').count()
+            );
+        }
+    }
+    // One file at a time, on the small path.
+    for (name, data) in files.iter().filter(|(n, _)| n.starts_with('s')) {
+        let want = rg_15_0_lines(name, data, b"a");
+        let (out, _) = bytes_out(&["--no-index", "-g", name, "a"], false);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&want),
+            "{name}"
+        );
+    }
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping the rg comparison");
+        return;
+    }
+    if !rg_reads_like_15_0() {
+        eprintln!("parity: rg reads like rg 15.1 or later here, skipping the rg comparison");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["a"],
+        &["-c", "a"],
+        &["--count-matches", "a"],
+        &["-l", "a"],
+        &["--files-without-match", "a"],
+        &["-q", "a"],
+        &["-B2", "a"],
+        &["-C3", "ab"],
+        &["-A1", "b"],
+        &["-m5", "a"],
+        &["-v", "b"],
+        &["-c", "-v", "a"],
+        &["--no-mmap", "a"],
+        &["-j1", "a"],
+        &["-B", "40000", "-c", "a"],
+        &["b"],
+        &["-l", "b"],
+        &["--files-without-match", "b"],
+        &["-E", "latin1", "a"],
+        &["-g", "l2_*", "a"],
+        &["-g", "s*", "a"],
+        &["-g", "u*", "a"],
+        &["-g", "u*", "-c", "a"],
+    ];
+    for args in cases {
+        let r = std::process::Command::new("rg")
+            .current_dir(d)
+            .args(["-n", "--no-heading", "--color=never", "--sort", "path"])
+            .args(*args)
+            .output()
+            .unwrap();
+        for index in [false, true] {
+            let mut a: Vec<&str> = args.to_vec();
+            if !index {
+                a.insert(0, "--no-index");
+            }
+            let (out, code) = bytes_out(&a, true);
+            assert!(
+                out == r.stdout,
+                "{a:?}: stdout diverged from rg ({} vs {} bytes)",
+                out.len(),
+                r.stdout.len()
+            );
+            assert_eq!(Some(code), r.status.code(), "{a:?}");
+        }
+    }
+    // The --stats counters both tools share.
+    for args in [
+        &["--stats", "-c", "a"][..],
+        &["--stats", "a"],
+        &["-E", "latin1", "-c", "--stats", "a"],
+    ] {
+        let counters = |out: &[u8]| -> Vec<String> {
+            String::from_utf8_lossy(out)
+                .lines()
+                .filter(|l| {
+                    l.ends_with(" matches")
+                        || l.ends_with(" matched lines")
+                        || l.ends_with(" files contained matches")
+                        || l.ends_with(" bytes searched")
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let r = std::process::Command::new("rg")
+            .current_dir(d)
+            .args(["-n", "--no-heading", "--color=never", "--sort", "path"])
+            .args(args)
+            .output()
+            .unwrap();
+        let (out, _) = bytes_out(&[&["--no-index"][..], args].concat(), true);
+        assert_eq!(counters(&out), counters(&r.stdout), "{args:?}");
+        assert_eq!(counters(&out).len(), 4, "{args:?}");
+    }
+}
+
+/// --files-without-match reads a file on past its first match, as rg's
+/// summary printer does, so a NUL after that match still squashes the
+/// file: it is not listed, yet it counts as a file without a match, so
+/// `-q --files-without-match` exits 0 on it. `-l` stops at the first
+/// match and lists it. rg 15.0 and 15.1 or later agree here.
+#[test]
+fn files_without_match_reads_past_the_first_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut late = b"match here\n".to_vec();
+    late.extend_from_slice(&b"plain line of text\n".repeat(4000));
+    late.extend_from_slice(b"\0tail\n");
+    std::fs::write(d.join("late.bin"), &late).unwrap();
+    let mut clean = b"match here\n".to_vec();
+    clean.extend_from_slice(&b"plain line of text\n".repeat(4000));
+    std::fs::write(d.join("clean.txt"), &clean).unwrap();
+    std::fs::write(d.join("none.txt"), "plain\n").unwrap();
+    let cases: &[(&[&str], &str, i32)] = &[
+        (&["--files-without-match", "match"], "none.txt\n", 0),
+        (
+            &["--files-without-match", "-g", "!none.txt", "match"],
+            "",
+            0,
+        ),
+        (
+            &["-q", "--files-without-match", "-g", "!none.txt", "match"],
+            "",
+            0,
+        ),
+        (
+            &["-q", "--files-without-match", "-g", "clean.txt", "match"],
+            "",
+            1,
+        ),
+        (&["-l", "match"], "clean.txt\nlate.bin\n", 0),
+        (&["-c", "match"], "clean.txt:1\n", 0),
+    ];
+    for &(args, want, code) in cases {
+        for index in [false, true] {
+            let mut a: Vec<&str> = args.to_vec();
+            if !index {
+                a.insert(0, "--no-index");
+            }
+            assert_eq!(glep_out_sync(d, &a), (want.to_string(), code), "{a:?}");
+        }
+        if have_rg() {
+            assert_eq!(rg_out(d, args), (want.to_string(), code), "rg {args:?}");
+        }
     }
 }

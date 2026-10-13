@@ -43,3 +43,10 @@ pub fn ignore_warning(msg: impl std::fmt::Display) {
         eprintln!("glep: {msg}");
     }
 }
+
+/// The operating system's own text for a missing path, as rg prints it:
+/// "No such file or directory (os error 2)" on Unix, "The system cannot
+/// find the file specified. (os error 2)" on Windows.
+pub fn not_found() -> std::io::Error {
+    std::io::Error::from_raw_os_error(2)
+}

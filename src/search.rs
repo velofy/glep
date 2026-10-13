@@ -98,7 +98,7 @@ pub struct SearchOpts {
     /// once in cli (format parsed, {host} from --hostname-bin or the
     /// platform). Like rg, links are only written when color is on.
     pub hyperlink: Option<grep_printer::HyperlinkConfig>,
-    /// Worker thread count (rg -j); None or 0 means one per core.
+    /// Worker thread count (rg -j); None or 0 means `default_threads()`.
     pub threads: Option<usize>,
     /// -r: rewrite matched text in output lines (capture refs like $1
     /// resolve; byte-level, applied by the printer).
@@ -113,8 +113,10 @@ pub struct SearchOpts {
     /// --crlf: `\r\n` line terminators (matcher crlf mode plus the
     /// searcher's CRLF line terminator, like rg). --null-data overrides it.
     pub crlf: bool,
-    /// --no-mmap: read every file through the searcher's buffer instead of
-    /// searching a memory map (glep maps by default; --mmap is a no-op).
+    /// --no-mmap: stream every file through the searcher's line buffer
+    /// instead of searching it as one slice (by default glep reads a file
+    /// whole into a reused buffer, or maps one over MAP_THRESHOLD; --mmap
+    /// is a no-op).
     pub no_mmap: bool,
     /// Path operands that name files (root-relative). Like rg, they are
     /// searched with --binary's detection (binary data is reported, not
@@ -246,6 +248,72 @@ impl Default for SearchOpts {
 /// pool and the in-order printer thread. Tests that want the pool path
 /// use a corpus larger than this.
 pub const SMALL_WORKLOAD: usize = 32;
+
+/// The search pool's width when -j is not given (or is 0). The rayon
+/// global pool (sweeps, listing filters) keeps one thread per core: see
+/// `cli::run`.
+///
+/// 1. `GLEP_THREADS`, a count above 0, wins: the A/B knob and escape
+///    hatch (0 or anything unparsable falls through).
+/// 2. macOS: the performance-core count (`hw.perflevel0.physicalcpu`),
+///    at most available_parallelism. A full scan is mostly kernel open,
+///    read and page-fault work whose lock contention grows faster than
+///    the thread count: on an M3 Pro (5 performance plus 6 efficiency
+///    cores) a kernel-tree full scan at 5 workers spends about a quarter
+///    of the system time it spends at 11 and finishes in 40 to 60% of the
+///    wall time. The knee sits at the performance-core count; efficiency
+///    cores add contention, not throughput.
+/// 3. Everywhere else (no perflevel sysctl: Intel Macs, Linux, Windows):
+///    available_parallelism, 4 if unknown.
+pub fn default_threads() -> usize {
+    let ap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    pick_threads(
+        std::env::var_os("GLEP_THREADS").as_deref(),
+        performance_cores(),
+        ap,
+    )
+}
+
+/// `default_threads`'s rule over its inputs: the GLEP_THREADS value, the
+/// performance-core count, and available_parallelism.
+fn pick_threads(env: Option<&std::ffi::OsStr>, perf_cores: Option<usize>, ap: usize) -> usize {
+    let forced = env
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    match (forced, perf_cores) {
+        (Some(n), _) => n,
+        (None, Some(p)) if p >= 1 => p.min(ap),
+        _ => ap,
+    }
+}
+
+/// The performance-core count, `hw.perflevel0.physicalcpu`; None when
+/// the sysctl is missing (Intel Macs) or reads below 1.
+#[cfg(target_os = "macos")]
+fn performance_cores() -> Option<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is a NUL-terminated C string, `value` is a c_int
+    // and `len` holds its size, and nothing is written (null new value).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value >= 1).then_some(value as usize)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_cores() -> Option<usize> {
+    None
+}
 
 // --- rg-compatible --json closing `summary` event -------------------------
 //
@@ -411,13 +479,28 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     Ok(b.build(pattern)?)
 }
 
-/// Stops at the first match (-q, -l, --files-without-match).
-#[derive(Default)]
+/// Whether a file matches, for -q, -l and --files-without-match. Like
+/// rg's summary printer, -q and -l stop at the first match, while
+/// --files-without-match (with or without -q) reads on to the end of the
+/// file (or to -m's limit): a NUL anywhere it reads still squashes the
+/// file, matches before it or not.
 struct FoundSink {
     found: bool,
+    /// Stop at the first match.
+    quit_early: bool,
     /// Binary data seen under quit detection; rg's summary printer then
     /// squashes the file's record (see `FileResult::squashed`).
     binary_quit: bool,
+}
+
+impl FoundSink {
+    fn new(opts: &SearchOpts) -> FoundSink {
+        FoundSink {
+            found: false,
+            quit_early: !opts.files_without_match,
+            binary_quit: false,
+        }
+    }
 }
 
 impl grep_searcher::Sink for FoundSink {
@@ -428,7 +511,7 @@ impl grep_searcher::Sink for FoundSink {
         _: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
         self.found = true;
-        Ok(false) // stop at first match
+        Ok(!self.quit_early)
     }
     fn binary_data(
         &mut self,
@@ -661,7 +744,7 @@ pub(crate) fn color_specs(user: &[String]) -> grep_printer::ColorSpecs {
     grep_printer::ColorSpecs::new(&all)
 }
 
-/// Per-thread search state: one `Searcher` (and one configured printer
+/// Per-thread search state: the searchers (and one configured printer
 /// builder) reused across every file this worker touches.
 /// `grep_searcher::Searcher` holds its decode/line buffers in RefCells
 /// precisely so a single instance can be reused across files; rebuilding it
@@ -669,7 +752,7 @@ pub(crate) fn color_specs(user: &[String]) -> grep_printer::ColorSpecs {
 /// buffers per file. ripgrep itself clones one SearchWorker per walker
 /// thread and reuses it for the whole run.
 struct WorkerState {
-    searcher: Searcher,
+    searcher: Searchers,
     printer: grep_printer::StandardBuilder,
     /// Path rendering for the summary-style modes (-l/-c).
     paths: PathStyle,
@@ -678,6 +761,17 @@ struct WorkerState {
     /// `binary_explicit`: convert unless detection is off).
     implicit_binary: BinaryDetection,
     explicit_binary: BinaryDetection,
+    /// Scratch that `Haystack::open` reads whole files into, reused file
+    /// after file. Every byte up to its len is initialized, so a read can
+    /// fill any of it without zeroing it first. Starts empty and grows to
+    /// the biggest file read, at most MAP_THRESHOLD plus READ_SLACK.
+    read_buf: Vec<u8>,
+    /// Files over this many bytes are mapped instead of read
+    /// (MAP_THRESHOLD; unit tests lower it).
+    map_threshold: usize,
+    /// `root.join(rel)` built in place, so a file's path costs no
+    /// allocation.
+    full: PathBuf,
 }
 
 impl WorkerState {
@@ -722,32 +816,291 @@ impl WorkerState {
         } else {
             BinaryDetection::convert(b'\x00')
         };
+        // Streams are decoded in front of their searcher (see `feed`).
+        let mut stream_builder = sb.clone();
+        stream_builder.encoding(None).bom_sniffing(false);
+        let searcher = Searchers {
+            main: sb.build(),
+            stream_builder,
+            stream: None,
+            encoding: opts
+                .encoding
+                .as_deref()
+                .and_then(|l| encoding_rs::Encoding::for_label_no_replacement(l.as_bytes())),
+            bom_sniffing: opts.bom_sniffing,
+            decode_buf: vec![0; 8 * 1024],
+            head: Vec::new(),
+        };
         WorkerState {
-            searcher: sb.build(),
+            searcher,
             printer: standard_printer_builder(opts),
             paths: PathStyle::new(opts),
             implicit_binary: detection,
             explicit_binary,
+            read_buf: Vec::new(),
+            map_threshold: map_threshold(),
+            full: PathBuf::new(),
         }
     }
 }
 
-/// The bytes to search for one file: an mmap when mapping succeeded
-/// (zero-copy: the searcher runs directly against page-cache pages, no
-/// kernel->user buffer copy), else the path (streamed through the
-/// searcher's line buffer). ripgrep's own macOS heuristic disables mmap
-/// with a 2018 "should re-evaluate" note; we re-evaluated: on
-/// page-cache-bound workloads (every-file searches) the copy elimination
-/// is a significant win. SIGBUS on concurrent truncation is the accepted
-/// risk, identical to rg's documented --mmap behavior on Linux.
+/// A worker's searchers, reused file after file. `main` searches whole
+/// files as slices. Everything searched line by line through a reader
+/// goes through `feed` and the `stream` searcher instead, so it is read
+/// the way rg reads a file: `--no-mmap`, `--binary` and explicit file
+/// operands, `-z`, `--pre`, transcoded files (`-E`, byte-order marks),
+/// and a slice searched again because a NUL sits past its first 64 KiB.
+struct Searchers {
+    main: Searcher,
+    /// `main`'s configuration without transcoding: `feed` decodes in
+    /// front of it.
+    stream_builder: SearcherBuilder,
+    /// Built on first use, and dropped after a search that grew its line
+    /// buffer past the first 64 KiB, so every stream starts with the
+    /// 64 KiB buffer rg starts with.
+    stream: Option<Searcher>,
+    /// What `main` transcodes with: `-E`, and byte-order-mark sniffing.
+    encoding: Option<&'static encoding_rs::Encoding>,
+    bom_sniffing: bool,
+    /// Scratch for `feed`'s decoder (grep-searcher's own size) and for
+    /// the first buffer `RgFill` reads ahead.
+    decode_buf: Vec<u8>,
+    head: Vec<u8>,
+}
+
+impl Searchers {
+    /// Whether `main` transcodes `bytes` before searching them, as
+    /// grep-searcher decides it (`slice_needs_transcoding`): an explicit
+    /// `-E`, or a UTF-8 or UTF-16 byte-order mark while sniffing is on.
+    fn transcodes(&self, bytes: &[u8]) -> bool {
+        self.encoding.is_some()
+            || (self.bom_sniffing
+                && encoding_rs::Encoding::for_bom(bytes).is_some_and(|(e, _)| {
+                    [
+                        encoding_rs::UTF_8,
+                        encoding_rs::UTF_16LE,
+                        encoding_rs::UTF_16BE,
+                    ]
+                    .contains(&e)
+                }))
+    }
+
+    /// A whole file in memory: `main` searches it as one slice, unless it
+    /// is transcoded and searched line by line, which grep-searcher does
+    /// through a reader, so it goes through `feed` too.
+    fn slice<M: Matcher, S: grep_searcher::Sink>(
+        &mut self,
+        matcher: &M,
+        bytes: &[u8],
+        sink: S,
+    ) -> Result<(), S::Error> {
+        if self.transcodes(bytes) && !self.main.multi_line_with_matcher(matcher) {
+            return self.feed(matcher, bytes, sink);
+        }
+        self.main.search_slice(matcher, bytes, sink)
+    }
+
+    /// Search a stream line by line as rg reads one: decoded the way
+    /// `main` decodes (grep-searcher's own decoder settings), then handed
+    /// to the `stream` searcher through `RgFill`, which reads like rg's
+    /// line buffer. Multi-line searches read the whole stream either way
+    /// and stay with `main`.
+    fn feed<M: Matcher, R: std::io::Read, S: grep_searcher::Sink>(
+        &mut self,
+        matcher: &M,
+        src: R,
+        sink: S,
+    ) -> Result<(), S::Error> {
+        use grep_searcher::SinkError;
+        let Searchers {
+            main,
+            stream_builder,
+            stream,
+            encoding,
+            bom_sniffing,
+            decode_buf,
+            head,
+        } = self;
+        let detection = main.binary_detection().clone();
+        let quit = detection.quit_byte();
+        let searcher = stream.get_or_insert_with(|| stream_builder.build());
+        searcher.set_binary_detection(detection);
+        let decoded = encoding_rs_io::DecodeReaderBytesBuilder::new()
+            .encoding(*encoding)
+            .utf8_passthru(true)
+            .strip_bom(*bom_sniffing)
+            .bom_override(true)
+            .bom_sniffing(*bom_sniffing)
+            .build_with_buffer(src, &mut decode_buf[..])
+            .map_err(S::Error::error_io)?;
+        let mut fill = RgFill::new(decoded, head, quit);
+        let res = searcher.search_reader(matcher, &mut fill, sink);
+        if fill.grew {
+            *stream = None;
+        }
+        res
+    }
+}
+
+/// Feeds grep-searcher's line buffer the fills rg's own line buffer makes
+/// (rg 15.0, whose buffer this matches byte for byte). rg fills its
+/// buffer whole before it searches it: it reads until the buffer (64 KiB
+/// at first) is full or the input ends, and under quit detection a NUL
+/// ends the search before the fill holding it is searched. grep-searcher
+/// 0.1.17 searches after any read that ends a line, and the
+/// byte-order-mark check in front of its buffer hands the input's first
+/// three bytes over in a read of their own, so on its own it would print
+/// the first line of a binary file whose first line is one or two bytes
+/// long, and one line more than rg from a file with such lines and a NUL
+/// just past its first 64 KiB. So this reads the first 64 KiB ahead and
+/// hands them out without crossing their end, which ends the buffer's
+/// first fill where rg's ends, and fills every later read whole, as rg's
+/// reads of a file are. From there the buffer holds what rg's holds
+/// after every fill, context lines included. When quit detection finds a
+/// NUL in those first 64 KiB, rg searches none of them, so the line
+/// terminators before the NUL are handed out as spaces: the buffer then
+/// finds no line to search before it reaches the NUL, which it reports at
+/// the same offset.
+struct RgFill<'h, R> {
+    inner: R,
+    /// The first 64 KiB, read ahead on the first read; `len` of them hold
+    /// the input.
+    head: &'h mut Vec<u8>,
+    len: usize,
+    pos: usize,
+    started: bool,
+    quit: Option<u8>,
+    /// The line buffer asked for more than its first 64 KiB: it grew.
+    grew: bool,
+}
+
+impl<'h, R: std::io::Read> RgFill<'h, R> {
+    fn new(inner: R, head: &'h mut Vec<u8>, quit: Option<u8>) -> RgFill<'h, R> {
+        RgFill {
+            inner,
+            head,
+            len: 0,
+            pos: 0,
+            started: false,
+            quit,
+            grew: false,
+        }
+    }
+}
+
+/// Read until `buf` is full or the input ends, past short reads; returns
+/// how many bytes were read.
+fn read_full<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+impl<R: std::io::Read> std::io::Read for RgFill<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.len() > FIRST_BUFFER {
+            self.grew = true;
+        }
+        if !self.started {
+            self.started = true;
+            if self.head.len() < FIRST_BUFFER {
+                self.head.resize(FIRST_BUFFER, 0);
+            }
+            self.len = read_full(&mut self.inner, &mut self.head[..FIRST_BUFFER])?;
+            if let Some(q) = self.quit {
+                if let Some(i) = memchr::memchr(q, &self.head[..self.len]) {
+                    for b in &mut self.head[..i] {
+                        if *b == b'\n' {
+                            *b = b' ';
+                        }
+                    }
+                }
+            }
+        }
+        if self.pos < self.len {
+            let n = buf.len().min(self.len - self.pos);
+            buf[..n].copy_from_slice(&self.head[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        read_full(&mut self.inner, buf)
+    }
+}
+
+/// Files up to this many bytes are read whole into the worker's buffer;
+/// a bigger file is searched through a memory map instead. Past about a
+/// megabyte, copying a file costs more than faulting its pages in: a
+/// narrowed kernel-tree search whose candidates include the
+/// multi-megabyte amdgpu register headers ran about a third slower when
+/// it read every file up to 8 MiB.
+const MAP_THRESHOLD: usize = 1 << 20;
+
+/// The first read asks for at most this much (grep-searcher's first
+/// buffer size). Most files end inside it; a file that fills it is sized
+/// with one fstat, so a file over the threshold costs one such copy
+/// before it is mapped.
+const FIRST_READ: usize = 64 << 10;
+
+/// Room past a file's reported size when the buffer grows for it, so the
+/// read that proves the end has somewhere to land.
+const READ_SLACK: usize = 64 << 10;
+
+#[cfg(test)]
+thread_local! {
+    /// A lower map threshold for unit tests, so small files take the
+    /// memory-map fallback. `WorkerState::new` reads it, always on the
+    /// thread that called `run`.
+    static TEST_MAP_THRESHOLD: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// MAP_THRESHOLD, or a unit test's override.
+fn map_threshold() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(t) = TEST_MAP_THRESHOLD.with(|t| t.get()) {
+            return t;
+        }
+    }
+    MAP_THRESHOLD
+}
+
+/// The bytes to search for one file. By default the whole file, searched
+/// as one slice: read into the worker's reusable buffer when it holds at
+/// most the map threshold (1 MiB), else memory-mapped. A file under 64
+/// KiB costs open, read, the read of 0 bytes that proves its end, and
+/// close. Mapping it instead costs an fstat, an mmap, a fault on first
+/// touch of every page and an munmap; mmap and munmap take the process's
+/// VM map lock exclusively and munmap invalidates the mapping's TLB
+/// entries on every core, so a full scan over many small files spent its
+/// time contending in the kernel (grep-searcher never maps on macOS).
+/// The slice search is the same either way, so the output is too. A file
+/// that cannot be opened, read or mapped, and an empty one, go to the
+/// path, streamed through the searcher's line buffer, which reports any
+/// error with rg's text. A mapped file truncated during its search can
+/// still raise SIGBUS, as under rg --mmap.
 ///
 /// Modes whose bytes are not the file's own bytes take a reader instead:
 /// `--pre` searches a preprocessor's stdout and `-z` decodes a gzip
 /// stream. `--binary` (convert detection) and `--no-mmap` read the file
 /// through the line buffer, which is also what rewrites NULs and detects
 /// binary data past the first buffer exactly like rg's default reader.
+/// Every reader goes through `Searchers::feed`.
 enum Haystack<'a> {
+    /// The worker's read buffer, holding the whole file in its first
+    /// `.1` bytes; it goes back to the worker after the search.
+    Buf(Vec<u8>, usize),
     Map(memmap2::Mmap),
+    /// A file already in memory, searched again through the line buffer
+    /// (see `reader_disagrees`).
+    Reread(&'a [u8]),
     Path(PathBuf),
     Gz(PathBuf),
     /// --pre: the command, the file it reads as stdin, and the path it
@@ -785,13 +1138,61 @@ fn stderr_text(err: &[u8]) -> String {
     }
 }
 
+/// Read the rest of `file` into `buf`, whose initialized bytes (all of
+/// its len) are scratch. Returns how many bytes the file held, or None
+/// once that passes `threshold`. Only a read of 0 bytes ends the file,
+/// never a short one. The first read asks for FIRST_READ bytes, and
+/// nothing asks for the file's size unless they fill it: then one fstat
+/// sends a file over the threshold to the map and sizes the buffer for
+/// the rest of a smaller one. The buffer never grows past the threshold
+/// plus READ_SLACK, so it never needs shrinking.
+fn read_whole(
+    file: &mut std::fs::File,
+    buf: &mut Vec<u8>,
+    threshold: usize,
+) -> std::io::Result<Option<usize>> {
+    use std::io::Read;
+    if buf.len() < FIRST_READ {
+        *buf = vec![0; FIRST_READ];
+    }
+    let mut n = 0;
+    let mut end = FIRST_READ;
+    loop {
+        if n > threshold {
+            return Ok(None);
+        }
+        if n == end {
+            let size = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+            if size > threshold {
+                return Ok(None);
+            }
+            end = size.max(n) + READ_SLACK;
+            if buf.len() < end {
+                buf.resize(end, 0);
+            }
+        }
+        match file.read(&mut buf[n..end]) {
+            Ok(0) => return Ok(Some(n)),
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl<'a> Haystack<'a> {
+    /// `buf` is the worker's read buffer: a whole-file read moves it into
+    /// `Buf` (leaving it empty), and the caller hands it back after the
+    /// search.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         full: &Path,
         rel: &Path,
         display: &Path,
         opts: &'a SearchOpts,
         convert: bool,
+        buf: &mut Vec<u8>,
+        threshold: usize,
     ) -> Haystack<'a> {
         if let Some(cmd) = &opts.pre {
             if opts
@@ -812,19 +1213,42 @@ impl<'a> Haystack<'a> {
         if opts.no_mmap || convert {
             return Haystack::Path(full.to_path_buf());
         }
-        match std::fs::File::open(full) {
-            Ok(f) => match unsafe { memmap2::Mmap::map(&f) } {
-                Ok(m) if !m.is_empty() => Haystack::Map(m),
-                _ => Haystack::Path(full.to_path_buf()),
-            },
-            Err(_) => Haystack::Path(full.to_path_buf()),
+        let mut file = match std::fs::File::open(full) {
+            Ok(f) => f,
+            Err(_) => return Haystack::Path(full.to_path_buf()),
+        };
+        let read = read_whole(&mut file, buf, threshold);
+        if let Ok(Some(n)) = read {
+            if n > 0 {
+                return Haystack::Buf(std::mem::take(buf), n);
+            }
+        }
+        if let Ok(None) = read {
+            // Over the threshold: map the same descriptor.
+            if let Ok(m) = unsafe { memmap2::Mmap::map(&file) } {
+                if !m.is_empty() {
+                    return Haystack::Map(m);
+                }
+            }
+        }
+        // Empty (an empty map fell back to the path too), unreadable or
+        // unmappable: the searcher reads the path and reports any error.
+        Haystack::Path(full.to_path_buf())
+    }
+
+    /// The bytes a slice search covers: the read file or the map.
+    fn slice(&self) -> Option<&[u8]> {
+        match self {
+            Haystack::Buf(b, n) => Some(&b[..*n]),
+            Haystack::Map(m) => Some(&m[..]),
+            _ => None,
         }
     }
 
     /// Search with `sink`; returns how many bytes the searcher consumed.
     fn search<M: Matcher, S: grep_searcher::Sink>(
         &self,
-        searcher: &mut Searcher,
+        searchers: &mut Searchers,
         matcher: &M,
         sink: S,
     ) -> Result<u64, S::Error> {
@@ -832,24 +1256,37 @@ impl<'a> Haystack<'a> {
             inner: sink,
             consumed: 0,
         };
-        self.search_raw(searcher, matcher, &mut sink)?;
+        self.search_raw(searchers, matcher, &mut sink)?;
         Ok(sink.consumed)
     }
 
     fn search_raw<M: Matcher, S: grep_searcher::Sink>(
         &self,
-        searcher: &mut Searcher,
+        searchers: &mut Searchers,
         matcher: &M,
         sink: S,
     ) -> Result<(), S::Error> {
+        use grep_searcher::SinkError;
+        // Line by line, a reader goes through `feed`; a multi-line search
+        // reads the whole stream into one buffer either way.
+        let lines = !searchers.main.multi_line_with_matcher(matcher);
         match self {
-            Haystack::Map(m) => searcher.search_slice(matcher, &m[..], sink),
-            Haystack::Path(p) => searcher.search_path(matcher, p, sink),
+            Haystack::Buf(b, n) => searchers.slice(matcher, &b[..*n], sink),
+            Haystack::Map(m) => searchers.slice(matcher, &m[..], sink),
+            Haystack::Reread(b) => searchers.feed(matcher, *b, sink),
+            Haystack::Path(p) if lines => {
+                let file = std::fs::File::open(p).map_err(S::Error::error_io)?;
+                searchers.feed(matcher, file, sink)
+            }
+            Haystack::Path(p) => searchers.main.search_path(matcher, p, sink),
             Haystack::Gz(p) => {
-                use grep_searcher::SinkError;
                 let file = std::fs::File::open(p).map_err(S::Error::error_io)?;
                 let dec = flate2::read::GzDecoder::new(file);
-                searcher.search_reader(matcher, dec, sink)
+                if lines {
+                    searchers.feed(matcher, dec, sink)
+                } else {
+                    searchers.main.search_reader(matcher, dec, sink)
+                }
             }
             Haystack::Pre(cmd, file, arg) => {
                 // rg's contract: the path is the sole argument and the file
@@ -858,7 +1295,6 @@ impl<'a> Haystack<'a> {
                 // stderr, unless the search stopped early (-l, -q, -m) and
                 // stderr is empty: that failure is the broken pipe our early
                 // stop caused.
-                use grep_searcher::SinkError;
                 let stdin = std::fs::File::open(file).map_err(S::Error::error_io)?;
                 let mut command = std::process::Command::new(cmd);
                 command
@@ -883,7 +1319,11 @@ impl<'a> Haystack<'a> {
                     inner: child.stdout.take().expect("piped stdout"),
                     eof: false,
                 };
-                let searched = searcher.search_reader(matcher, &mut out, sink);
+                let searched = if lines {
+                    searchers.feed(matcher, &mut out, sink)
+                } else {
+                    searchers.main.search_reader(matcher, &mut out, sink)
+                };
                 // Close our end before the wait: a sink that stopped early
                 // makes the child see EPIPE instead of blocking.
                 let eof = out.eof;
@@ -912,36 +1352,40 @@ impl<'a> Haystack<'a> {
 /// slice search checks the same window up front.
 const FIRST_BUFFER: usize = 64 * 1024;
 
-/// A memory map is searched as one slice, where grep-searcher checks the
-/// first-buffer window up front and afterwards only matched and context
-/// lines for binary data; rg's default reader checks every buffer it
-/// reads. The two can only disagree when the slice search consumed lines
-/// past the window's complete lines and a NUL sits past the window. In
-/// that rare case (true here) the caller searches the file again through
-/// the reader, so the output, counts and exit status stay rg's.
+/// A whole file (read or mapped) is searched as one slice, where
+/// grep-searcher checks the first-buffer window up front and afterwards
+/// only matched and context lines for binary data; rg's default reader
+/// checks every buffer it reads. The two can only disagree when a NUL
+/// sits past the window and the slice search got as far as the end of
+/// the window's complete lines: past it, it searched lines rg never
+/// reaches, and stopping right there at a matched line that holds the NUL
+/// it has already printed that match's context lines, which rg does not.
+/// In that rare case (true here) the caller searches the same bytes again
+/// through the reader (`Haystack::Reread`), so the output, counts and
+/// exit status stay rg's.
 fn reader_disagrees<M: Matcher>(
-    map: &[u8],
+    bytes: &[u8],
     consumed: u64,
     searcher: &Searcher,
     matcher: &M,
     opts: &SearchOpts,
 ) -> bool {
-    if map.len() <= FIRST_BUFFER || searcher.binary_detection().quit_byte().is_none() {
+    if bytes.len() <= FIRST_BUFFER || searcher.binary_detection().quit_byte().is_none() {
         return false;
     }
     // Multi-line searches and transcoded files go through the same
     // whole-haystack or reader path either way.
-    let bom = map.starts_with(&[0xEF, 0xBB, 0xBF])
-        || map.starts_with(&[0xFF, 0xFE])
-        || map.starts_with(&[0xFE, 0xFF]);
+    let bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        || bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF]);
     if searcher.multi_line_with_matcher(matcher)
         || opts.encoding.is_some()
         || (opts.bom_sniffing && bom)
     {
         return false;
     }
-    let first_lines_end = memchr::memrchr(b'\n', &map[..FIRST_BUFFER]).map_or(0, |i| i + 1);
-    consumed > first_lines_end as u64 && memchr::memchr(0, &map[FIRST_BUFFER..]).is_some()
+    let first_lines_end = memchr::memrchr(b'\n', &bytes[..FIRST_BUFFER]).map_or(0, |i| i + 1);
+    consumed >= first_lines_end as u64 && memchr::memchr(0, &bytes[FIRST_BUFFER..]).is_some()
 }
 
 /// How a bare path record is rendered: the -l/-c/--count-matches/
@@ -1109,7 +1553,12 @@ fn search_one<M: Matcher>(
     rel: &Path,
     opts: &SearchOpts,
 ) -> anyhow::Result<FileResult> {
-    let full = root.join(rel);
+    // `root.join(rel)` in the worker's path buffer: an absolute `rel`
+    // replaces the root there exactly as it does in join.
+    let mut full = std::mem::take(&mut state.full);
+    full.as_mut_os_string().clear();
+    full.push(root);
+    full.push(rel);
     let display = display_path(rel, opts);
     let display: &Path = &display;
     // Explicit file operands get rg's explicit binary detection for this
@@ -1118,14 +1567,17 @@ fn search_one<M: Matcher>(
     if explicit {
         state
             .searcher
+            .main
             .set_binary_detection(state.explicit_binary.clone());
     }
     let res = search_detected(state, matcher, &full, rel, display, opts);
     if explicit {
         state
             .searcher
+            .main
             .set_binary_detection(state.implicit_binary.clone());
     }
+    state.full = full;
     res
 }
 
@@ -1138,18 +1590,50 @@ fn search_detected<M: Matcher>(
     opts: &SearchOpts,
 ) -> anyhow::Result<FileResult> {
     // Convert detection rewrites NULs, which needs the searcher's buffer.
-    let convert = state.searcher.binary_detection().convert_byte().is_some();
-    let hay = Haystack::open(full, rel, display, opts, convert);
-    let (res, consumed) = search_hay(state, matcher, &hay, display, opts)?;
-    if let Haystack::Map(map) = &hay {
+    let convert = state
+        .searcher
+        .main
+        .binary_detection()
+        .convert_byte()
+        .is_some();
+    let hay = Haystack::open(
+        full,
+        rel,
+        display,
+        opts,
+        convert,
+        &mut state.read_buf,
+        state.map_threshold,
+    );
+    let res = search_checked(state, matcher, &hay, display, opts);
+    if let Haystack::Buf(buf, _) = hay {
+        // The read buffer goes back to the worker for its next file.
+        state.read_buf = buf;
+    }
+    res
+}
+
+/// `search_hay`, then the reader's search of the same bytes instead when
+/// a slice search could differ from it (see `reader_disagrees`).
+fn search_checked<M: Matcher>(
+    state: &mut WorkerState,
+    matcher: &M,
+    hay: &Haystack<'_>,
+    display: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<FileResult> {
+    let (res, consumed) = search_hay(state, matcher, hay, display, opts)?;
+    if let Some(bytes) = hay.slice() {
         // A file that matched nothing and printed nothing reads the same
         // through the reader (which searches a prefix of the same bytes),
-        // unless --files-without-match reports the miss. Skipping those
+        // unless --files-without-match reports the miss or --stats or
+        // --json count the bytes and lines searched. Skipping the rest
         // keeps the common case (big files without a hit) free of the
         // extra NUL scan.
-        let observable = res.matched || !res.buf.is_empty() || opts.files_without_match;
-        if observable && reader_disagrees(map, consumed, &state.searcher, matcher, opts) {
-            let hay = Haystack::Path(full.to_path_buf());
+        let observable =
+            res.matched || !res.buf.is_empty() || opts.files_without_match || res.stats.is_some();
+        if observable && reader_disagrees(bytes, consumed, &state.searcher.main, matcher, opts) {
+            let hay = Haystack::Reread(bytes);
             return Ok(search_hay(state, matcher, &hay, display, opts)?.0);
         }
     }
@@ -1182,7 +1666,7 @@ fn search_hay<M: Matcher>(
             };
             return Ok((res, consumed));
         }
-        let mut sink = FoundSink::default();
+        let mut sink = FoundSink::new(opts);
         let consumed = hay.search(searcher, matcher, &mut sink)?;
         let res = FileResult {
             matched: sink.found && !sink.binary_quit,
@@ -1192,7 +1676,7 @@ fn search_hay<M: Matcher>(
         return Ok((res, consumed));
     }
     if opts.count || opts.count_matches {
-        let multi_line = searcher.multi_line_with_matcher(matcher);
+        let multi_line = searcher.main.multi_line_with_matcher(matcher);
         let mut sink = CountSink::new(matcher, opts, multi_line);
         let consumed = hay.search(searcher, matcher, &mut sink)?;
         let stats = opts
@@ -1249,7 +1733,7 @@ fn search_hay<M: Matcher>(
                 consumed,
             )
         } else {
-            let mut sink = FoundSink::default();
+            let mut sink = FoundSink::new(opts);
             let consumed = hay.search(searcher, matcher, &mut sink)?;
             (
                 sink.found && !sink.binary_quit,
@@ -1691,9 +2175,9 @@ pub fn run(
 /// byte-identical to `rg --sort path`-style deterministic output while the
 /// search itself runs at rg's unordered parallel throughput. No worker
 /// ever holds a lock while writing to stdout. Each worker owns one
-/// reusable `Searcher` (buffers included), mirroring ripgrep's per-thread
-/// SearchWorker reuse.
-fn run_impl<M: Matcher + Sync>(
+/// reusable `Searcher` (buffers included), a read buffer and a clone of
+/// the matcher, mirroring ripgrep's per-thread SearchWorker.
+fn run_impl<M: Matcher + Clone + Send + Sync>(
     matcher: &M,
     root: &Path,
     files: &[PathBuf],
@@ -1715,14 +2199,17 @@ fn run_impl<M: Matcher + Sync>(
     };
 
     if std::env::var_os("GLEP_TIMING").is_some() {
-        // Which search path ran: tests use it to prove the worker pool is
-        // exercised.
-        let path = if files.len() <= SMALL_WORKLOAD {
-            "small"
+        // Which search path ran, and the pool's width: tests use it to
+        // prove the worker pool is exercised with the expected workers.
+        if files.len() <= SMALL_WORKLOAD {
+            eprintln!("glep timing: search path small ({} files)", files.len());
         } else {
-            "pool"
-        };
-        eprintln!("glep timing: search path {path} ({} files)", files.len());
+            eprintln!(
+                "glep timing: search path pool ({} files, {} workers)",
+                files.len(),
+                pool_workers(opts, files.len())
+            );
+        }
     }
     let mut printer = if files.len() <= SMALL_WORKLOAD {
         // Small workloads: stay on this thread, one reusable searcher,
@@ -1748,10 +2235,20 @@ fn run_impl<M: Matcher + Sync>(
     finish(&mut printer, files, universe, opts, out, start)
 }
 
+/// The worker pool's width for `files` files: -j when above 0 (rg's -j),
+/// else `default_threads()`, and never more workers than files.
+fn pool_workers(opts: &SearchOpts, files: usize) -> usize {
+    let parallelism = match opts.threads {
+        Some(n) if n > 0 => n,
+        _ => default_threads(),
+    };
+    parallelism.min(files).max(1)
+}
+
 /// The worker pool + in-order printer thread for workloads larger than
 /// `SMALL_WORKLOAD`. Returns the printer's final state (found flag,
 /// merged stats, matched indices).
-fn run_pool<M: Matcher + Sync>(
+fn run_pool<M: Matcher + Clone + Send + Sync>(
     matcher: &M,
     root: &Path,
     files: &[PathBuf],
@@ -1759,13 +2256,7 @@ fn run_pool<M: Matcher + Sync>(
     encoding: Option<&grep_searcher::Encoding>,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<Printer> {
-    let parallelism = match opts.threads {
-        Some(n) if n > 0 => n,
-        _ => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
-    };
-    let workers = parallelism.min(files.len()).max(1);
+    let workers = pool_workers(opts, files.len());
     // The channel capacity is the memory bound: at most this many file
     // output buffers (plus one per worker in flight) exist at once.
     let window = (workers * 16).max(64);
@@ -1806,13 +2297,18 @@ fn run_pool<M: Matcher + Sync>(
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let mut state = WorkerState::new(opts, encoding);
+            // A clone per worker shares the compiled program but owns its
+            // scratch: regex-automata's cache pool and PCRE2's match-data
+            // pool serve one owner thread without a lock and every other
+            // thread through a mutex.
+            let matcher = matcher.clone();
             let tx = tx.clone();
             let cursor = &cursor;
             let window = &window_state;
             let stop = &stop;
             handles.push(scope.spawn(move || {
                 worker(
-                    cursor, &tx, &mut state, matcher, root, files, opts, window, ring_cap, stop,
+                    cursor, &tx, &mut state, &matcher, root, files, opts, window, ring_cap, stop,
                 );
             }));
         }
@@ -1837,7 +2333,7 @@ fn run_pool<M: Matcher + Sync>(
 /// even after a -q stop, so the printer's cursor can reach any index a
 /// waiting worker holds.
 #[allow(clippy::too_many_arguments)]
-fn worker<M: Matcher + Sync>(
+fn worker<M: Matcher>(
     cursor: &AtomicUsize,
     tx: &SyncSender<Done>,
     state: &mut WorkerState,
@@ -2083,20 +2579,115 @@ mod tests {
         assert_eq!(out, expect);
     }
 
-    /// The same 100-file search through a 2-worker pool (-j 2) and through
-    /// one worker: identical bytes regardless of the worker count.
+    /// Serialises the tests that set GLEP_THREADS or depend on its value.
+    static GLEP_THREADS_ENV: Mutex<()> = Mutex::new(());
+
+    /// The same 100-file search through one worker, through 2- and
+    /// 3-worker pools, and through the default width (threads None and
+    /// -j 0: `default_threads()`, the performance-core count on macOS),
+    /// plus wider than the machine: identical bytes regardless of the
+    /// worker count.
     #[test]
     fn parallel_output_independent_of_thread_count() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, files) = big_corpus(100);
+        let ap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let mut o1 = opts();
         o1.threads = Some(1);
-        let mut o2 = opts();
-        o2.threads = Some(2);
         let (_, a) = run_str("needle", dir.path(), &files, &o1);
-        let (_, b) = run_str("needle", dir.path(), &files, &o2);
-        let (_, c) = run_str("needle", dir.path(), &files, &opts());
-        assert_eq!(a, b);
-        assert_eq!(a, c);
+        for threads in [Some(2), Some(3), None, Some(0), Some(ap), Some(ap + 3)] {
+            let mut o = opts();
+            o.threads = threads;
+            let (_, b) = run_str("needle", dir.path(), &files, &o);
+            assert_eq!(a, b, "threads {threads:?}");
+        }
+    }
+
+    /// The pool width: -j above 0 as given, else `default_threads()`,
+    /// never more workers than files and never fewer than one.
+    #[test]
+    fn pool_workers_follow_j_then_default() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut o = opts();
+        o.threads = Some(7);
+        assert_eq!(pool_workers(&o, 1000), 7);
+        assert_eq!(pool_workers(&o, 4), 4);
+        assert_eq!(pool_workers(&o, 0), 1);
+        for threads in [None, Some(0)] {
+            o.threads = threads;
+            assert_eq!(pool_workers(&o, 100_000), default_threads());
+        }
+    }
+
+    /// `default_threads`'s rule: GLEP_THREADS above 0 wins (even above
+    /// available_parallelism), 0 and garbage fall through to the
+    /// performance-core count capped at available_parallelism, and with
+    /// no performance-core count it is available_parallelism.
+    #[test]
+    fn pick_threads_rule() {
+        use std::ffi::OsStr;
+        let env = |v: &'static str| Some(OsStr::new(v));
+        assert_eq!(pick_threads(env("3"), Some(5), 11), 3);
+        assert_eq!(pick_threads(env("16"), Some(5), 11), 16);
+        assert_eq!(pick_threads(env("3"), None, 11), 3);
+        for junk in [
+            "0",
+            "",
+            "abc",
+            "-2",
+            "3x",
+            " 3",
+            "1.5",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(pick_threads(env(junk), Some(5), 11), 5, "{junk:?}");
+            assert_eq!(pick_threads(env(junk), None, 11), 11, "{junk:?}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let not_utf8 = OsStr::from_bytes(b"\xff3");
+            assert_eq!(pick_threads(Some(not_utf8), Some(5), 11), 5);
+        }
+        assert_eq!(pick_threads(None, Some(5), 11), 5);
+        assert_eq!(pick_threads(None, Some(6), 6), 6);
+        assert_eq!(pick_threads(None, Some(12), 8), 8);
+        assert_eq!(pick_threads(None, Some(0), 11), 11);
+        assert_eq!(pick_threads(None, None, 11), 11);
+        assert_eq!(pick_threads(None, None, 1), 1);
+    }
+
+    /// `default_threads()` itself: within [1, available_parallelism]
+    /// without GLEP_THREADS (the performance-core count where the sysctl
+    /// exists), GLEP_THREADS=3 gives 3, and 0 or garbage fall through.
+    #[test]
+    fn default_threads_env_and_bounds() {
+        let _env = GLEP_THREADS_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("GLEP_THREADS");
+        let ap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        std::env::remove_var("GLEP_THREADS");
+        let base = default_threads();
+        assert!((1..=ap).contains(&base), "{base} not within [1, {ap}]");
+        match performance_cores() {
+            Some(p) => assert_eq!(base, p.min(ap)),
+            None => assert_eq!(base, ap),
+        }
+        std::env::set_var("GLEP_THREADS", "3");
+        assert_eq!(default_threads(), 3);
+        std::env::set_var("GLEP_THREADS", (ap + 5).to_string());
+        assert_eq!(default_threads(), ap + 5);
+        for junk in ["0", "", "abc", "-2", "3x"] {
+            std::env::set_var("GLEP_THREADS", junk);
+            assert_eq!(default_threads(), base, "GLEP_THREADS={junk:?}");
+        }
+        match saved {
+            Some(v) => std::env::set_var("GLEP_THREADS", v),
+            None => std::env::remove_var("GLEP_THREADS"),
+        }
     }
 
     /// -l through the parallel path must print one path per matched file,
@@ -2335,5 +2926,388 @@ mod tests {
             assert_eq!(render(r"C:\abs\x.txt", b'/'), "C:/abs/x.txt");
             assert_eq!(render(r"src\x.txt", b'%'), "src%x.txt");
         }
+    }
+
+    /// `run` with the map threshold forced to `threshold` (None keeps
+    /// MAP_THRESHOLD): every worker state is built on this thread.
+    fn run_bytes(
+        pattern: &str,
+        root: &Path,
+        files: &[PathBuf],
+        o: &SearchOpts,
+        threshold: Option<usize>,
+    ) -> (bool, Vec<u8>) {
+        TEST_MAP_THRESHOLD.with(|t| t.set(threshold));
+        let mut out = Vec::new();
+        let found = run(pattern, root, files, None, o, &mut out);
+        TEST_MAP_THRESHOLD.with(|t| t.set(None));
+        (found.unwrap(), out)
+    }
+
+    /// Exactly `n` bytes of numbered text lines, every 97th one carrying
+    /// `hello` (the first among them); the last line may be cut short of
+    /// its terminator.
+    fn text_of_len(n: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n + 32);
+        let mut i = 0;
+        while v.len() < n {
+            let line = if i % 97 == 0 {
+                format!("hello line {i}\n")
+            } else {
+                format!("plain line {i}\n")
+            };
+            v.extend_from_slice(line.as_bytes());
+            i += 1;
+        }
+        v.truncate(n);
+        v
+    }
+
+    /// 300 files, enough for the worker pool, with the edge cases of a
+    /// whole-file read among plain ones: an empty and a 1-byte file, sizes
+    /// around the searcher's 64 KiB first buffer (and FIRST_READ), a NUL
+    /// just past that buffer after a match (the index's FLAG_NUL_LATE
+    /// case) and one in the first 100 bytes, UTF-16 files with byte-order
+    /// marks, a file over the 4 KiB test threshold, and two over
+    /// MAP_THRESHOLD.
+    fn read_corpus() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let put = |name: &str, bytes: &[u8]| std::fs::write(d.join(name), bytes).unwrap();
+        put("e_empty.txt", b"");
+        put("e_one.txt", b"h");
+        for n in [65535, 65536, 65537] {
+            put(&format!("e_size{n}.txt"), &text_of_len(n));
+        }
+        let mut late = text_of_len(FIRST_BUFFER + 1);
+        late.push(0);
+        late.extend_from_slice(b"\nhello after the nul\n");
+        late.extend(text_of_len(20_000));
+        put("e_latenul.txt", &late);
+        let mut early = b"hello early\nab\x00cd\n".to_vec();
+        early.extend(text_of_len(3_000));
+        put("e_earlynul.txt", &early);
+        let mut le = vec![0xFF, 0xFE];
+        for b in "hello utf16 le\nplain\nhello again\n".bytes() {
+            le.extend_from_slice(&[b, 0]);
+        }
+        put("e_utf16le.txt", &le);
+        let mut be = vec![0xFE, 0xFF];
+        for b in "hello utf16 be\nplain\n".bytes() {
+            be.extend_from_slice(&[0, b]);
+        }
+        put("e_utf16be.txt", &be);
+        put("e_10k.txt", &text_of_len(10_000));
+        put("e_grow.txt", &text_of_len(1_150_000));
+        put("e_over.txt", &text_of_len(1_300_000));
+        for i in 0..288 {
+            let body = match i % 3 {
+                0 => format!("hello {i}\nplain\n"),
+                1 => format!("plain {i}\n"),
+                _ => format!("a{i}\nhello and a\n"),
+            };
+            put(&format!("f{i:03}.txt"), body.as_bytes());
+        }
+        let mut files: Vec<PathBuf> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| PathBuf::from(e.unwrap().file_name()))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 300);
+        (dir, files)
+    }
+
+    /// A file read whole into the worker's buffer prints exactly what the
+    /// searcher's own reader prints (--no-mmap) in every output mode,
+    /// through the worker pool, at four map thresholds: MAP_THRESHOLD,
+    /// where the two biggest files are mapped after one fstat; 4 KiB,
+    /// where every bigger file takes the map fallback after its first
+    /// read; exactly FIRST_READ, which a 65536-byte file fills without
+    /// passing; and one between the two biggest files, where the buffer
+    /// grows for the smaller one. The reader's output is rg's, byte for
+    /// byte.
+    #[test]
+    fn whole_file_reads_print_what_the_reader_prints() {
+        let (dir, files) = read_corpus();
+        let d = dir.path();
+        type Mode = (&'static str, &'static [&'static str], fn(&mut SearchOpts));
+        let modes: &[Mode] = &[
+            ("default", &[], |_| {}),
+            ("-l", &["-l"], |o| o.files_with_matches = true),
+            ("-c", &["-c"], |o| o.count = true),
+            ("--count-matches", &["--count-matches"], |o| {
+                o.count_matches = true
+            }),
+            ("--files-without-match", &["--files-without-match"], |o| {
+                o.files_without_match = true
+            }),
+            ("-a", &["-a"], |o| o.binary = BinaryDetection::none()),
+            ("--binary", &["--binary"], |o| {
+                o.binary = BinaryDetection::convert(b'\x00')
+            }),
+            ("-v -c", &["-v", "-c"], |o| {
+                o.invert = true;
+                o.count = true;
+            }),
+        ];
+        for (label, rg_args, set) in modes {
+            let mut reader = opts();
+            set(&mut reader);
+            reader.no_mmap = true;
+            let want = run_bytes("hello", d, &files, &reader, None);
+            assert!(!want.1.is_empty(), "{label}: no output");
+            let mut o = opts();
+            set(&mut o);
+            for threshold in [None, Some(4096), Some(FIRST_READ), Some(1_200_000)] {
+                assert_eq!(
+                    run_bytes("hello", d, &files, &o, threshold),
+                    want,
+                    "{label} at threshold {threshold:?}"
+                );
+            }
+            let rg = std::process::Command::new("rg")
+                .args(["-n", "--sort", "path"])
+                .args(*rg_args)
+                .arg("hello")
+                .current_dir(d)
+                .output()
+                .expect("rg must be installed for parity tests");
+            assert_eq!(want.1, rg.stdout, "{label}: rg");
+        }
+    }
+
+    /// `read_whole` returns exactly the file at every size around
+    /// FIRST_READ and the threshold, also into a buffer still holding a
+    /// bigger file's bytes, and None only past the threshold. Small files
+    /// never grow the buffer, and nothing grows it past the threshold
+    /// plus READ_SLACK.
+    #[test]
+    fn read_whole_reads_exact_files_up_to_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+        for (size, threshold, whole) in [
+            (0, MAP_THRESHOLD, true),
+            (1, MAP_THRESHOLD, true),
+            (FIRST_READ - 1, MAP_THRESHOLD, true),
+            (4096, 4096, true),
+            (4097, 4096, false),
+            (FIRST_READ, MAP_THRESHOLD, true),
+            (FIRST_READ + 1, MAP_THRESHOLD, true),
+            (FIRST_READ + 1, FIRST_READ, false),
+            (MAP_THRESHOLD, MAP_THRESHOLD, true),
+            (300, MAP_THRESHOLD, true),
+            (MAP_THRESHOLD + 1, MAP_THRESHOLD, false),
+            (200_000, 100_000, false),
+            (100_000, 100_000, true),
+            (3 * MAP_THRESHOLD, MAP_THRESHOLD, false),
+        ] {
+            let p = dir.path().join(format!("r{size}"));
+            let data = text_of_len(size);
+            std::fs::write(&p, &data).unwrap();
+            let mut f = std::fs::File::open(&p).unwrap();
+            let got = read_whole(&mut f, &mut buf, threshold).unwrap();
+            if whole {
+                assert_eq!(got, Some(size), "{size} at {threshold}");
+                assert!(buf[..size] == data[..], "{size} at {threshold}");
+            } else {
+                assert_eq!(got, None, "{size} at {threshold}");
+            }
+            assert!(buf.len() >= FIRST_READ, "{size}");
+            assert!(buf.len() <= MAP_THRESHOLD + READ_SLACK, "{size}");
+        }
+        let mut fresh = Vec::new();
+        for size in [0, 1, 4096, FIRST_READ - 1] {
+            let p = dir.path().join(format!("r{size}"));
+            let mut f = std::fs::File::open(&p).unwrap();
+            let got = read_whole(&mut f, &mut fresh, MAP_THRESHOLD).unwrap();
+            assert_eq!(got, Some(size), "{size}");
+            assert_eq!(fresh.len(), FIRST_READ, "{size}");
+        }
+    }
+
+    /// A short read is not the end of a file: `read_whole` keeps reading
+    /// a pipe written in small pieces until the writer closes it, past
+    /// FIRST_READ (where the size the pipe reports is no bound).
+    #[cfg(unix)]
+    #[test]
+    fn read_whole_reads_past_short_reads() {
+        use std::io::Write;
+        let piece = |i: usize| format!("{i:05} {}\n", "x".repeat(1000));
+        let (r, mut w) = std::io::pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            for i in 0..150 {
+                // A reader that stopped early closed the pipe.
+                if w.write_all(piece(i).as_bytes()).is_err() {
+                    return;
+                }
+                if i % 10 == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+        let mut f = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+        let mut buf = Vec::new();
+        let n = read_whole(&mut f, &mut buf, MAP_THRESHOLD).unwrap();
+        drop(f);
+        writer.join().unwrap();
+        let want: String = (0..150).map(piece).collect();
+        assert!(want.len() > FIRST_READ);
+        assert_eq!(n, Some(want.len()));
+        assert_eq!(&buf[..want.len()], want.as_bytes());
+    }
+
+    /// Each worker searches with its own clone of the matcher: `-c '.*'`
+    /// (every line runs the regex engine) counts the same through 8
+    /// workers as through one, with both engines.
+    #[test]
+    fn worker_matcher_clones_count_like_one_worker() {
+        let (dir, files) = big_corpus(300);
+        let want: String = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("{}:{}\n", f.display(), if i % 3 == 0 { 3 } else { 1 }))
+            .collect();
+        for pcre2 in [false, true] {
+            let mut o = opts();
+            o.count = true;
+            o.pcre2 = pcre2;
+            o.threads = Some(1);
+            let one = run_bytes(".*", dir.path(), &files, &o, None);
+            o.threads = Some(8);
+            let eight = run_bytes(".*", dir.path(), &files, &o, None);
+            assert_eq!(one, eight, "pcre2 {pcre2}");
+            assert_eq!(String::from_utf8(one.1).unwrap(), want, "pcre2 {pcre2}");
+        }
+    }
+
+    /// The worker's path buffer is rebuilt per file: an absolute file
+    /// path opens as given (as `root.join` would), and the relative files
+    /// after it open under the root again.
+    #[test]
+    fn absolute_file_paths_open_as_given() {
+        let (dir, mut files) = big_corpus(40);
+        let other = tempfile::tempdir().unwrap();
+        let abs = other.path().join("abs.txt");
+        std::fs::write(&abs, "needle absolute\n").unwrap();
+        files.insert(5, abs.clone());
+        let mut want = String::new();
+        for (i, f) in files.iter().enumerate() {
+            if i == 5 {
+                want.push_str(&format!("{}:1:needle absolute\n", abs.display()));
+                continue;
+            }
+            let n = if i < 5 { i } else { i - 1 };
+            if n % 3 == 0 {
+                want.push_str(&format!("{}:2:needle here {n}\n", f.display()));
+            }
+        }
+        let (found, out) = run_str("needle", dir.path(), &files, &opts());
+        assert!(found);
+        assert_eq!(out, want);
+    }
+
+    /// Gives out at most 7 bytes per read, like a pipe or a decoder.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(7).min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// `RgFill` hands out the first 64 KiB without a read ever crossing
+    /// their end, fills every later read whole even from a reader that
+    /// gives out a few bytes at a time, and passes every byte on in
+    /// order. A read asking for more than 64 KiB marks the line buffer
+    /// grown. Under quit detection, the line terminators before a NUL in
+    /// the first 64 KiB are handed out as spaces; a NUL past them changes
+    /// nothing, and neither does convert or no detection.
+    #[test]
+    fn rg_fill_reads_like_rgs_line_buffer() {
+        use std::io::Read;
+        let data: Vec<u8> = (0..200_000u32)
+            .map(|i| if i % 10 == 9 { b'\n' } else { b'a' })
+            .collect();
+        let mut head = Vec::new();
+        let mut fill = RgFill::new(Trickle(&data), &mut head, Some(0));
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 3 * FIRST_BUFFER];
+        let mut read = |fill: &mut RgFill<'_, Trickle<'_>>, want: usize, got: &mut Vec<u8>| {
+            let n = fill.read(&mut buf[..want]).unwrap();
+            got.extend_from_slice(&buf[..n]);
+            n
+        };
+        assert_eq!(read(&mut fill, 3, &mut got), 3);
+        assert_eq!(read(&mut fill, FIRST_BUFFER, &mut got), FIRST_BUFFER - 3);
+        assert_eq!(read(&mut fill, 50_000, &mut got), 50_000);
+        assert!(!fill.grew);
+        assert_eq!(read(&mut fill, FIRST_BUFFER, &mut got), FIRST_BUFFER);
+        assert!(!fill.grew);
+        let rest = data.len() - got.len();
+        assert_eq!(read(&mut fill, 3 * FIRST_BUFFER, &mut got), rest);
+        assert!(fill.grew);
+        assert_eq!(read(&mut fill, 10, &mut got), 0);
+        assert_eq!(got, data);
+
+        let all = |src: &[u8], quit: Option<u8>| {
+            let mut head = Vec::new();
+            let mut fill = RgFill::new(src, &mut head, quit);
+            let mut out = Vec::new();
+            fill.read_to_end(&mut out).unwrap();
+            out
+        };
+        assert_eq!(all(b"a\nb\nc\0\nd\n", Some(0)), b"a b c\0\nd\n");
+        assert_eq!(all(b"a\nb\nc\0\nd\n", None), b"a\nb\nc\0\nd\n");
+        let mut late = data[..FIRST_BUFFER].to_vec();
+        late.extend_from_slice(b"\0x\n");
+        assert_eq!(all(&late, Some(0)), late);
+    }
+
+    /// Through `feed`, a stream stops where rg 15.0's reader stops: every
+    /// line of its first 64 KiB, and none of the 64 KiB buffer that holds
+    /// the NUL, whatever the stream's own read sizes. The stream searcher
+    /// is rebuilt after a search that grew its buffer, so the next stream
+    /// starts at 64 KiB again.
+    #[test]
+    fn feed_stops_where_rgs_reader_stops() {
+        let opts = SearchOpts::default();
+        let mut state = WorkerState::new(&opts, None);
+        let matcher = build_matcher("a", &opts).unwrap();
+        let count = |state: &mut WorkerState, src: &[u8]| {
+            let mut sink = CountSink::for_stats(&matcher);
+            let mut tracked = Tracked {
+                inner: &mut sink,
+                consumed: 0,
+            };
+            state
+                .searcher
+                .feed(&matcher, Trickle(src), &mut tracked)
+                .unwrap();
+            let consumed = tracked.consumed;
+            (sink.lines, consumed, sink.binary_quit)
+        };
+        // 2-byte lines and a NUL at 100000: rg searches 32768 lines.
+        let mut two = b"a\n".repeat(50_000);
+        two.push(0);
+        two.extend_from_slice(&b"a\n".repeat(100));
+        assert_eq!(count(&mut state, &two), (32_768, 65_536, true));
+        // A NUL in the first 64 KiB, after a short first line: nothing.
+        let mut early = b"a\nab".to_vec();
+        early.push(0);
+        early.extend_from_slice(b"cd\n");
+        assert_eq!(count(&mut state, &early), (0, 0, true));
+        // A 200 KB first line grows the buffer; the next stream gets a
+        // fresh one, so its NUL at 70000 stops it after 32768 lines.
+        let mut long = vec![b'a'; 200_000];
+        long.extend_from_slice(b"\na\n");
+        assert!(state.searcher.stream.is_some());
+        assert_eq!(count(&mut state, &long), (2, long.len() as u64, false));
+        assert!(state.searcher.stream.is_none());
+        let mut seventy = b"a\n".repeat(35_000);
+        seventy.push(0);
+        assert_eq!(count(&mut state, &seventy), (32_768, 65_536, true));
     }
 }

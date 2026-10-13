@@ -464,14 +464,17 @@ pub fn sweep_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 
 /// Scoped sweep: exactly the full sweep's result restricted to the given
 /// index-relative prefixes (ignore files applied, `.git`/`.glep`
-/// hard-excluded, hidden entries flagged). Both implementations walk FROM
-/// THE ROOT and prune everything off the path to a prefix, so every
-/// ancestor ignore rule applies, and a prefix that is itself ignored (an
-/// explicit `node_modules` operand, say) yields nothing instead of
-/// pulling an ignored tree into the index. Used by `Index::update_scoped`
-/// for queries already restricted by path filters, where sweeping the
-/// rest of the tree would be wasted work (issue #21). Sorted by path
-/// (the test-facing variant; the diff uses `sweep_scoped_unsorted`).
+/// hard-excluded, hidden entries flagged). Every ancestor ignore rule
+/// between the root and a prefix applies, and a prefix that is itself
+/// ignored (an explicit `node_modules` operand, say) yields nothing
+/// instead of pulling an ignored tree into the index: the walker walks
+/// from the root and prunes everything off the path to a prefix, and the
+/// macOS bulk walker reads each level on that path by name and starts at
+/// the prefix with the rules a walk from the root would carry there (see
+/// `walk_bulk::sweep_bulk_scoped`). Used by `Index::update_scoped` for
+/// queries already restricted by path filters, where sweeping the rest of
+/// the tree would be wasted work (issue #21). Sorted by path (the
+/// test-facing variant; the diff uses `sweep_scoped_unsorted`).
 #[cfg(test)]
 pub fn sweep_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<FileMeta>> {
     let mut v = sweep_scoped_unsorted(root, prefixes)?;
@@ -503,6 +506,48 @@ pub fn sweep_scoped_unsorted(root: &Path, prefixes: &[PathBuf]) -> anyhow::Resul
     sweep_walker_scoped_unsorted(root, prefixes)
 }
 
+/// A scoped sweep for a listing (see [`sweep_scoped_listing`]).
+pub struct ScopedListing {
+    /// [`sweep_scoped_unsorted`]'s files: the same paths and hidden flags,
+    /// unsorted, but mtimes and sizes may be 0.
+    pub files: Vec<FileMeta>,
+    /// Prefixes the sweep entered as a directory, starting the walk at the
+    /// prefix itself because every level above it is one the walk from
+    /// the root enters: the files under such a prefix are exactly the
+    /// ones in `files`, none or many. Other prefixes have no files here
+    /// unless some lie under them.
+    pub entered: Vec<PathBuf>,
+}
+
+/// [`sweep_scoped_unsorted`] for a listing, which reads only paths and
+/// hidden flags: on macOS the bulk walker lists each directory with
+/// readdir instead of getattrlistbulk, under the same kill-switch and
+/// fallback posture. The walker fallback reports no entered prefixes.
+pub fn sweep_scoped_listing(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<ScopedListing> {
+    #[cfg(target_os = "macos")]
+    {
+        let scoped = !prefixes.is_empty() && !prefixes.iter().any(|p| p.as_os_str().is_empty());
+        if scoped && std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+            match crate::walk_bulk::sweep_bulk_scoped_names(root, prefixes) {
+                Ok((files, entered)) => return Ok(ScopedListing { files, entered }),
+                Err(e) => {
+                    if !e.to_string().ends_with("deferring to the walker") {
+                        eprintln!("glep: bulk sweep failed ({e}), falling back to walker sweep");
+                    }
+                    return Ok(ScopedListing {
+                        files: sweep_walker_scoped_unsorted(root, prefixes)?,
+                        entered: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(ScopedListing {
+        files: sweep_scoped_unsorted(root, prefixes)?,
+        entered: Vec::new(),
+    })
+}
+
 /// Portable scoped walker: the full sweep's `WalkBuilder`, rooted at the
 /// root, with an entry filter that descends only into directories inside
 /// or above a prefix and keeps only files inside one.
@@ -512,8 +557,9 @@ fn sweep_walker_scoped_unsorted(
 ) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let scope: std::sync::Arc<Vec<PathBuf>> = std::sync::Arc::new(prefixes.to_vec());
@@ -570,8 +616,9 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let walker = add_rgignore(&mut ignore::WalkBuilder::new(root))
@@ -636,8 +683,9 @@ pub fn sweep_unfiltered(
     }
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let walker = ignore::WalkBuilder::new(root)
@@ -993,10 +1041,7 @@ mod tests {
         let err = sweep_unfiltered(&missing, false, false).unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!(
-                "{}: No such file or directory (os error 2)",
-                missing.display()
-            )
+            format!("{}: {}", missing.display(), crate::messages::not_found())
         );
     }
 
@@ -1500,6 +1545,194 @@ mod tests {
                 ]
             );
         }
+    }
+}
+
+/// The scoped sweep that starts each prefix's walk at the prefix itself
+/// (`walk_bulk::sweep_bulk_scoped`) against the walk from the root it
+/// replaces (`sweep_bulk_scoped_from_root`): for random prefix sets over
+/// a tree with nested `.gitignore` files, whitelists, hidden, ignored and
+/// symlinked directories, the same files with the same metadata and
+/// hidden flags. The names-only listing variant yields the same paths and
+/// flags, and reports as entered exactly the prefixes it started at.
+#[cfg(all(test, target_os = "macos"))]
+mod scoped_start_parity {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let write = |rel: &str, body: &str| {
+            let p = d.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        std::fs::create_dir_all(d.join(".git/info")).unwrap();
+        write(".git/info/exclude", "excluded.txt\n");
+        write(".gitignore", "*.log\nbuild/\n!keep.log\nsecret*\n");
+        write("excluded.txt", "x");
+        write("top.txt", "x");
+        write("a/.gitignore", "x/\n*.tmp\n");
+        write("a/top.txt", "x");
+        write("a/x/y.txt", "x");
+        write("a/xx/y.txt", "x");
+        write("a/b/.gitignore", "!important.tmp\nc2/\n");
+        write("a/b/important.tmp", "x");
+        write("a/b/other.tmp", "x");
+        write("a/b/c/f1.txt", "x");
+        write("a/b/c/f2.log", "x");
+        write("a/b/c/keep.log", "x");
+        write("a/b/c/.env", "x");
+        write("a/b/c2/z.txt", "x");
+        write("build/out.txt", "x");
+        write("build/sub/o.txt", "x");
+        write(".hid/sub/h.txt", "x");
+        write(".hid/.inner/i.txt", "x");
+        write("wl/.gitignore", ".*\n!.gitignore\n!.github/\n");
+        write("wl/.github/workflows/ci.yml", "x");
+        write("wl/.secret/k.txt", "x");
+        write("wl/.dot", "x");
+        write("wl/plain.txt", "x");
+        write("d/g.txt", "x");
+        write("d-e/f.txt", "x");
+        write("d.e/h.txt", "x");
+        write("secretdir/s.txt", "x");
+        write("only_ignored/q.log", "x");
+        std::fs::create_dir_all(d.join("empty")).unwrap();
+        std::os::unix::fs::symlink("a/b", d.join("sym")).unwrap();
+        std::os::unix::fs::symlink("top.txt", d.join("symf")).unwrap();
+        dir
+    }
+
+    /// Every directory and file below `dir` (symlinks included, not
+    /// followed), relative to `root`.
+    fn entries(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            out.push(p.strip_prefix(root).unwrap().to_path_buf());
+            if e.file_type().unwrap().is_dir() {
+                entries(root, &p, out);
+            }
+        }
+    }
+
+    fn sorted(mut v: Vec<FileMeta>) -> Vec<FileMeta> {
+        v.sort_by(|a, b| a.path.cmp(&b.path));
+        v
+    }
+
+    #[test]
+    fn prefix_start_matches_the_walk_from_the_root() {
+        let dir = fixture();
+        let root = dir.path();
+        let mut pool = Vec::new();
+        entries(root, root, &mut pool);
+        // Spellings no listing yields: missing, under a file, through or
+        // at a symlink, another case, `.` and `..`, absolute, trailing
+        // slash, and the hard-excluded `.git`.
+        for extra in [
+            "nope",
+            "a/nope",
+            "a/b/c/f1.txt/x",
+            "sym/c",
+            "A/b",
+            "a/./b",
+            "../x",
+            "/abs",
+            "a/b/",
+            ".git",
+            ".git/info",
+        ] {
+            pool.push(PathBuf::from(extra));
+        }
+        pool.sort();
+        // A fixed-seed generator: the same prefix sets on every run.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % n
+        };
+        let mut entered_rounds = 0;
+        for round in 0..400 {
+            let count = 1 + next(3);
+            let prefixes: Vec<PathBuf> =
+                (0..count).map(|_| pool[next(pool.len())].clone()).collect();
+            let old =
+                sorted(crate::walk_bulk::sweep_bulk_scoped_from_root(root, &prefixes).unwrap());
+            let new = sorted(crate::walk_bulk::sweep_bulk_scoped(root, &prefixes).unwrap());
+            assert_eq!(new, old, "round {round}: {prefixes:?}");
+            let (names, entered) =
+                crate::walk_bulk::sweep_bulk_scoped_names(root, &prefixes).unwrap();
+            let names = sorted(names);
+            let flags = |v: &[FileMeta]| -> Vec<(PathBuf, bool)> {
+                v.iter().map(|m| (m.path.clone(), m.hidden)).collect()
+            };
+            assert_eq!(flags(&names), flags(&old), "round {round}: {prefixes:?}");
+            // Read with names only: no mtime or size, but for a prefix
+            // naming a file, which the walk looks up with its attributes.
+            for (n, o) in names.iter().zip(&old) {
+                assert!(
+                    (n.mtime_ns, n.size) == (0, 0) || (n.mtime_ns, n.size) == (o.mtime_ns, o.size)
+                );
+            }
+            // Entered: real directories among the prefixes, each holding
+            // exactly the walk from the root's files under it, and every
+            // prefix lying in no other prefix that has files under it is
+            // entered, unless a spelling sent the sweep to the root walk.
+            for e in &entered {
+                assert!(prefixes.contains(e), "round {round}: {e:?}");
+                assert!(std::fs::symlink_metadata(root.join(e)).unwrap().is_dir());
+            }
+            entered_rounds += usize::from(!entered.is_empty());
+            let respelled = prefixes.iter().any(|p| p.starts_with("A"));
+            for p in &prefixes {
+                let outer = !prefixes.iter().any(|q| q != p && p.starts_with(q));
+                let has = old.iter().any(|m| m.path.starts_with(p));
+                let is_dir = std::fs::symlink_metadata(root.join(p)).is_ok_and(|m| m.is_dir());
+                if outer && has && is_dir && !respelled {
+                    assert!(entered.contains(p), "round {round}: {p:?} in {prefixes:?}");
+                }
+            }
+        }
+        // Most rounds start at a prefix rather than at the root.
+        assert!(entered_rounds > 100, "{entered_rounds}");
+    }
+
+    /// The pieces the operand-start walk relies on: a file prefix keeps
+    /// the bulk scan's exact mtime and size (the freshness diff compares
+    /// them), and a prefix stored under another spelling falls back to the
+    /// walk from the root instead of listing under the typed spelling.
+    #[test]
+    fn file_prefixes_and_respelled_prefixes() {
+        let dir = fixture();
+        let root = dir.path();
+        let full = sorted(crate::walk_bulk::sweep_bulk(root).unwrap());
+        let file = PathBuf::from("a/b/c/f1.txt");
+        let scoped =
+            crate::walk_bulk::sweep_bulk_scoped(root, std::slice::from_ref(&file)).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(Some(&scoped[0]), full.iter().find(|m| m.path == file));
+        if root.join("A").exists() {
+            // A case-insensitive volume: `A/b` names a/b on disk.
+            let respelled = vec![PathBuf::from("A/b")];
+            let (files, entered) =
+                crate::walk_bulk::sweep_bulk_scoped_names(root, &respelled).unwrap();
+            assert!(files.is_empty() && entered.is_empty());
+        }
+        // An .ignore on the way to a prefix defers to the walker, as
+        // listing that level would.
+        std::fs::write(root.join("a/.ignore"), "top.txt\n").unwrap();
+        let err = crate::walk_bulk::sweep_bulk_scoped(root, &[PathBuf::from("a/b")]).unwrap_err();
+        assert!(
+            err.to_string().ends_with("deferring to the walker"),
+            "{err}"
+        );
+        let swept = sorted(sweep_scoped_unsorted(root, &[PathBuf::from("a/b")]).unwrap());
+        let walked = sorted(sweep_walker_scoped_unsorted(root, &[PathBuf::from("a/b")]).unwrap());
+        assert_eq!(swept, walked);
     }
 }
 

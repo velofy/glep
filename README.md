@@ -38,7 +38,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 ## Features
 
 - **Trigram index** in `.glep/`, memory-mapped, about 10% of corpus size on the kernel tree.
-- **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
+- **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher and no daemon: the one background process is the first index build of a large tree, which runs once and exits.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
 - **Familiar flags:** ripgrep's own spellings, including `-i -S -F -w -x -v -l -c -o -q -U -e -f -g -t -T -C -A -B -m -M -n -N -a -z -P -E -L -u -0 -j -H -I -b` and `--json --stats --heading --column --vimgrep --trim --sort --sortr --count-matches --files-without-match --passthru --null-data --hidden --no-ignore --no-ignore-vcs --ignore-file --type-add --color --hyperlink-format`. Flags that change which files exist for a query (`--no-ignore`, `-L`, `--one-file-system` and friends) run as live scans that never touch the index.
@@ -68,9 +68,9 @@ glep status                     # index stats
 
 `--no-ignore` always pays a full scan: it bypasses the index entirely, so gitignored trees never enter it. It costs the same as `rg --no-ignore`, every time.
 
-The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory.
+The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory. On a tree holding more than 64 MiB the first query does not wait for that build: it answers with a full scan, at rg's cost, and then builds the index in a detached low-priority process, so later queries use it; a smaller tree builds it inline. A query no trigram can narrow (a pattern shorter than three bytes, `.*`, `-v`, `--passthru`, `-c --include-zero`) gets nothing from an index, so it builds none: it searches the tree like `--no-index`, and the first query an index can narrow builds it. `GLEP_SYNC_BUILD=1` always builds inline, and `GLEP_BG_BUILD_MIN_BYTES` moves the threshold (`K`, `M` and `G` suffixes accepted). On Windows the build is always inline.
 
-Binary files are handled the way rg's default reader handles them, and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
+Binary files are handled the way rg's default reader handles them (rg 15.0's, see below), and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
 
 Known differences from rg:
 
@@ -82,6 +82,8 @@ Known differences from rg:
 - `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
 - glep never reads stdin, so a search with no path argument always searches the tree.
 - The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
+- A binary file is read as rg 15.0 reads it: in buffers of 64 KiB, each filled whole before it is searched, and a NUL ends the search before the buffer holding it is searched. rg 15.1 and later search after any read that ends a line, and their byte-order-mark check hands a file's first three bytes over in a read of their own, so on a binary file whose first line is one or two bytes long they print that line, and with a NUL past the first 64 KiB they can stop at another line than rg 15.0 and glep do.
+- Every file is read with a fresh 64 KiB buffer. rg keeps one buffer per search thread, and a line of 64 KiB or more grows it for every file that thread searches afterwards, so under `--sort path` (one thread, in path order) a file with a NUL past its first 64 KiB that sorts after such a line can stop earlier in rg, or print nothing. rg's output for that file then depends on which files it searched before it, and without `--sort` on which thread searched them.
 
 ## When to use it
 
@@ -114,7 +116,7 @@ Linux kernel 6.12 source tree (a tarball extract, not a git checkout): 86,604 fi
 | Single char `q` (no trigram, full scan) | 3.36 s | 3.13 s | 2.8 to 3.3 s | 0.8x / 0.8x |
 | List all .c files (`--files`, 34,657 files) | 195 ms | 45 ms | rg --files 71 ms, fd 74 ms | 0.3x / 1.5x |
 
-Index build (one-time): 28 s. Index size: 154 MB, about 10% of the corpus. Default glep pays the self-healing freshness sweep on each query: on macOS one bulk attribute call per directory, elsewhere a stat per file. `--ttl` skips the sweep inside a read burst, which is the 20 to 81 ms column. Patterns shorter than three bytes, or otherwise trigram-free like `.*`, cannot be narrowed by any trigram index, so glep falls back to a full parallel scan and runs at ripgrep speed (the `q` row). Listings read the manifest after the sweep, so `--files` only beats `rg --files` and `fd` inside a `--ttl` window. On a small 86-file Python repository both tools answer in single-digit milliseconds (glep 4.5 ms, rg 7.0 ms; `--files` 3.4 ms against `rg --files` 4.9 ms and `fd` 7.5 ms), so the index pays off at scale, not on small trees.
+Index build (one-time): 28 s. Index size: 154 MB, about 10% of the corpus. Default glep pays the self-healing freshness sweep on each query: on macOS one bulk attribute call per directory, elsewhere a stat per file. `--ttl` skips the sweep inside a read burst, which is the 20 to 81 ms column. Patterns shorter than three bytes, or otherwise trigram-free like `.*`, cannot be narrowed by any trigram index, so glep falls back to a full parallel scan and runs at ripgrep speed (the `q` row). On macOS such a query over the whole tree, without `--ttl`, skips the index and its freshness sweep and searches the file set the dir-mtime listing cache lists, once a root-wide `--files` listing has built that cache. Listings read the manifest after the sweep, so `--files` only beats `rg --files` and `fd` inside a `--ttl` window. On a small 86-file Python repository both tools answer in single-digit milliseconds (glep 4.5 ms, rg 7.0 ms; `--files` 3.4 ms against `rg --files` 4.9 ms and `fd` 7.5 ms), so the index pays off at scale, not on small trees.
 
 A perf branch not yet on main (worker-pool search with one reusable searcher per thread, zero-copy mmap verification, parallel freshness diff, dir-mtime listing cache) was measured in the same sessions on the same corpus: rare pattern 97 ms (24 ms with `--ttl`), common pattern 152 ms (76 ms), `static` 1.50 s (1.28 s), `--files` 61 ms with or without `--ttl`, ahead of `rg --files` (71 ms) and `fd` (74 ms). This table will be updated when it lands. Details: [Benchmarks](https://velofy.co/glep/benchmarks/).
 

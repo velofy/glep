@@ -32,6 +32,7 @@ use ignore::types::{Types, TypesBuilder};
 use ignore::Match;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// One --type-add / --type-clear / -t / -T, kept in command-line order:
 /// rg applies them in that order, so `-T md -t md` selects md and
@@ -111,11 +112,13 @@ pub struct FilterSpec<'a> {
 pub struct Filters {
     root: PathBuf,
     cwd_rel: PathBuf,
-    overrides: Option<Override>,
+    /// The matchers are shared by every `fork`: a copy per rayon job then
+    /// costs a few pointers, not the type definitions' glob sets.
+    overrides: Option<Arc<Override>>,
     /// --ignore-file matchers, in command-line order; the last one with an
     /// opinion decides, and only where no ignore file in the tree has one.
-    explicit: Vec<Gitignore>,
-    types: Option<Types>,
+    explicit: Arc<Vec<Gitignore>>,
+    types: Option<Arc<Types>>,
     max_depth: Option<usize>,
     show_hidden: bool,
     /// Directory levels can be skipped by these filters: an override has a
@@ -162,9 +165,9 @@ impl Filters {
         Ok(Filters {
             root: root.to_path_buf(),
             cwd_rel: cwd_rel.to_path_buf(),
-            overrides,
-            explicit,
-            types,
+            overrides: overrides.map(Arc::new),
+            explicit: Arc::new(explicit),
+            types: types.map(Arc::new),
             max_depth: spec.max_depth,
             show_hidden: spec.hidden,
             prune_dirs,
@@ -178,9 +181,9 @@ impl Filters {
         })
     }
 
-    /// A copy with the same matchers and operand and empty caches, for a
-    /// worker thread.
-    fn fork(&self) -> Filters {
+    /// A copy with the same (shared) matchers and operand and empty
+    /// caches, for a worker thread.
+    pub fn fork(&self) -> Filters {
         Filters {
             root: self.root.clone(),
             cwd_rel: self.cwd_rel.clone(),
@@ -252,12 +255,12 @@ impl Filters {
 
     /// The override matcher, for walkers that apply it themselves.
     pub fn overrides(&self) -> Option<&Override> {
-        self.overrides.as_ref()
+        self.overrides.as_deref()
     }
 
     /// The type matcher, for walkers that apply it themselves.
     pub fn types(&self) -> Option<&Types> {
-        self.types.as_ref()
+        self.types.as_deref()
     }
 
     /// Whether rg would yield `f` (root-relative, under the operand set by

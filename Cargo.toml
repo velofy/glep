@@ -17,6 +17,8 @@ bstr = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4.6.11"
 clap_mangen = "0.3.3"
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
 flate2 = { version = "1", features = ["rust_backend"] }
 fs2 = "0.4"
 globset = "0.4"
@@ -40,5 +42,5 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
