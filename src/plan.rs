@@ -9,41 +9,33 @@ pub enum Plan {
     All,
 }
 
-/// How the matcher compares letters, which decides the trigrams of a
-/// required literal that the index can look up (`Index::postings_for`
-/// looks a trigram up as is, or, case-insensitively, as every ASCII case
-/// variant of it).
+/// How the matcher compares letters, which decides how the index looks a
+/// required trigram up (`Index::postings_for`) and which trigrams of a
+/// literal it can look up at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Case {
     /// Byte for byte: every trigram is looked up as is.
     Sensitive,
-    /// ASCII case folding only (--no-unicode): the ASCII variants of an
-    /// all-ASCII trigram cover every match of it.
+    /// ASCII case folding only (--no-unicode): an all-ASCII trigram is
+    /// looked up as each of its ASCII case variants.
     Ascii,
     /// Unicode simple case folding, both engines' -i (and -S) in their
     /// default Unicode mode. ASCII letters fold among themselves except
     /// two: `k`/`K` also match KELVIN SIGN (U+212A) and `s`/`S` LONG S
-    /// (U+017F), multibyte characters no ASCII variant covers, so a
-    /// trigram holding one of them, or any non-ASCII byte, cannot be
-    /// looked up.
+    /// (U+017F), so an all-ASCII trigram is looked up as every trigram a
+    /// match can put in a file (`trigram::fold_variants`).
     Unicode,
 }
 
 impl Case {
-    /// Whether lookups use the ASCII case variants of each trigram.
-    pub fn insensitive(self) -> bool {
-        self != Case::Sensitive
-    }
-
     /// Whether every match of the literal bytes `t` contains one of the
-    /// index's lookups for them.
+    /// index's lookups for them: always when case-sensitive; otherwise
+    /// only for all-ASCII bytes, since a non-ASCII character can fold to
+    /// characters of other byte lengths.
     fn covers(self, t: &[u8]) -> bool {
         match self {
             Case::Sensitive => true,
-            Case::Ascii => t.is_ascii(),
-            Case::Unicode => t
-                .iter()
-                .all(|b| b.is_ascii() && !matches!(b, b'k' | b'K' | b's' | b'S')),
+            Case::Ascii | Case::Unicode => t.is_ascii(),
         }
     }
 }
@@ -404,29 +396,16 @@ mod tests {
         }
     }
 
-    /// `k` and `s` also match KELVIN SIGN and LONG S under Unicode case
-    /// folding, which no ASCII case variant covers, so their trigrams
-    /// never narrow a case-insensitive Unicode search. ASCII-only folding
-    /// (--no-unicode) and case-sensitive searches keep them.
+    /// `k` and `s` trigrams still narrow a Unicode case-insensitive
+    /// search: the index looks them up with their KELVIN SIGN and LONG S
+    /// spellings too (`trigram::fold_variants`).
     #[test]
-    fn unicode_case_insensitive_drops_k_and_s_trigrams() {
-        match build("kfree", false, Case::Unicode) {
-            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"fre"), pack(b"ree")]]),
-            Plan::All => panic!("expected groups"),
-        }
-        match build("KFREE", true, Case::Unicode) {
-            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"FRE"), pack(b"REE")]]),
-            Plan::All => panic!("expected groups"),
-        }
-        match build("mismatch", false, Case::Unicode) {
-            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"atc"), pack(b"mat"), pack(b"tch")]]),
-            Plan::All => panic!("expected groups"),
-        }
-        // Every trigram holds a k or an s: nothing is left to narrow on.
-        assert!(matches!(build("kiss", false, Case::Unicode), Plan::All));
-        for case in [Case::Ascii, Case::Sensitive] {
+    fn k_and_s_trigrams_still_narrow() {
+        for case in [Case::Unicode, Case::Ascii, Case::Sensitive] {
             match build("kfree", false, case) {
-                Plan::Groups(g) => assert!(g[0].contains(&pack(b"kfr"))),
+                Plan::Groups(g) => {
+                    assert_eq!(g, vec![vec![pack(b"fre"), pack(b"kfr"), pack(b"ree")]])
+                }
                 Plan::All => panic!("expected groups"),
             }
         }
@@ -458,7 +437,14 @@ mod tests {
                 _ => &[],
             };
             assert_eq!(non_ascii, expect, "{}", c as char);
-            assert_eq!(Case::Unicode.covers(&[c, b'x', b'y']), expect.is_empty());
+            // Each partner's UTF-8 has its own trigram windows.
+            let t = crate::trigram::pack(&[c, b'x', b'y']);
+            let lookups = crate::trigram::fold_variants(t);
+            for ch in expect {
+                let text = format!("{ch}xy");
+                let tris = crate::trigram::extract(text.as_bytes());
+                assert!(lookups.iter().any(|v| tris.contains(v)), "{text}");
+            }
         }
     }
 }

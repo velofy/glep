@@ -973,11 +973,11 @@ fn matcher_config_matches_rg() {
 }
 
 /// Under Unicode case folding (rg's -i and -S), ASCII `k` and `s` also
-/// match KELVIN SIGN (U+212A) and LONG S (U+017F). The index narrows a
-/// case-insensitive search with the ASCII case variants of each trigram,
-/// which never cover those two, so kelvin.txt and longs.txt are found
-/// only when trigrams holding a k or an s do not narrow. Other ASCII
-/// trigrams still narrow, next to non-ASCII text too (cafe.txt).
+/// match KELVIN SIGN (U+212A) and LONG S (U+017F). ASCII case variants of
+/// a trigram never cover those two, so kelvin.txt and longs.txt are found
+/// only when the index also looks k and s trigrams up with their Kelvin
+/// and long s spellings. ASCII trigrams next to non-ASCII text still
+/// narrow (cafe.txt).
 #[test]
 fn unicode_case_folding_matches_rg() {
     if !have_rg() {
@@ -991,8 +991,14 @@ fn unicode_case_folding_matches_rg() {
     std::fs::write(d.join("plain.txt"), "plain kfree and mismatch\n").unwrap();
     std::fs::write(d.join("cafe.txt"), "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\n").unwrap();
     std::fs::write(d.join("other.txt"), "nothing to see\n").unwrap();
+    // Several fold partners inside one trigram.
+    std::fs::write(d.join("mid.txt"), "ab\u{17F}k zz\n").unwrap();
+    std::fs::write(d.join("kk.txt"), "x\u{212A}\u{212A}y\n").unwrap();
     let cases: &[&[&str]] = &[
         &["-i", "kfree"],
+        &["-i", "-c", "absk"],
+        &["-i", "-c", "xkky"],
+        &["-i", "-l", "kiss"],
         &["-S", "kfree"],
         &["-i", "-F", "KFREE"],
         &["-i", "-w", "kfree"],

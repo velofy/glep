@@ -2165,12 +2165,8 @@ pub fn run() -> anyhow::Result<i32> {
     // they stay out.
     let search_binary =
         args.text || args.binary || args.null_data || !utf8_only || args.pre.is_some();
-    let (mut plain, mut hidden) = idx.candidates_split(
-        &query_plan,
-        plan_case.insensitive(),
-        args.hidden,
-        search_binary,
-    );
+    let (mut plain, mut hidden) =
+        idx.candidates_split(&query_plan, plan_case, args.hidden, search_binary);
     if args.search_zip {
         let (zip_plain, zip_hidden) = idx.zip_candidates_split(args.hidden);
         merge_extra(&mut plain, zip_plain);
