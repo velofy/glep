@@ -1420,27 +1420,30 @@ fn per_file_errors_exit_two_like_rg() {
     std::fs::write(d.join("sub/s.txt"), "hello s\n").unwrap();
     std::fs::write(d.join("u.txt"), "hello u\n").unwrap();
     std::fs::set_permissions(d.join("u.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
-    // Running as root: nothing is unreadable, so the case proves nothing.
-    if std::fs::read(d.join("u.txt")).is_ok() {
-        eprintln!("parity: files stay readable (root?), skipping");
-        return;
-    }
     std::os::unix::fs::symlink("nowhere", d.join("dang")).unwrap();
-    let mut cases: Vec<&[&str]> = vec![
-        &["hello"],
-        &["-c", "hello"],
-        &["-l", "hello"],
-        &["-q", "hello"],
-        &["-q", "zz_absent_zz"],
-        &["--no-messages", "hello"],
-        &["--files"],
+    // As root nothing is unreadable: those cases would prove nothing, but
+    // the dangling link, --pre and -z ones still hold.
+    let unreadable = std::fs::read(d.join("u.txt")).is_err();
+    let mut cases: Vec<&[&str]> = Vec::new();
+    if unreadable {
+        cases.extend_from_slice(&[
+            &["hello"],
+            &["-c", "hello"],
+            &["-l", "hello"],
+            &["-q", "hello"],
+            &["-q", "zz_absent_zz"],
+            &["--no-messages", "hello"],
+            &["--files"],
+        ]);
+    }
+    cases.extend_from_slice(&[
         &["-L", "-l", "hello"],
         &["-L", "--files"],
         &["--pre", "false", "hello", "p.txt"],
         &["--pre", "false", "-l", "hello"],
         &["--pre", "cat", "-c", "hello"],
         &["--pre", "cat", "-q", "hello"],
-    ];
+    ]);
     if have_cmd("gzip") {
         std::fs::write(d.join("bad.gz"), b"not gzip at all\n").unwrap();
         cases.extend_from_slice(&[&["-z", "hello", "bad.gz"], &["-z", "-c", "hello"]]);
