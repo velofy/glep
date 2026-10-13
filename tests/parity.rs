@@ -1129,6 +1129,110 @@ fn remaining_stack_flags_match_rg() {
     check_cases(pool.path(), "pool", cases);
 }
 
+/// Like rg, a repeated flag is last-wins instead of an error (wrappers and
+/// aliases that always add -n, --color or --sort), and rg's negated and
+/// alias spellings are accepted, each acting where it stands: `-uu
+/// --no-hidden`, `--no-ignore --ignore-vcs`, `-P --no-pcre2`, ...
+#[test]
+fn repeated_and_negated_flags_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["-n", "-n", "hello"],
+        &["-i", "-i", "HELLO"],
+        &["-w", "-w", "foo"],
+        &["-l", "-l", "hello"],
+        &["-c", "-c", "hello"],
+        &["-A1", "-A2", "hello"],
+        &["-m1", "-m2", "foo"],
+        &["-M", "5", "-M", "10", "a+"],
+        &["--threads", "2", "-j1", "hello"],
+        &["--sort", "path", "--sortr", "path", "-l", "hello"],
+        &["--sortr", "path", "--sort", "path", "-l", "hello"],
+        &["--color", "never", "--color", "never", "hello"],
+        &["--json", "--json", "-l", "hello"],
+        &["--hidden", "--hidden", "-l", "hiddentoken"],
+        &["-E", "utf-8", "-E", "utf-8", "hello"],
+        &["-r", "a", "-r", "b", "hello"],
+        &[
+            "--context-separator",
+            "a",
+            "--context-separator",
+            "b",
+            "-C1",
+            "hello",
+        ],
+        &["--null-data", "--null-data", "-c", "hello"],
+        &["-v", "-v", "-c", "hello"],
+        &["-q", "-q", "hello"],
+        &["-g", "*.rs", "-g", "*.md", "-l", "hello"],
+        &["-e", "hello", "-e", "answer", "-l"],
+        &["--unrestricted", "-l", "hello"],
+        &["--unrestricted", "--unrestricted", "-l", "hiddentoken"],
+        &["-uu", "--no-hidden", "-l", "hiddentoken"],
+        &["--no-hidden", "-uu", "-l", "hiddentoken"],
+        &["--no-ignore", "--ignore", "-l", "hello"],
+        &["--ignore", "--no-ignore", "-l", "hello"],
+        &["--no-ignore", "--ignore-vcs", "-l", "hello"],
+        &["--no-ignore", "--ignore-dot", "-l", "hello"],
+        &["--no-ignore-vcs", "--ignore", "-l", "hello"],
+        &["-u", "--ignore", "-l", "hello"],
+        &["-a", "--no-text", "-c", "binary"],
+        &["--binary", "--no-binary", "binary"],
+        &["-uuu", "--no-binary", "-l", "binary"],
+        &["-P", "--no-pcre2", "-c", "hel+o"],
+        &["--no-pcre2", "-c", "hello"],
+        &["--no-unicode", "--unicode", "-c", "\\w+"],
+        &["--sort-files", "-l", "hello"],
+        &["--no-sort-files", "--sort-files", "-l", "hello"],
+        &["--line-buffered", "--no-line-buffered", "hello"],
+        &["--no-block-buffered", "hello"],
+        &["--no-require-git", "-l", "hello"],
+        &["--require-git", "--no-require-git", "-l", "hello"],
+        &["--no-require-git", "--require-git", "-l", "hello"],
+        &["-U", "--no-multiline", "-c", "hello"],
+        &["--multiline-dotall", "--no-multiline-dotall", "-c", "hello"],
+        &["--no-follow", "-l", "hello"],
+        &["--crlf", "--no-crlf", "-c", "hello$"],
+        &["-F", "--no-fixed-strings", "-c", "hel.o"],
+        &["-v", "--no-invert-match", "-c", "hello"],
+        &["--json", "--no-json", "-c", "hello"],
+        &["--stats", "--no-stats", "-c", "hello"],
+        &["--trim", "--no-trim", "padded"],
+        &["-z", "--no-search-zip", "-l", "hello"],
+        &["--column", "--no-column", "hello"],
+        &["-b", "--no-byte-offset", "hello"],
+        &["-c", "--include-zero", "--no-include-zero", "hello"],
+        &[
+            "-M",
+            "5",
+            "--max-columns-preview",
+            "--no-max-columns-preview",
+            "a+",
+        ],
+        &["--one-file-system", "--no-one-file-system", "-l", "hello"],
+        &[
+            "--glob-case-insensitive",
+            "--no-glob-case-insensitive",
+            "-g",
+            "*.MD",
+            "-l",
+            "hello",
+        ],
+        &["--no-ignore-file-case-insensitive", "-l", "hello"],
+        &["--no-pre", "-c", "hello"],
+        &["--messages", "--ignore-messages", "-l", "hello"],
+        &["--no-messages", "--messages", "hello", "no_such_path"],
+        &["--no-ignore-files", "-l", "hello"],
+        &["--ignore-files", "-l", "hello"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    let pool = pool_corpus();
+    check_cases(pool.path(), "pool", cases);
+}
+
 #[cfg(unix)]
 fn have_cmd(cmd: &str) -> bool {
     std::process::Command::new(cmd)

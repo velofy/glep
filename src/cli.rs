@@ -7,7 +7,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "glep", version, about = "Indexed grep + glob for AI agents")]
+#[command(
+    name = "glep",
+    version,
+    about = "Indexed grep + glob for AI agents",
+    // A repeated flag is last-wins, like rg (`-n -n`, `--sort path --sort
+    // none`); repeatable lists (-e, -g, -t, ...) and the -u counter keep
+    // accumulating.
+    args_override_self = true
+)]
 pub struct Args {
     /// Pattern, or the subcommands: index, status
     pub pattern: Option<String>,
@@ -95,7 +103,7 @@ pub struct Args {
     pub ignore_file: Vec<std::path::PathBuf>,
     /// Unrestricted search: -u = --no-ignore, -uu = --no-ignore + --hidden,
     /// -uuu = --no-ignore + --hidden + --binary (rg's ladder).
-    #[arg(short = 'u', action = clap::ArgAction::Count)]
+    #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count)]
     pub unrestricted: u8,
     /// Color output: never (default), always, auto (when stdout is a tty).
     /// --colors sets individual specs like the reference's --colors flag.
@@ -132,9 +140,9 @@ pub struct Args {
     /// Print no context separators at all (rg --no-context-separator)
     #[arg(long, overrides_with = "context_separator")]
     pub no_context_separator: bool,
-    /// PCRE2 regex engine (lookaround, backrefs, etc.). A last-wins pair
-    /// with --engine, like rg.
-    #[arg(short = 'P', long = "pcre2", overrides_with = "engine")]
+    /// PCRE2 regex engine (lookaround, backrefs, etc.). Last-wins with
+    /// --engine and --no-pcre2, like rg.
+    #[arg(short = 'P', long = "pcre2")]
     pub pcre2: bool,
     /// Include hidden (dot-prefixed) files and directories, rg semantics.
     /// .git is always excluded regardless of this flag.
@@ -419,6 +427,95 @@ pub struct Args {
     /// always scanned); K, M and G suffixes accepted
     #[arg(long, default_value = "1048576", value_name = "NUM+SUFFIX?", value_parser = parse_human_u64)]
     pub max_filesize: u64,
+    // rg's negated and alias spellings, accepted for scripts and aliases.
+    // Each pair is last-wins (clap's overrides_with); the ones that
+    // interact with -u or with each other (ignore sources, --hidden, the
+    // binary mode, the regex engine, unicode, sorting, buffering) are
+    // resolved by command-line position in `resolve_flag_families`.
+    #[arg(long, hide = true, overrides_with = "require_git")]
+    pub no_require_git: bool,
+    #[arg(long, hide = true)]
+    pub no_hidden: bool,
+    #[arg(long = "ignore", hide = true)]
+    pub ignore_all: bool,
+    #[arg(long, hide = true)]
+    pub ignore_dot: bool,
+    #[arg(long, hide = true)]
+    pub ignore_vcs: bool,
+    #[arg(long, hide = true)]
+    pub ignore_exclude: bool,
+    #[arg(long, hide = true)]
+    pub ignore_global: bool,
+    #[arg(long, hide = true)]
+    pub ignore_parent: bool,
+    /// Ignore every --ignore-file flag, even later ones (rg
+    /// --no-ignore-files; --ignore-files undoes it)
+    #[arg(long, hide = true)]
+    pub no_ignore_files: bool,
+    #[arg(long, hide = true, overrides_with = "no_ignore_files")]
+    pub ignore_files: bool,
+    #[arg(long, hide = true, overrides_with = "no_messages")]
+    pub messages: bool,
+    #[arg(long, hide = true, overrides_with = "no_ignore_messages")]
+    pub ignore_messages: bool,
+    #[arg(long, hide = true, overrides_with = "multiline")]
+    pub no_multiline: bool,
+    #[arg(long, hide = true, overrides_with = "multiline_dotall")]
+    pub no_multiline_dotall: bool,
+    #[arg(long, hide = true)]
+    pub no_text: bool,
+    #[arg(long, hide = true)]
+    pub no_binary: bool,
+    #[arg(long, hide = true)]
+    pub no_pcre2: bool,
+    #[arg(long, hide = true)]
+    pub auto_hybrid_regex: bool,
+    #[arg(long, hide = true)]
+    pub no_auto_hybrid_regex: bool,
+    #[arg(long, hide = true)]
+    pub unicode: bool,
+    #[arg(long, hide = true)]
+    pub pcre2_unicode: bool,
+    #[arg(long, hide = true)]
+    pub no_pcre2_unicode: bool,
+    #[arg(long, hide = true)]
+    pub no_sort_files: bool,
+    #[arg(long, hide = true)]
+    pub no_line_buffered: bool,
+    #[arg(long, hide = true)]
+    pub no_block_buffered: bool,
+    #[arg(long, hide = true, overrides_with = "follow")]
+    pub no_follow: bool,
+    #[arg(long, hide = true, overrides_with = "crlf")]
+    pub no_crlf: bool,
+    #[arg(long, hide = true, overrides_with = "fixed_strings")]
+    pub no_fixed_strings: bool,
+    #[arg(long, hide = true, overrides_with = "invert_match")]
+    pub no_invert_match: bool,
+    #[arg(long, hide = true, overrides_with = "json")]
+    pub no_json: bool,
+    #[arg(long, hide = true, overrides_with = "stats")]
+    pub no_stats: bool,
+    #[arg(long, hide = true, overrides_with = "trim")]
+    pub no_trim: bool,
+    #[arg(long, hide = true, overrides_with = "search_zip")]
+    pub no_search_zip: bool,
+    #[arg(long, hide = true, overrides_with = "column")]
+    pub no_column: bool,
+    #[arg(long, hide = true, overrides_with = "byte_offset")]
+    pub no_byte_offset: bool,
+    #[arg(long, hide = true, overrides_with = "include_zero")]
+    pub no_include_zero: bool,
+    #[arg(long, hide = true, overrides_with = "max_columns_preview")]
+    pub no_max_columns_preview: bool,
+    #[arg(long, hide = true, overrides_with = "one_file_system")]
+    pub no_one_file_system: bool,
+    #[arg(long, hide = true, overrides_with = "glob_case_insensitive")]
+    pub no_glob_case_insensitive: bool,
+    #[arg(long, hide = true, overrides_with = "ignore_file_case_insensitive")]
+    pub no_ignore_file_case_insensitive: bool,
+    #[arg(long, hide = true, overrides_with = "pre")]
+    pub no_pre: bool,
     /// The resolved pattern list for a content search (set in `run`).
     #[arg(skip)]
     pub pattern_set: Vec<String>,
@@ -1420,6 +1517,176 @@ fn last_index(matches: &clap::ArgMatches, id: &str) -> Option<usize> {
     matches.indices_of(id).and_then(|i| i.max())
 }
 
+/// rg resolves these flags by position: each acts where it stands, so the
+/// last writer of a setting wins even across different flags (`-uu
+/// --no-hidden`, `--no-ignore --ignore-vcs`, `-a -uuu`, `-P --engine
+/// default`, `--sort path --no-sort-files`). The -u counter carries only
+/// its last position, so all of its levels act there (the usual `-uu` or
+/// `-uuu` cluster).
+fn resolve_flag_families(args: &mut Args, matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    /// The value of the last writer among `(position, value)` pairs, or
+    /// `default` when none of them was given.
+    fn last<T: Copy>(default: T, writers: &[(Option<usize>, T)]) -> T {
+        writers
+            .iter()
+            .filter_map(|&(at, v)| at.map(|at| (at, v)))
+            .max_by_key(|&(at, _)| at)
+            .map_or(default, |(_, v)| v)
+    }
+    let at = |id: &str| last_index(matches, id);
+    let u = at("unrestricted");
+    let level = |n: u8| u.filter(|_| args.unrestricted >= n);
+
+    // Ignore sources: --no-ignore and -u turn all five off, --ignore
+    // turns them back on, each --no-ignore-X / --ignore-X flips one.
+    let all_off = at("no_ignore").max(level(1));
+    let all_on = at("ignore_all");
+    let respected = |no: &str, yes: &str| {
+        last(
+            true,
+            &[
+                (all_off, false),
+                (all_on, true),
+                (at(no), false),
+                (at(yes), true),
+            ],
+        )
+    };
+    let dot = respected("no_ignore_dot", "ignore_dot");
+    let vcs = respected("no_ignore_vcs", "ignore_vcs");
+    let exclude = respected("no_ignore_exclude", "ignore_exclude");
+    let global = respected("no_ignore_global", "ignore_global");
+    let parent = respected("no_ignore_parent", "ignore_parent");
+    args.no_ignore_dot = !dot;
+    args.no_ignore_vcs = !vcs;
+    args.no_ignore_exclude = !exclude;
+    args.no_ignore_global = !global;
+    args.no_ignore_parent = !parent;
+    args.no_ignore = !(dot || vcs || exclude || global || parent);
+
+    // -uu adds --hidden.
+    args.hidden = last(
+        false,
+        &[
+            (at("hidden"), true),
+            (at("no_hidden"), false),
+            (level(2), true),
+        ],
+    );
+
+    // The binary mode: -a/--text, --binary (and -uuu), or rg's default
+    // (--no-text and --no-binary both go back to it).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Bin {
+        Quit,
+        Text,
+        Convert,
+    }
+    let bin = last(
+        Bin::Quit,
+        &[
+            (at("text"), Bin::Text),
+            (at("no_text"), Bin::Quit),
+            (at("binary"), Bin::Convert),
+            (at("no_binary"), Bin::Quit),
+            (level(3), Bin::Convert),
+        ],
+    );
+    args.text = bin == Bin::Text;
+    args.binary = bin == Bin::Convert;
+
+    // The regex engine: -P, --no-pcre2, --engine, and the deprecated
+    // --auto-hybrid-regex pair. --engine's value is checked wherever it
+    // stands, like rg's flag parser does.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Engine {
+        Default,
+        Pcre2,
+        Auto,
+    }
+    let engine = match args.engine.as_deref() {
+        None => Engine::Default,
+        Some("default") => Engine::Default,
+        Some("pcre2") => Engine::Pcre2,
+        // rg's hybrid mode: decided per pattern when the matcher is built
+        // (search::run falls back to PCRE2).
+        Some("auto") => Engine::Auto,
+        Some(other) => anyhow::bail!("unrecognized regex engine '{other}'"),
+    };
+    let engine = last(
+        Engine::Default,
+        &[
+            (at("pcre2"), Engine::Pcre2),
+            (at("no_pcre2"), Engine::Default),
+            (at("engine"), engine),
+            (at("auto_hybrid_regex"), Engine::Auto),
+            (at("no_auto_hybrid_regex"), Engine::Default),
+        ],
+    );
+    args.pcre2 = engine == Engine::Pcre2;
+    args.engine_auto = engine == Engine::Auto;
+
+    // Unicode, with the deprecated --pcre2-unicode spellings.
+    args.no_unicode = !last(
+        true,
+        &[
+            (at("no_unicode"), false),
+            (at("unicode"), true),
+            (at("pcre2_unicode"), true),
+            (at("no_pcre2_unicode"), false),
+        ],
+    );
+
+    // Sorting: --sort, --sortr, and the deprecated --sort-files pair
+    // (--no-sort-files turns sorting off again).
+    #[derive(Clone, Copy)]
+    enum Sort {
+        Unset,
+        Sort,
+        Sortr,
+        Path,
+        Off,
+    }
+    match last(
+        Sort::Unset,
+        &[
+            (at("sort"), Sort::Sort),
+            (at("sortr"), Sort::Sortr),
+            (at("sort_files"), Sort::Path),
+            (at("no_sort_files"), Sort::Off),
+        ],
+    ) {
+        Sort::Unset => {}
+        Sort::Sort => args.sortr = None,
+        Sort::Sortr => args.sort = None,
+        Sort::Path => {
+            args.sort = Some("path".to_string());
+            args.sortr = None;
+        }
+        Sort::Off => {
+            args.sort = None;
+            args.sortr = None;
+        }
+    }
+
+    // Output buffering: only line buffering changes what glep does.
+    args.line_buffered = last(
+        false,
+        &[
+            (at("line_buffered"), true),
+            (at("no_line_buffered"), false),
+            (at("block_buffered"), false),
+            (at("no_block_buffered"), false),
+        ],
+    );
+
+    // --no-ignore-files drops every --ignore-file, even later ones.
+    if args.no_ignore_files {
+        args.ignore_file.clear();
+    }
+    Ok(())
+}
+
 pub fn run() -> anyhow::Result<i32> {
     use clap::{CommandFactory, FromArgMatches};
     let matches = Args::command().get_matches();
@@ -1441,23 +1708,7 @@ pub fn run() -> anyhow::Result<i32> {
             args.paths.insert(0, PathBuf::from(p));
         }
     }
-    // -u/-uu/-uuu fold into their flag equivalents, rg's ladder: -u is
-    // --no-ignore, -uu adds --hidden, -uuu adds --binary (binary files are
-    // searched and reported with a notice, not printed as text). As in rg
-    // the -u flags act where they stand, so an -a after -uuu still wins.
-    if args.unrestricted > 0 {
-        args.no_ignore = true;
-        if args.unrestricted >= 2 {
-            args.hidden = true;
-        }
-        if args.unrestricted >= 3
-            && last_index(&matches, "unrestricted")
-                > last_index(&matches, "text").max(last_index(&matches, "binary"))
-        {
-            args.binary = true;
-            args.text = false;
-        }
-    }
+    resolve_flag_families(&mut args, &matches)?;
 
     // Commands that print and exit before any tree work.
     // --generate emits shell completions or a man page.
@@ -1521,10 +1772,6 @@ pub fn run() -> anyhow::Result<i32> {
     if args.print0 {
         args.null = true;
     }
-    if args.sort_files {
-        args.sort = Some("path".to_string());
-        args.sortr = None;
-    }
     if args.pretty {
         // -p is rg's alias for --color always --heading --line-number, so
         // each of those settings only holds unless a flag given AFTER -p
@@ -1549,17 +1796,6 @@ pub fn run() -> anyhow::Result<i32> {
     if args.null_data {
         args.text = true;
         args.binary = false;
-    }
-    // --engine and -P are a last-wins pair (clap keeps only the later).
-    if let Some(e) = &args.engine {
-        match e.as_str() {
-            "default" => args.pcre2 = false,
-            "pcre2" => args.pcre2 = true,
-            // rg's hybrid mode: decided per pattern when the matcher is
-            // built (search::run falls back to PCRE2).
-            "auto" => args.engine_auto = true,
-            other => anyhow::bail!("unrecognized regex engine '{other}'"),
-        }
     }
     // -E: `auto` is the default (BOM sniffing), `none` turns sniffing
     // off; any other label must name a real encoding.
