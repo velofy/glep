@@ -76,7 +76,7 @@ Known differences from rg:
 
 - Paths under an operand print relative to the cwd: `glep pat ./src` prints `src/x` where rg prints `./src/x` (likewise for `..` operands), so `bytes_printed` in the JSON summary can differ too. A file operand prints the same way, with native separators: on Windows a typed `src/main.rs` prints as `src\main.rs`, where rg keeps the spelling typed.
 - `--files` takes a glob in the pattern slot, where rg takes paths. Like `-g`, it matches the path relative to the cwd.
-- A positive `-g`/`--iglob` glob does not bring back files or directories that ignore rules exclude. In rg, glob overrides outrank `.gitignore` and `.ignore`, so `rg -g '*.log'` also searches gitignored logs and `rg -g '*'` descends into every ignored directory; glep filters the indexed file set, which never holds ignored files. Add `--no-ignore` to get rg's result. A glob or `-t` type does rescue a hidden file, as in rg.
+- A positive `-g`/`--iglob` glob does not bring back files or directories that ignore rules exclude. In rg, glob overrides outrank `.gitignore` and `.ignore`, so `rg -g '*.log'` also searches gitignored logs and `rg -g '*'` descends into every ignored directory; glep filters the indexed file set, which never holds ignored files. Add `--no-ignore` to search ignored files too. A glob or `-t` type does rescue a hidden file, as in rg.
 - `.git` and `.glep` are never listed or searched, even under `-uu`.
 - `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`); pass `--require-git` for rg's default.
 - `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
