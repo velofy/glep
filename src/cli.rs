@@ -1596,26 +1596,36 @@ fn names_below_root(p: &Path) -> bool {
 /// prefix's and the next byte is a separator or the end (both are plain
 /// names joined by single separators). Stops once every prefix has one.
 fn prefixes_with_files(metas: &[walk::FileMeta], prefixes: &[PathBuf]) -> Vec<bool> {
-    let sep = std::path::MAIN_SEPARATOR as u8;
     let mut found = vec![false; prefixes.len()];
     let mut missing = prefixes.len();
     for m in metas {
         if missing == 0 {
             break;
         }
-        let path = m.path.as_os_str().as_encoded_bytes();
         for (prefix, seen) in prefixes.iter().zip(found.iter_mut()) {
-            let prefix = prefix.as_os_str().as_encoded_bytes();
-            if !*seen
-                && path.starts_with(prefix)
-                && path.get(prefix.len()).is_none_or(|&b| b == sep)
-            {
+            if !*seen && path_is_under(&m.path, prefix) {
                 *seen = true;
                 missing -= 1;
             }
         }
     }
     found
+}
+
+/// Whether `path` is `prefix` or lies below it, comparing whole names.
+/// On Unix both are plain names joined by single '/' separators, so a byte
+/// comparison is exact and cheap. Windows accepts '/' and '\\' alike and
+/// operands may mix them, so it compares path components instead.
+#[cfg(unix)]
+fn path_is_under(path: &Path, prefix: &Path) -> bool {
+    let path = path.as_os_str().as_encoded_bytes();
+    let prefix = prefix.as_os_str().as_encoded_bytes();
+    path.starts_with(prefix) && path.get(prefix.len()).is_none_or(|&b| b == b'/')
+}
+
+#[cfg(not(unix))]
+fn path_is_under(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix)
 }
 
 /// A scoped --files listing (directory operands below the root, see
@@ -2967,6 +2977,27 @@ mod tests {
             [true, true, false, true, true, false, true]
         );
         assert_eq!(prefixes_with_files(&[], &prefixes), [false; 7]);
+    }
+
+    /// Windows takes either separator in operands and swept paths alike.
+    #[cfg(windows)]
+    #[test]
+    fn prefixes_with_files_takes_either_separator_on_windows() {
+        let meta = |p: &str| walk::FileMeta {
+            path: PathBuf::from(p),
+            mtime_ns: 0,
+            size: 0,
+            hidden: false,
+        };
+        let metas = [meta("src\\a.rs"), meta("srcx\\b.rs"), meta("src2\\c\\d")];
+        let prefixes: Vec<PathBuf> = ["src", "src2/c", "src2\\c", "sr", "src\\a.rs"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            prefixes_with_files(&metas, &prefixes),
+            [true, true, true, false, true]
+        );
     }
 
     #[cfg(unix)]
