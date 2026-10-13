@@ -1,5 +1,6 @@
 pub mod manifest;
 pub mod postings;
+pub mod quick;
 
 use crate::plan::{Case, Plan};
 use crate::timing::Timings;
@@ -252,6 +253,102 @@ fn entry_flags(
         flags |= FLAG_RACY;
     }
     flags
+}
+
+/// The ids below `below` that `tri`'s postings hold in `segs`, under
+/// every spelling `case` looks it up as, ascending and unique.
+fn postings_for(segs: &[&Postings], tri: u32, case: Case, below: u64) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for t in Index::lookup_variants(tri, case) {
+        for seg in segs {
+            if let Some(v) = seg.lookup_below(t, below) {
+                ids.extend(v);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Total stored blob bytes of `tri`'s postings in `segs`, every spelling
+/// `case` looks it up as, without decoding any of them: 0 when no indexed
+/// file holds the trigram.
+fn postings_len(segs: &[&Postings], tri: u32, case: Case) -> usize {
+    Index::lookup_variants(tri, case)
+        .into_iter()
+        .map(|t| segs.iter().map(|seg| seg.blob_len(t)).sum::<usize>())
+        .sum()
+}
+
+/// Narrow `acc` (ascending, unique) to the ids `tri`'s postings in `segs`
+/// hold, under any spelling `case` looks it up as. Each stored blob is
+/// merged against `acc` as it decodes, so no list is materialized and
+/// none decodes past `acc`'s last id. A blob that fails to decode before
+/// then counts as empty, as `Postings::lookup` treats it.
+fn retain_postings(segs: &[&Postings], acc: &mut Vec<u32>, tri: u32, case: Case) {
+    let mut hits = Vec::with_capacity(acc.len());
+    let mut sources = 0;
+    for t in Index::lookup_variants(tri, case) {
+        for seg in segs {
+            let Some(blob) = seg.blob(t) else {
+                continue;
+            };
+            sources += 1;
+            let before = hits.len();
+            if postings::intersect_blob(acc, blob, &mut hits).is_err() {
+                hits.truncate(before);
+                postings::report_corrupt();
+            }
+        }
+    }
+    if sources > 1 {
+        // Several spellings or segments: their hits interleave.
+        hits.sort_unstable();
+        hits.dedup();
+    }
+    *acc = hits;
+}
+
+/// The ids below `below` of the indexed files that hold every trigram of
+/// some group of `groups` (a narrowed plan) in `segs`, ascending and
+/// unique. Each group goes rarest first, by stored blob size (nothing
+/// decoded): the narrowest list starts the intersection, and a group
+/// holding an absent trigram matches no indexed file, so it is skipped
+/// before decoding anything. No list decodes past `below`.
+fn group_ids(segs: &[&Postings], groups: &[Vec<u32>], case: Case, below: u64) -> Vec<u32> {
+    let mut union: Vec<u32> = Vec::new();
+    let mut lists = 0;
+    for group in groups {
+        let mut by_size: Vec<(usize, u32)> = group
+            .iter()
+            .map(|&t| (postings_len(segs, t, case), t))
+            .collect();
+        by_size.sort_unstable();
+        let Some(&(smallest, rarest)) = by_size.first() else {
+            continue;
+        };
+        if smallest == 0 {
+            continue;
+        }
+        let mut acc = postings_for(segs, rarest, case, below);
+        for &(_, t) in &by_size[1..] {
+            if acc.is_empty() {
+                break;
+            }
+            retain_postings(segs, &mut acc, t, case);
+        }
+        if !acc.is_empty() {
+            lists += 1;
+            union.extend(acc);
+        }
+    }
+    if lists > 1 {
+        // One group's list is ascending and unique already.
+        union.sort_unstable();
+        union.dedup();
+    }
+    union
 }
 
 impl Index {
@@ -551,64 +648,12 @@ impl Index {
         }
     }
 
-    fn segments(&self) -> impl Iterator<Item = &Postings> {
+    /// The posting segments a lookup reads: main, then the delta.
+    fn segments(&self) -> Vec<&Postings> {
         [self.main.as_ref(), self.delta.as_ref()]
             .into_iter()
             .flatten()
-    }
-
-    fn postings_for(&self, tri: u32, case: Case) -> Vec<u32> {
-        let mut ids = Vec::new();
-        for t in Self::lookup_variants(tri, case) {
-            for seg in self.segments() {
-                if let Some(v) = seg.lookup(t) {
-                    ids.extend(v);
-                }
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    }
-
-    /// Total stored blob bytes of `tri`'s postings, every spelling `case`
-    /// looks it up as, main and delta, without decoding any of them: 0
-    /// when no indexed file holds the trigram.
-    fn postings_len(&self, tri: u32, case: Case) -> usize {
-        Self::lookup_variants(tri, case)
-            .into_iter()
-            .map(|t| self.segments().map(|seg| seg.blob_len(t)).sum::<usize>())
-            .sum()
-    }
-
-    /// Narrow `acc` (ascending, unique) to the ids `tri`'s postings hold,
-    /// under any spelling `case` looks it up as, main and delta. Each
-    /// stored blob is merged against `acc` as it decodes, so no list is
-    /// materialized and none decodes past `acc`'s last id. A blob that
-    /// fails to decode before then counts as empty, as `Postings::lookup`
-    /// treats it.
-    fn retain_postings(&self, acc: &mut Vec<u32>, tri: u32, case: Case) {
-        let mut hits = Vec::with_capacity(acc.len());
-        let mut sources = 0;
-        for t in Self::lookup_variants(tri, case) {
-            for seg in self.segments() {
-                let Some(blob) = seg.blob(t) else {
-                    continue;
-                };
-                sources += 1;
-                let before = hits.len();
-                if postings::intersect_blob(acc, blob, &mut hits).is_err() {
-                    hits.truncate(before);
-                    postings::report_corrupt();
-                }
-            }
-        }
-        if sources > 1 {
-            // Several spellings or segments: their hits interleave.
-            hits.sort_unstable();
-            hits.dedup();
-        }
-        *acc = hits;
+            .collect()
     }
 
     fn is_live(&self, id: u32) -> bool {
@@ -673,32 +718,7 @@ impl Index {
                 .map(|e| e.id)
                 .collect(),
             Plan::Groups(groups) => {
-                let mut union: Vec<u32> = Vec::new();
-                for group in groups {
-                    // Rarest first, by stored blob size (nothing decoded):
-                    // the narrowest list starts the intersection, and a
-                    // group holding an absent trigram matches no indexed
-                    // file, so it is skipped before decoding anything.
-                    let mut by_size: Vec<(usize, u32)> = group
-                        .iter()
-                        .map(|&t| (self.postings_len(t, case), t))
-                        .collect();
-                    by_size.sort_unstable();
-                    let Some(&(smallest, rarest)) = by_size.first() else {
-                        continue;
-                    };
-                    if smallest == 0 {
-                        continue;
-                    }
-                    let mut acc = self.postings_for(rarest, case);
-                    for &(_, t) in &by_size[1..] {
-                        if acc.is_empty() {
-                            break;
-                        }
-                        self.retain_postings(&mut acc, t, case);
-                    }
-                    union.extend(acc);
-                }
+                let mut union = group_ids(&self.segments(), groups, case, u64::MAX);
                 // Skip-flagged text files (oversized, UTF-16 BOM) were
                 // never indexed; always scan them. Binary files too, when
                 // the caller can surface them.

@@ -337,6 +337,9 @@ impl WhitelistChecker {
 struct CollectorBuilder<'a> {
     root: &'a Path,
     global: &'a Mutex<Vec<FileMeta>>,
+    /// Report walk errors (an unreadable directory, say) as the sweep
+    /// does; false for a check the sweep repeats (`FileCheck`).
+    report: bool,
     /// False on the --no-ignore sweep: with ignore rules disabled there is
     /// no whitelist to consult, and hidden-ness is purely name-based.
     whitelists: bool,
@@ -352,6 +355,7 @@ impl<'s> ParallelVisitorBuilder<'s> for CollectorBuilder<'s> {
             local: Vec::new(),
             global: self.global,
             whitelists: self.whitelists,
+            report: self.report,
             whitelist: WhitelistChecker::with_flags(self.flags),
         })
     }
@@ -363,6 +367,7 @@ struct Collector<'a> {
     root: &'a Path,
     local: Vec<FileMeta>,
     global: &'a Mutex<Vec<FileMeta>>,
+    report: bool,
     whitelists: bool,
     whitelist: WhitelistChecker,
 }
@@ -400,7 +405,11 @@ impl ParallelVisitor for Collector<'_> {
             }
             // rg reports walk errors (an unreadable directory, a dangling
             // link or a loop under -L) and exits 2 once it is done.
-            Err(err) => crate::messages::error(err),
+            Err(err) => {
+                if self.report {
+                    crate::messages::error(err)
+                }
+            }
         }
         WalkState::Continue
     }
@@ -506,6 +515,99 @@ pub fn sweep_scoped_unsorted(root: &Path, prefixes: &[PathBuf]) -> anyhow::Resul
     sweep_walker_scoped_unsorted(root, prefixes)
 }
 
+/// Settles whether the full sweep of a root would yield given files right
+/// now, and with which attributes, without sweeping: the -q probe's check
+/// that a file it searches before the freshness sweep runs is one the run
+/// searches. On macOS each file is looked up level by level
+/// (`walk_bulk::FileLookup`); the files a lookup cannot settle, and every
+/// file elsewhere or under GLEP_NO_BULK_SWEEP, go to the portable sweep
+/// scoped to them, which walks from the root through the directories on
+/// their paths only. Nothing is reported: the sweep that follows reads
+/// the same directories and ignore files and reports what it finds.
+pub struct FileCheck {
+    root: PathBuf,
+    #[cfg(target_os = "macos")]
+    lookup: Option<crate::walk_bulk::FileLookup>,
+}
+
+impl FileCheck {
+    pub fn new(root: PathBuf) -> FileCheck {
+        #[cfg(target_os = "macos")]
+        let lookup = if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+            crate::messages::hushed(|| crate::walk_bulk::FileLookup::new(root.clone()).ok())
+        } else {
+            None
+        };
+        FileCheck {
+            root,
+            #[cfg(target_os = "macos")]
+            lookup,
+        }
+    }
+
+    /// The portable walker alone, whatever the platform.
+    #[cfg(test)]
+    pub fn portable(root: PathBuf) -> FileCheck {
+        FileCheck {
+            root,
+            #[cfg(target_os = "macos")]
+            lookup: None,
+        }
+    }
+
+    /// The root this check answers for.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The sweep's view of each of `files` (root-relative), in order: the
+    /// file as the sweep would yield it now, or None when it would not.
+    /// Only a path spelled as the sweep spells it (plain names joined by
+    /// single separators) can be yielded.
+    pub fn files(&mut self, files: &[PathBuf]) -> Vec<Option<FileMeta>> {
+        let mut out: Vec<Option<FileMeta>> = vec![None; files.len()];
+        let canonical = |p: &PathBuf| {
+            p.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+                && p.components().collect::<PathBuf>().as_os_str() == p.as_os_str()
+        };
+        #[cfg(target_os = "macos")]
+        let walk: Vec<usize> = match &mut self.lookup {
+            Some(lookup) => {
+                let mut walk = Vec::new();
+                crate::messages::hushed(|| {
+                    for (i, f) in files.iter().enumerate() {
+                        if !canonical(f) {
+                            continue;
+                        }
+                        match lookup.file(f) {
+                            crate::walk_bulk::FileVerdict::Yielded(m) => out[i] = Some(m),
+                            crate::walk_bulk::FileVerdict::Skipped => {}
+                            crate::walk_bulk::FileVerdict::Unsettled => walk.push(i),
+                        }
+                    }
+                });
+                walk
+            }
+            None => (0..files.len()).filter(|&i| canonical(&files[i])).collect(),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let walk: Vec<usize> = (0..files.len()).filter(|&i| canonical(&files[i])).collect();
+        if walk.is_empty() {
+            return out;
+        }
+        let prefixes: Vec<PathBuf> = walk.iter().map(|&i| files[i].clone()).collect();
+        if let Ok(found) = sweep_walker_scoped(&self.root, &prefixes, false) {
+            let mut by_path: HashMap<PathBuf, FileMeta> =
+                found.into_iter().map(|m| (m.path.clone(), m)).collect();
+            for &i in &walk {
+                out[i] = by_path.remove(&files[i]);
+            }
+        }
+        out
+    }
+}
+
 /// A scoped sweep for a listing (see [`sweep_scoped_listing`]).
 pub struct ScopedListing {
     /// [`sweep_scoped_unsorted`]'s files: the same paths and hidden flags,
@@ -555,6 +657,16 @@ fn sweep_walker_scoped_unsorted(
     root: &Path,
     prefixes: &[PathBuf],
 ) -> anyhow::Result<Vec<FileMeta>> {
+    sweep_walker_scoped(root, prefixes, true)
+}
+
+/// `sweep_walker_scoped_unsorted`, reporting walk errors only when
+/// `report` is set.
+fn sweep_walker_scoped(
+    root: &Path,
+    prefixes: &[PathBuf],
+    report: bool,
+) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: {}",
@@ -586,6 +698,7 @@ fn sweep_walker_scoped_unsorted(
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        report,
         whitelists: true,
         flags: WalkFlags::all(),
     };
@@ -629,6 +742,7 @@ fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        report: true,
         whitelists: true,
         flags: WalkFlags::all(),
     };
@@ -702,6 +816,7 @@ pub fn sweep_unfiltered(
     let mut builder = CollectorBuilder {
         root,
         global: &collected,
+        report: true,
         whitelists: false,
         flags: WalkFlags::all(),
     };
@@ -1765,5 +1880,187 @@ mod wl_debug {
             "verdict={:?}",
             wl.verdict(dir.path(), std::path::Path::new(".gitignore"), false)
         );
+    }
+}
+
+/// `FileCheck` against the full sweep it stands in for: over a tree with
+/// nested `.gitignore` files, whitelists, hidden, ignored and symlinked
+/// directories, every path the tree holds (and spellings no listing
+/// yields) is settled exactly as the sweep yields it, attributes and
+/// hidden flag included, by the platform's check and by the portable
+/// walker alone; and an `.ignore` on the way, which only the walker
+/// judges, still gets the walker's answer.
+#[cfg(test)]
+mod file_check_parity {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let write = |rel: &str, body: &str| {
+            let p = d.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        std::fs::create_dir_all(d.join(".git/info")).unwrap();
+        write(".git/info/exclude", "excluded.txt\n");
+        write(".git/HEAD", "x");
+        write(".gitignore", "*.log\nbuild/\n!keep.log\nsecret*\n");
+        write("excluded.txt", "x");
+        write("top.txt", "x");
+        write("a/.gitignore", "x/\n*.tmp\n");
+        write("a/top.txt", "xx");
+        write("a/x/y.txt", "x");
+        write("a/b/.gitignore", "!important.tmp\nc2/\n");
+        write("a/b/important.tmp", "x");
+        write("a/b/other.tmp", "x");
+        write("a/b/c/f1.txt", "xyz");
+        write("a/b/c/f2.log", "x");
+        write("a/b/c/keep.log", "x");
+        write("a/b/c/.env", "x");
+        write("a/b/c2/z.txt", "x");
+        write("build/out.txt", "x");
+        write(".hid/sub/h.txt", "x");
+        write("wl/.gitignore", ".*\n!.gitignore\n!.github/\n");
+        write("wl/.github/workflows/ci.yml", "x");
+        write("wl/.secret/k.txt", "x");
+        write("wl/.dot", "x");
+        write("wl/plain.txt", "x");
+        write("secretdir/s.txt", "x");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("a/b", d.join("sym")).unwrap();
+            std::os::unix::fs::symlink("top.txt", d.join("symf")).unwrap();
+        }
+        dir
+    }
+
+    /// Every directory and file below `dir` (symlinks included, not
+    /// followed), relative to `root`, plus spellings no listing yields.
+    fn pool(root: &Path) -> Vec<PathBuf> {
+        fn entries(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let p = e.path();
+                out.push(p.strip_prefix(root).unwrap().to_path_buf());
+                if e.file_type().unwrap().is_dir() {
+                    entries(root, &p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        entries(root, root, &mut out);
+        for extra in [
+            "nope",
+            "a/nope.txt",
+            "a/b/c/f1.txt/x",
+            "sym/c/f1.txt",
+            "A/top.txt",
+            "a/./top.txt",
+            "../x",
+            ".git/HEAD",
+            ".glep/manifest.bin",
+        ] {
+            out.push(PathBuf::from(extra));
+        }
+        out.sort();
+        out
+    }
+
+    /// What `check` says of every path of `pool`, against `swept`.
+    fn assert_matches(check: &mut FileCheck, pool: &[PathBuf], swept: &[FileMeta], label: &str) {
+        // Keyed by spelling: `a/./top.txt` is not a path the sweep yields.
+        let by_path: HashMap<&std::ffi::OsStr, &FileMeta> =
+            swept.iter().map(|m| (m.path.as_os_str(), m)).collect();
+        // One batch, then one path at a time: answers never depend on
+        // what was asked before.
+        let all = check.files(pool);
+        for (p, got) in pool.iter().zip(all) {
+            assert_eq!(
+                got.as_ref(),
+                by_path.get(p.as_os_str()).copied(),
+                "{label}: {p:?}"
+            );
+        }
+        for p in pool.iter().rev() {
+            let got = check.files(std::slice::from_ref(p)).pop().unwrap();
+            assert_eq!(
+                got.as_ref(),
+                by_path.get(p.as_os_str()).copied(),
+                "{label}: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_check_settles_every_path_like_the_sweep() {
+        let dir = fixture();
+        let root = dir.path();
+        let pool = pool(root);
+        let swept = sweep_unsorted(root).unwrap();
+        assert!(swept
+            .iter()
+            .any(|m| m.path == Path::new("wl/.github/workflows/ci.yml")));
+        assert!(!swept.iter().any(|m| m.path == Path::new("a/b/c2/z.txt")));
+        assert_matches(
+            &mut FileCheck::new(root.to_path_buf()),
+            &pool,
+            &swept,
+            "check",
+        );
+        let walked = sweep_walker_unsorted(root).unwrap();
+        assert_matches(
+            &mut FileCheck::portable(root.to_path_buf()),
+            &pool,
+            &walked,
+            "portable",
+        );
+    }
+
+    /// An `.ignore` on the way, and one inside a directory: the walker's
+    /// verdict, on every platform.
+    #[test]
+    fn dot_ignores_get_the_walkers_answer() {
+        let dir = fixture();
+        let root = dir.path();
+        std::fs::write(root.join("a/.ignore"), "top.txt\n!other.tmp\n").unwrap();
+        std::fs::write(root.join(".rgignore"), "secretdir/\n!excluded.txt\n").unwrap();
+        let pool = pool(root);
+        let walked = sweep_walker_unsorted(root).unwrap();
+        assert!(walked.iter().any(|m| m.path == Path::new("a/b/other.tmp")));
+        assert!(!walked.iter().any(|m| m.path == Path::new("a/top.txt")));
+        assert_matches(
+            &mut FileCheck::new(root.to_path_buf()),
+            &pool,
+            &walked,
+            "check",
+        );
+    }
+
+    /// A directory the sweep cannot open hides every file below it, even
+    /// though a lookup by name still passes through it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_hides_its_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture();
+        let root = dir.path();
+        let pool = pool(root);
+        let locked = root.join("a/b/c");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o311)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            // Running as root: nothing is unreadable.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let swept = crate::messages::hushed(|| sweep_unsorted(root).unwrap());
+        assert!(!swept.iter().any(|m| m.path.starts_with("a/b/c")));
+        let mut check = FileCheck::new(root.to_path_buf());
+        let got = check.files(&[PathBuf::from("a/b/c/f1.txt")]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(got, vec![None]);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o311)).unwrap();
+        assert_matches(&mut check, &pool, &swept, "locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

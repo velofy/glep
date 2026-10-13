@@ -27,9 +27,35 @@ pub fn errored() -> bool {
     ERRORED.load(Ordering::Relaxed)
 }
 
+thread_local! {
+    /// How many `hushed` calls this thread is inside.
+    static HUSHED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` with this thread's messages hushed: [`error`] and
+/// [`ignore_warning`] neither print nor set the errored flag until it
+/// returns. For work a run may redo and report for real later (the -q
+/// probe's lookups of files ahead of the freshness sweep, which reads the
+/// same directories and ignore files again), so nothing is reported
+/// twice. Threads `f` starts report as usual.
+pub fn hushed<T>(f: impl FnOnce() -> T) -> T {
+    HUSHED.with(|h| h.set(h.get() + 1));
+    let out = f();
+    HUSHED.with(|h| h.set(h.get() - 1));
+    out
+}
+
+/// Whether this thread is inside `hushed`.
+pub fn is_hushed() -> bool {
+    HUSHED.with(|h| h.get() > 0)
+}
+
 /// Report a per-file or per-walk error: sets the errored flag, prints
 /// `glep: <msg>` unless --no-messages.
 pub fn error(msg: impl std::fmt::Display) {
+    if is_hushed() {
+        return;
+    }
     ERRORED.store(true, Ordering::Relaxed);
     if MESSAGES.load(Ordering::Relaxed) {
         eprintln!("glep: {msg}");
@@ -39,6 +65,9 @@ pub fn error(msg: impl std::fmt::Display) {
 /// Report an ignore-file problem: prints `glep: <msg>` unless
 /// --no-messages or --no-ignore-messages, and leaves the exit code alone.
 pub fn ignore_warning(msg: impl std::fmt::Display) {
+    if is_hushed() {
+        return;
+    }
     if MESSAGES.load(Ordering::Relaxed) && IGNORE_MESSAGES.load(Ordering::Relaxed) {
         eprintln!("glep: {msg}");
     }

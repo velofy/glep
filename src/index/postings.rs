@@ -50,7 +50,9 @@ pub struct Malformed;
 /// Warn that a posting blob failed to decode; its trigram then counts as
 /// empty.
 pub fn report_corrupt() {
-    eprintln!("glep: postings blob corrupt; treating trigram as empty (run: glep index)");
+    if !crate::messages::is_hushed() {
+        eprintln!("glep: postings blob corrupt; treating trigram as empty (run: glep index)");
+    }
 }
 
 /// The next id delta of a posting blob, advancing `blob` past it; None
@@ -143,7 +145,27 @@ pub struct Postings {
 }
 
 impl Postings {
+    /// Open and check the whole file: every table entry must lie inside
+    /// the blob region, so a corrupt file fails here (and the index is
+    /// rebuilt) instead of losing candidates one lookup at a time.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let p = Self::open_lazy(path)?;
+        let blob_len = p.mmap.len() - HEADER - p.n * ENTRY;
+        for i in 0..p.n {
+            let (_, off, len) = p.entry(i);
+            anyhow::ensure!(
+                off.checked_add(len).is_some_and(|end| end <= blob_len),
+                "postings table entry out of bounds"
+            );
+        }
+        Ok(p)
+    }
+
+    /// `open` without the check of every table entry, which reads the
+    /// whole table (6 MB on a kernel-scale index): for the -q probe, which
+    /// looks a few trigrams up and settles for less from a corrupt file.
+    /// `blob` then treats an entry out of bounds as absent.
+    pub fn open_lazy(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
         // Safety: the map is read-only and glep replaces index files only via
         // atomic rename; a concurrent external truncation would SIGBUS, which
@@ -158,20 +180,11 @@ impl Postings {
         let n = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
         let generation = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
         anyhow::ensure!(mmap.len() >= HEADER + n * ENTRY, "truncated postings table");
-        let p = Self {
+        Ok(Self {
             mmap,
             n,
             generation,
-        };
-        let blob_len = p.mmap.len() - HEADER - n * ENTRY;
-        for i in 0..n {
-            let (_, off, len) = p.entry(i);
-            anyhow::ensure!(
-                off.checked_add(len).is_some_and(|end| end <= blob_len),
-                "postings table entry out of bounds"
-            );
-        }
-        Ok(p)
+        })
     }
 
     /// Index introspection helper; exercised by unit tests and kept for
@@ -226,19 +239,27 @@ impl Postings {
     /// or None when the table has no entry for it.
     pub fn blob(&self, trigram: u32) -> Option<&[u8]> {
         let (off, len) = self.find(trigram)?;
-        let start = HEADER + self.n * ENTRY + off;
-        Some(&self.mmap[start..start + len])
+        let start = (HEADER + self.n * ENTRY).checked_add(off)?;
+        self.mmap.get(start..start.checked_add(len)?)
     }
 
     pub fn lookup(&self, trigram: u32) -> Option<Vec<u32>> {
+        self.lookup_below(trigram, u64::MAX)
+    }
+
+    /// `lookup`, decoding only the ids below `below`.
+    pub fn lookup_below(&self, trigram: u32, below: u64) -> Option<Vec<u32>> {
         let mut slice = self.blob(trigram)?;
         // At most one id per byte.
-        let mut ids = Vec::with_capacity(slice.len());
+        let mut ids = Vec::with_capacity(if below == u64::MAX { slice.len() } else { 0 });
         let mut cur = 0u32;
         while let Some(delta) = next_delta(&mut slice) {
             match delta {
                 Ok(d) => {
                     cur = cur.wrapping_add(d);
+                    if u64::from(cur) >= below {
+                        break;
+                    }
                     ids.push(cur);
                 }
                 Err(Malformed) => {

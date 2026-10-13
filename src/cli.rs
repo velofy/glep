@@ -1,4 +1,7 @@
-use crate::index::manifest::{FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
+use crate::index::manifest::{
+    FLAG_DEAD, FLAG_HIDDEN, FLAG_RACY, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE,
+};
+use crate::index::quick::QuickIndex;
 use crate::index::Index;
 use crate::timing::Timings;
 use crate::{filters, messages, plan, search, walk};
@@ -1032,6 +1035,25 @@ impl Scope {
     fn select(&mut self, plain: Vec<PathBuf>, hidden: Vec<PathBuf>) -> Vec<PathBuf> {
         self.filters.select(&self.operands, plain, hidden)
     }
+
+    /// Whether `select` keeps the indexed file `f`, flagged `hidden` by
+    /// the sweep, under some directory operand: the -q probe's per-file
+    /// form of it (file operands and walked directories aside).
+    fn probe_keeps(&mut self, f: &Path, hidden: bool) -> bool {
+        let Scope {
+            operands, filters, ..
+        } = self;
+        operands.iter().any(|op| {
+            let p = &op.path;
+            if !matches!(op.kind, filters::OperandKind::Dir)
+                || !(p.as_os_str().is_empty() || f.starts_with(p))
+            {
+                return false;
+            }
+            filters.begin_operand(p);
+            (!hidden || filters.may_keep_hidden(p)) && filters.keep(f, hidden)
+        })
+    }
 }
 
 /// The --files glob (glep's pattern slot), matched against the path as
@@ -1396,6 +1418,7 @@ fn run_live(
     scope: &mut Scope,
     timings: &mut Timings,
     had_error: bool,
+    ahead: &Ahead,
 ) -> anyhow::Result<i32> {
     let mut files = scope.walk_all(args, cwd_rel);
     timings.stage("live_walk");
@@ -1417,8 +1440,7 @@ fn run_live(
     }
     let mut opts = search_opts(args, cwd_rel);
     opts.fixed = effective_fixed;
-    let mut out = search::StdoutOut;
-    let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
+    let found = ahead.search(&pattern, root, &mut files, None, &opts)?;
     timings.stage("search");
     timings.finish();
     Ok(exit_code(args, had_error || nothing_searched, found))
@@ -1980,6 +2002,7 @@ fn cached_root_listing(
 /// manifest and sweep epoch stay as they were and the next narrowed query
 /// sweeps as before. None on a cache miss, before anything is printed.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn search_cached_listing(
     root: &Path,
     cwd_rel: &Path,
@@ -1988,6 +2011,7 @@ fn search_cached_listing(
     query: &Query,
     timings: &mut Timings,
     had_error: bool,
+    ahead: &Ahead,
 ) -> anyhow::Result<Option<i32>> {
     let Some(CachedListing { mut files, tree }) =
         cached_root_listing(root, cwd_rel, scope, None, timings)
@@ -2003,8 +2027,7 @@ fn search_cached_listing(
     }
     let mut opts = search_opts(args, cwd_rel);
     opts.fixed = query.fixed;
-    let mut out = search::StdoutOut;
-    let found = search::run(&query.pattern, root, &files, None, &opts, &mut out)?;
+    let found = ahead.search(&query.pattern, root, &mut files, None, &opts)?;
     timings.stage("search");
     timings.finish();
     // The process exits right after this returns: the file list and the
@@ -2014,11 +2037,315 @@ fn search_cached_listing(
     Ok(Some(exit_code(args, had_error || nothing_searched, found)))
 }
 
+/// Whether -q's probe may answer this run (see `probe`): -q without
+/// --json or --stats, which count every file (rg's quit_after_match), and
+/// without --files-without-match, whose answer is a file without a
+/// match. --ttl keeps its meaning: inside its window the index answers
+/// without a sweep anyway. GLEP_NO_PROBE turns the probe off.
+fn probe_eligible(args: &Args) -> bool {
+    args.quiet
+        && !args.json
+        && !args.stats
+        && !args.files_without_match
+        && args.ttl == 0
+        && std::env::var_os("GLEP_NO_PROBE").is_none()
+}
+
+/// The -q probe's file check (`walk::FileCheck`), set up on a thread of
+/// its own when the arguments look like a run the probe answers (a `-q`
+/// or `--quiet`, or a cluster of short flags holding a q, and none of the
+/// flags `probe_eligible` turns away): it finds the index root as `run`
+/// does and loads the ignore rules above it (the global gitignore among
+/// them, whose git-config parsing compiles a regex) while the arguments
+/// parse. None otherwise. A guess the parsed arguments prove wrong costs
+/// that thread its work, or the probe the time to load the rules itself.
+fn early_file_check() -> Option<std::thread::JoinHandle<Option<walk::FileCheck>>> {
+    if std::env::var_os("GLEP_NO_PROBE").is_some() {
+        return None;
+    }
+    let mut quiet = false;
+    for a in std::env::args_os().skip(1) {
+        let a = a.as_encoded_bytes();
+        if [&b"--stats"[..], b"--json", b"--files-without-match"].contains(&a)
+            || a.starts_with(b"--ttl")
+        {
+            return None;
+        }
+        quiet |= a == b"--quiet"
+            || (a.len() > 1
+                && a[0] == b'-'
+                && a[1] != b'-'
+                && a[1..].iter().all(u8::is_ascii_alphanumeric)
+                && a.contains(&b'q'));
+    }
+    if !quiet {
+        return None;
+    }
+    std::thread::Builder::new()
+        .spawn(|| {
+            let cwd = std::env::current_dir().ok()?;
+            let (root, _) = discover_index_root(&cwd).ok()?;
+            root.join(".glep/manifest.bin")
+                .exists()
+                .then(|| walk::FileCheck::new(root))
+        })
+        .ok()
+}
+
+/// How far the probe goes before it hands the run to the freshness sweep:
+/// candidates looked at, files searched, and bytes searched. The probe
+/// searches one file at a time; past these the sweep and the parallel
+/// search take over, skipping what the probe searched (see `Ahead`).
+const PROBE_EXAMINE: usize = 256;
+const PROBE_FILES: usize = 64;
+const PROBE_BYTES: u64 = 4 << 20;
+
+/// The first round of a narrowed probe decodes the posting lists only
+/// below this id; each later round goes eight times as far (see `probe`).
+const PROBE_FIRST_IDS: u64 = 4096;
+
+/// What a probe that found nothing leaves the run (see `Ahead`).
+#[derive(Default)]
+struct Probed {
+    /// Searched without a match, with the (mtime, size) they had then.
+    unsettled: Vec<(PathBuf, u128, u64)>,
+    /// Searched with an error, reported already.
+    failed: Vec<PathBuf>,
+}
+
+/// -q's probe, for a run whose answer is whether anything matches
+/// (`probe_eligible`): before the freshness sweep runs, search the indexed
+/// files the plan picks (every entry under Plan::All), in index order, on
+/// this thread, and end the run at the first match. A match decides the
+/// run only in a file the run searches, so each candidate is first looked
+/// up on disk as the sweep would find it (`walk::FileCheck`: ignore rules,
+/// hidden flag, symlinks, unreadable directories, all as of now) and
+/// filtered by the run's operands and filters. It is searched only when
+/// its (mtime, size) and hidden flag are still what the index recorded
+/// and its entry is not racy: what a new, changed or racy file holds is
+/// the sweep's business, which reads it again. Files the index never read
+/// (oversized, UTF-16, binary) wait for the run too. Nothing here trusts
+/// the index: it only picks which files to look at first, and a stale,
+/// torn or corrupt one just finds nothing. File operands come first: the
+/// run searches each as itself, whatever any rule says.
+///
+/// The first candidates are the ones that matter, so a narrowed plan's
+/// posting lists are decoded in rounds, each only below an id bound
+/// (PROBE_FIRST_IDS, then eight times further each round), instead of
+/// whole: on a kernel-scale tree a pattern of common trigrams intersects
+/// tens of thousands of ids per list. Candidates are looked up in batches
+/// that start at one file and double.
+///
+/// None when a file settled the run (exit 0). Otherwise what was searched,
+/// for the run to skip (`Ahead`), after at most PROBE_EXAMINE candidates,
+/// PROBE_FILES files or PROBE_BYTES bytes. `check` is the file check, set
+/// up on a thread of its own (`early_file_check`): without one, or with
+/// one for another root, the probe sets one up itself.
+#[allow(clippy::too_many_arguments)]
+fn probe(
+    root: &Path,
+    scope: &mut Scope,
+    query: &Query,
+    mut view: QuickIndex,
+    check: Option<std::thread::JoinHandle<Option<walk::FileCheck>>>,
+    matcher: &search::AnyMatcher,
+    opts: &search::SearchOpts,
+) -> anyhow::Result<Option<Probed>> {
+    let timing = std::env::var_os("GLEP_TIMING").is_some();
+    let mut prober = search::Prober::new(matcher, opts)?;
+    let mut probed = Probed::default();
+    // Content read now from a file with an mtime past this may be
+    // rewritten within the same filesystem clock tick, its (mtime, size)
+    // kept: such a file is searched again by the run (see `Ahead`).
+    let settled_before = std::time::SystemTime::now()
+        .checked_sub(crate::dircache::RACY_SLACK)
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for op in &scope.operands {
+        match op.kind {
+            filters::OperandKind::File => {
+                if !seen.insert(op.path.clone()) {
+                    continue;
+                }
+                match prober.probe(root, &op.path, opts) {
+                    search::Probe::Settled => {
+                        if timing {
+                            eprintln!("glep timing: probe settled on a file operand");
+                        }
+                        return Ok(None);
+                    }
+                    search::Probe::Failed => probed.failed.push(op.path.clone()),
+                    // Read through a link, maybe: nothing for the run to skip.
+                    search::Probe::Unsettled => {}
+                }
+            }
+            filters::OperandKind::Dir => dirs.push(op.path.clone()),
+            filters::OperandKind::Walked(_) => {}
+        }
+    }
+    let under_dirs = |p: &Path| {
+        dirs.iter()
+            .any(|d| d.as_os_str().is_empty() || p.starts_with(d))
+    };
+    let mut pending = check;
+    let mut check: Option<walk::FileCheck> = None;
+    let count = view.len() as u64;
+    let (mut examined, mut searched, mut bytes) = (0usize, 0usize, 0u64);
+    // A narrowed plan's candidates below `hi`, from `lo` on; `at` is the
+    // next one to look at.
+    let (mut round, mut at, mut lo, mut hi) = (Vec::new(), 0usize, 0u64, PROBE_FIRST_IDS);
+    let mut batch = 1usize;
+    'batches: while !dirs.is_empty() && examined < PROBE_EXAMINE {
+        let want = batch.min(PROBE_EXAMINE - examined);
+        batch = (batch * 2).min(64);
+        let entries = match &query.plan {
+            plan::Plan::Groups(groups) => {
+                while at >= round.len() {
+                    if lo >= count {
+                        break 'batches;
+                    }
+                    round = crate::messages::hushed(|| view.group_ids(groups, query.case, hi));
+                    round.retain(|&id| u64::from(id) >= lo);
+                    (at, lo, hi) = (0, hi, hi.saturating_mul(8));
+                }
+                let (entries, taken) = view.entries_where(&round[at..], want, under_dirs);
+                examined += entries.len();
+                at += taken;
+                entries
+            }
+            plan::Plan::All => {
+                let entries = view.scan(want, under_dirs);
+                if entries.is_empty() {
+                    break;
+                }
+                examined += entries.len();
+                entries
+            }
+        };
+        let wanted: Vec<_> = entries
+            .into_iter()
+            .filter(|e| {
+                e.flags
+                    & (FLAG_DEAD
+                        | FLAG_RACY
+                        | FLAG_SKIP_TOO_LARGE
+                        | FLAG_TRANSCODE
+                        | FLAG_SKIP_BINARY)
+                    == 0
+                    && !seen.contains(&e.path)
+                    && scope.probe_keeps(&e.path, e.flags & FLAG_HIDDEN != 0)
+            })
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let paths: Vec<PathBuf> = wanted.iter().map(|e| e.path.clone()).collect();
+        let check = check.get_or_insert_with(|| match pending.take().map(|h| h.join()) {
+            Some(Ok(Some(check))) if check.root() == root => check,
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            _ => walk::FileCheck::new(root.to_path_buf()),
+        });
+        for (e, now) in wanted.iter().zip(check.files(&paths)) {
+            let Some(now) = now else {
+                continue;
+            };
+            if now.mtime_ns != e.mtime_ns
+                || now.size != e.size
+                || now.hidden != (e.flags & FLAG_HIDDEN != 0)
+            {
+                continue;
+            }
+            seen.insert(e.path.clone());
+            match prober.probe(root, &e.path, opts) {
+                search::Probe::Settled => {
+                    if timing {
+                        eprintln!(
+                            "glep timing: probe settled after {examined} candidates, {} searched",
+                            searched + 1
+                        );
+                    }
+                    return Ok(None);
+                }
+                search::Probe::Unsettled if now.mtime_ns < settled_before => probed
+                    .unsettled
+                    .push((e.path.clone(), now.mtime_ns, now.size)),
+                search::Probe::Unsettled => {}
+                search::Probe::Failed => probed.failed.push(e.path.clone()),
+            }
+            searched += 1;
+            bytes += now.size;
+            if searched >= PROBE_FILES || bytes >= PROBE_BYTES {
+                break 'batches;
+            }
+        }
+    }
+    if timing {
+        eprintln!("glep timing: probe {examined} candidates, {searched} searched, no match");
+    }
+    Ok(Some(probed))
+}
+
+/// What the -q probe did ahead of the run's own search, if it ran: the
+/// matcher it built, and the files it searched without settling the run,
+/// which the run's search skips. A failed file's error is reported once.
+/// A file searched without a match is skipped only while its (mtime,
+/// size) are still what they were then, and only when that mtime was
+/// already outside the racy window when the probe read it: a write since
+/// would have changed them.
+#[derive(Default)]
+struct Ahead {
+    matcher: Option<search::AnyMatcher>,
+    probed: Probed,
+}
+
+impl Ahead {
+    /// `search::run` over `files`, minus what the probe settled.
+    fn search(
+        &self,
+        pattern: &str,
+        root: &Path,
+        files: &mut Vec<PathBuf>,
+        universe: Option<&search::Universe>,
+        opts: &search::SearchOpts,
+    ) -> anyhow::Result<bool> {
+        let done: std::collections::HashSet<&Path> = self
+            .probed
+            .failed
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(
+                self.probed
+                    .unsettled
+                    .iter()
+                    .filter(|(p, mtime_ns, size)| {
+                        std::fs::symlink_metadata(root.join(p)).is_ok_and(|md| {
+                            md.len() == *size && crate::dircache::mtime_of(&md) == *mtime_ns
+                        })
+                    })
+                    .map(|(p, _, _)| p.as_path()),
+            )
+            .collect();
+        if !done.is_empty() {
+            // The probe searched each file once: a file the run lists
+            // twice (under two operands) is searched once more.
+            let mut done = done;
+            files.retain(|f| !done.remove(f.as_path()));
+        }
+        let mut out = search::StdoutOut;
+        match &self.matcher {
+            Some(m) => search::run_with(m, root, files, universe, opts, &mut out),
+            None => search::run(pattern, root, files, universe, opts, &mut out),
+        }
+    }
+}
+
 /// Debug builds only, for tests: when the environment variable `var`
 /// names a directory, create `reached` in it, then wait (a minute at
 /// most) until `resume` appears there, so a test can change the tree at
 /// that exact point of a run.
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(debug_assertions)]
 fn test_pause(var: &str) {
     let Some(dir) = std::env::var_os(var).map(PathBuf::from) else {
         return;
@@ -2259,6 +2586,7 @@ fn command() -> clap::Command {
 
 pub fn run() -> anyhow::Result<i32> {
     use clap::FromArgMatches;
+    let early_check = early_file_check();
     let matches = command().get_matches();
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     messages::configure(!args.no_messages, !args.no_ignore_messages);
@@ -2532,7 +2860,15 @@ pub fn run() -> anyhow::Result<i32> {
         || args.follow
         || args.no_index
     {
-        return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
+        return run_live(
+            &root,
+            &cwd_rel,
+            &args,
+            &mut scope,
+            &mut timings,
+            had_error,
+            &Ahead::default(),
+        );
     }
 
     // Dir-mtime cached listing (macOS only) for root-wide listings,
@@ -2600,8 +2936,36 @@ pub fn run() -> anyhow::Result<i32> {
     } else {
         Some(plan_query(&args)?)
     };
+    // -q asks only whether anything matches: the probe searches indexed
+    // files the plan picks before any sweep, and a match there ends the
+    // run (see `probe`). Otherwise the run goes on as below, skipping what
+    // the probe searched already (see `Ahead`).
+    let mut ahead = Ahead::default();
     if let Some(q) = &query {
         timings.stage("plan");
+        if probe_eligible(&args) {
+            if let Some(view) = QuickIndex::open(&root) {
+                let mut opts = search_opts(&args, &cwd_rel);
+                opts.fixed = q.fixed;
+                let matcher = search::AnyMatcher::build(&q.pattern, &opts)?;
+                let probed = probe(&root, &mut scope, q, view, early_check, &matcher, &opts)?;
+                timings.stage("probe");
+                match probed {
+                    None => {
+                        timings.finish();
+                        return Ok(exit_code(&args, had_error, true));
+                    }
+                    Some(probed) => {
+                        #[cfg(debug_assertions)]
+                        test_pause("GLEP_TEST_PAUSE_AFTER_PROBE");
+                        ahead = Ahead {
+                            matcher: Some(matcher),
+                            probed,
+                        }
+                    }
+                }
+            }
+        }
         if q.plan == plan::Plan::All {
             #[cfg(target_os = "macos")]
             if listing_cache_eligible(&args) && args.ttl == 0 {
@@ -2613,12 +2977,21 @@ pub fn run() -> anyhow::Result<i32> {
                     q,
                     &mut timings,
                     had_error,
+                    &ahead,
                 )? {
                     return Ok(code);
                 }
             }
             if !root.join(".glep/manifest.bin").exists() {
-                return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
+                return run_live(
+                    &root,
+                    &cwd_rel,
+                    &args,
+                    &mut scope,
+                    &mut timings,
+                    had_error,
+                    &ahead,
+                );
             }
         }
     }
@@ -2692,7 +3065,15 @@ pub fn run() -> anyhow::Result<i32> {
         // queries on a new tree): answer with a live scan, as --no-index
         // does, instead of failing or waiting for the build.
         Err(e) if e.is::<crate::index::IndexBusy>() => {
-            return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
+            return run_live(
+                &root,
+                &cwd_rel,
+                &args,
+                &mut scope,
+                &mut timings,
+                had_error,
+                &ahead,
+            );
         }
         Err(e) => return Err(e),
     };
@@ -2840,8 +3221,7 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
-    let mut out = search::StdoutOut;
-    let found = search::run(&pattern, &root, &files, universe.as_ref(), &opts, &mut out)?;
+    let found = ahead.search(&pattern, &root, &mut files, universe.as_ref(), &opts)?;
     timings.stage("search");
     timings.finish();
     Ok(exit_code(&args, had_error || nothing_searched, found))

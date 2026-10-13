@@ -1107,6 +1107,161 @@ fn scoped_starts(
     Ok(Some(starts))
 }
 
+/// What the full sweep makes of one directory on the way to a file
+/// (`FileLookup`).
+#[derive(Clone)]
+enum DirState {
+    /// It lists the directory, judging its entries with this stack: the
+    /// seed plus the own `.gitignore` of every level from the root down to
+    /// and including it.
+    Listed(Vec<Arc<Gitignore>>),
+    /// It never lists it: absent, ignored, not a directory (a symlink to
+    /// one included), `.git` or `.glep`, or a directory it cannot open.
+    Skipped,
+    /// A lookup cannot tell: an `.ignore` or `.rgignore` on the way, whose
+    /// precedence only the walker gets right, or a name stored under
+    /// another spelling.
+    Unsettled,
+}
+
+/// Whether the full sweep would yield one file (`FileLookup::file`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileVerdict {
+    /// It would, with these attributes as they are now.
+    Yielded(FileMeta),
+    /// It would not.
+    Skipped,
+    /// A lookup cannot tell (see `DirState::Unsettled`).
+    Unsettled,
+}
+
+/// Answers whether `sweep_bulk` would yield given files right now, without
+/// listing a single directory: each level on a file's path is looked up by
+/// name, as `scoped_starts` reads the levels above a scope prefix, and
+/// judged by the rules the walk from the root would carry there. Unlike
+/// `scoped_starts` it also opens every directory on the way, as the sweep
+/// does to list it, since one it cannot open is reported and skipped by
+/// the sweep while a lookup by name still passes through it. Levels are
+/// remembered across files, so siblings cost one lookup each.
+pub struct FileLookup {
+    root: PathBuf,
+    seed: Vec<Arc<Gitignore>>,
+    dot: Vec<Arc<Gitignore>>,
+    /// Directories settled so far, root-relative ("" is the root).
+    dirs: HashMap<PathBuf, DirState>,
+}
+
+impl FileLookup {
+    /// Err where `sweep_bulk` fails before scanning anything: a root that
+    /// is no directory, or ancestor rules it cannot load.
+    pub fn new(root: PathBuf) -> anyhow::Result<FileLookup> {
+        anyhow::ensure!(
+            root.is_dir(),
+            "{}: {}",
+            root.display(),
+            crate::messages::not_found()
+        );
+        let seed = build_ancestor_stack(&root)?;
+        let dot = build_ancestor_dot_ignores(&root);
+        Ok(FileLookup {
+            root,
+            seed,
+            dot,
+            dirs: HashMap::new(),
+        })
+    }
+
+    /// The sweep's verdict on `rel`, a root-relative path of plain names.
+    pub fn file(&mut self, rel: &Path) -> FileVerdict {
+        if rel.as_os_str().is_empty()
+            || !rel.components().all(|c| matches!(c, Component::Normal(_)))
+        {
+            return FileVerdict::Skipped;
+        }
+        let (Some(parent), Some(name)) = (rel.parent(), rel.file_name()) else {
+            return FileVerdict::Skipped;
+        };
+        let stack = match self.dir(parent) {
+            DirState::Listed(stack) => stack,
+            DirState::Skipped => return FileVerdict::Skipped,
+            DirState::Unsettled => return FileVerdict::Unsettled,
+        };
+        let abs = self.root.join(rel);
+        match lookup_entry(&abs, name) {
+            Lookup::Found(e)
+                if e.objtype == VREG && !is_ignored(&self.dot, &stack, &abs, false, name) =>
+            {
+                FileVerdict::Yielded(FileMeta {
+                    path: rel.to_path_buf(),
+                    mtime_ns: e.mtime_ns,
+                    size: e.size,
+                    hidden: still_hidden(&self.dot, &stack, &self.root, rel),
+                })
+            }
+            Lookup::Found(_) | Lookup::Absent => FileVerdict::Skipped,
+            Lookup::Unsure => FileVerdict::Unsettled,
+        }
+    }
+
+    fn dir(&mut self, rel: &Path) -> DirState {
+        if let Some(state) = self.dirs.get(rel) {
+            return state.clone();
+        }
+        let state = match (rel.parent(), rel.file_name()) {
+            (Some(parent), Some(name)) => match self.dir(parent) {
+                DirState::Listed(stack) => {
+                    let abs = self.root.join(rel);
+                    match lookup_entry(&abs, name) {
+                        Lookup::Found(e)
+                            if e.objtype == VDIR
+                                && !is_ignored(&self.dot, &stack, &abs, true, name) =>
+                        {
+                            Self::listed(&abs, stack)
+                        }
+                        Lookup::Found(_) | Lookup::Absent => DirState::Skipped,
+                        Lookup::Unsure => DirState::Unsettled,
+                    }
+                }
+                other => other,
+            },
+            // The root itself.
+            _ => Self::listed(&self.root, self.seed.clone()),
+        };
+        self.dirs.insert(rel.to_path_buf(), state.clone());
+        state
+    }
+
+    /// A directory the sweep enters, with the stack it carries there: the
+    /// sweep opens it to list it, then layers its own `.gitignore` on.
+    fn listed(abs: &Path, mut stack: Vec<Arc<Gitignore>>) -> DirState {
+        let Ok(cpath) = CString::new(abs.as_os_str().as_bytes()) else {
+            return DirState::Unsettled;
+        };
+        // Safety: cpath is a NUL-terminated string that outlives the call,
+        // and the descriptor is closed right away.
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return DirState::Skipped;
+        }
+        // Safety: fd was opened above and is closed exactly once.
+        unsafe {
+            libc::close(fd);
+        }
+        match level_rules(abs) {
+            Ok(Level::Rules(own)) => {
+                stack.extend(own);
+                DirState::Listed(stack)
+            }
+            Ok(Level::Unsure) | Err(_) => DirState::Unsettled,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_recursive<'scope>(
     scope: &rayon::Scope<'scope>,

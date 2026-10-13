@@ -162,7 +162,7 @@ pub fn unchanged(p: &Path, mtime_ns: u128, size: u64) -> bool {
 }
 
 /// `md`'s mtime in nanoseconds since the epoch, 0 when unavailable.
-fn mtime_of(md: &std::fs::Metadata) -> u128 {
+pub(crate) fn mtime_of(md: &std::fs::Metadata) -> u128 {
     md.modified()
         .ok()
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())

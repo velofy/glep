@@ -2146,25 +2146,107 @@ pub fn run(
     opts: &SearchOpts,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<bool> {
+    // Building the matcher up front also validates the pattern before any
+    // I/O.
+    let matcher = AnyMatcher::build(pattern, opts)?;
+    run_with(&matcher, root, files, universe, opts, out)
+}
+
+/// `run` with a matcher already built (`AnyMatcher::build`), so a run
+/// that searched some files ahead (the -q probe) compiles its pattern
+/// once.
+pub(crate) fn run_with(
+    matcher: &AnyMatcher,
+    root: &Path,
+    files: &[PathBuf],
+    universe: Option<&Universe>,
+    opts: &SearchOpts,
+    out: &mut (dyn std::io::Write + Send),
+) -> anyhow::Result<bool> {
     // Two monomorphized paths, one per engine. Sinks and the searcher are
-    // generic over Matcher; only the builder differs. Building the matcher
-    // up front also validates the pattern before any I/O.
-    if opts.pcre2 {
-        let matcher = build_pcre2_matcher(pattern, opts)?;
-        return run_impl(&matcher, root, files, universe, opts, out);
+    // generic over Matcher; only the builder differs.
+    match matcher {
+        AnyMatcher::Rust(m) => run_impl(m, root, files, universe, opts, out),
+        AnyMatcher::Pcre2(m) => run_impl(m, root, files, universe, opts, out),
     }
-    let matcher = match build_matcher(pattern, opts) {
-        Ok(m) => m,
-        // --engine auto: rg's hybrid mode falls back to PCRE2 whenever the
-        // default engine rejects the pattern, and reports the default
-        // engine's error when PCRE2 rejects it too.
-        Err(e) if opts.engine_auto => match build_pcre2_matcher(pattern, opts) {
-            Ok(m) => return run_impl(&m, root, files, universe, opts, out),
-            Err(_) => return Err(e),
-        },
-        Err(e) => return Err(e),
-    };
-    run_impl(&matcher, root, files, universe, opts, out)
+}
+
+/// The run's compiled pattern, in the engine the flags pick.
+pub(crate) enum AnyMatcher {
+    Rust(grep_regex::RegexMatcher),
+    Pcre2(grep_pcre2::RegexMatcher),
+}
+
+impl AnyMatcher {
+    /// -P picks PCRE2; otherwise Rust's regex, except that --engine auto
+    /// (rg's hybrid mode) falls back to PCRE2 whenever the default engine
+    /// rejects the pattern, and reports the default engine's error when
+    /// PCRE2 rejects it too.
+    pub(crate) fn build(pattern: &str, opts: &SearchOpts) -> anyhow::Result<AnyMatcher> {
+        if opts.pcre2 {
+            return Ok(AnyMatcher::Pcre2(build_pcre2_matcher(pattern, opts)?));
+        }
+        match build_matcher(pattern, opts) {
+            Ok(m) => Ok(AnyMatcher::Rust(m)),
+            Err(e) if opts.engine_auto => match build_pcre2_matcher(pattern, opts) {
+                Ok(m) => Ok(AnyMatcher::Pcre2(m)),
+                Err(_) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// What one file the -q probe searched says about the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// The file settles the exit status (`SearchOpts::settles`).
+    Settled,
+    /// Searched without settling it.
+    Unsettled,
+    /// The search failed; the error is reported already.
+    Failed,
+}
+
+/// Searches single files on the calling thread with one reusable worker
+/// state, for the -q probe: files whose answer may end the run before it
+/// knows its whole file set.
+pub(crate) struct Prober<'m> {
+    matcher: &'m AnyMatcher,
+    state: WorkerState,
+}
+
+impl<'m> Prober<'m> {
+    /// Resolves the -E label first, as `run` does, so a bad one fails
+    /// before any file is read.
+    pub(crate) fn new(matcher: &'m AnyMatcher, opts: &SearchOpts) -> anyhow::Result<Prober<'m>> {
+        let encoding = match &opts.encoding {
+            Some(label) => Some(
+                grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(Prober {
+            matcher,
+            state: WorkerState::new(opts, encoding.as_ref()),
+        })
+    }
+
+    /// Search `rel` (relative to `root`) as `run` would, reporting a
+    /// failure the same way.
+    pub(crate) fn probe(&mut self, root: &Path, rel: &Path, opts: &SearchOpts) -> Probe {
+        let res = match self.matcher {
+            AnyMatcher::Rust(m) => search_one_or_warn(&mut self.state, m, root, rel, opts),
+            AnyMatcher::Pcre2(m) => search_one_or_warn(&mut self.state, m, root, rel, opts),
+        };
+        if res.failed {
+            Probe::Failed
+        } else if opts.settles(&res) {
+            Probe::Settled
+        } else {
+            Probe::Unsettled
+        }
+    }
 }
 
 /// Parallel design (v2): workers pull file indices off a shared atomic
