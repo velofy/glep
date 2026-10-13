@@ -2105,6 +2105,10 @@ fn listing_cache_with_ancestor_dot_ignore() {
     check_cases(&inner, "cache edited", cases);
     #[cfg(target_os = "macos")]
     {
+        // The ancestor .ignore was just edited; the cache distrusts mtimes
+        // within two seconds of a sweep (dircache::RACY_SLACK), so wait
+        // that out before expecting a listing to be served from it.
+        std::thread::sleep(std::time::Duration::from_millis(2200));
         let cache = inner.join(".glep/dirtree.bin");
         let (_, code) = glep_out(&inner, &["--files"]);
         assert_eq!(code, 0);
