@@ -28,6 +28,9 @@ pub struct Index {
     /// certifies the full listing (the macOS dir-mtime listing cache) be
     /// rebuilt from the manifest.
     swept_full: bool,
+    /// After a scoped sweep: each scope prefix and whether the sweep found
+    /// any file under it (see `has_files_under`).
+    scope_presence: Vec<(PathBuf, bool)>,
 }
 
 fn now_epoch() -> u64 {
@@ -157,6 +160,7 @@ impl Index {
             read_only: false,
             lock,
             swept_full: true,
+            scope_presence: Vec::new(),
         })
     }
 
@@ -190,6 +194,7 @@ impl Index {
                         read_only,
                         lock,
                         swept_full: false,
+                        scope_presence: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -232,6 +237,20 @@ impl Index {
             .collect();
         v.sort();
         v
+    }
+
+    /// Whether the tree holds any indexable file under `prefix` (hidden
+    /// files included). A directory operand without one is something the
+    /// index cannot serve: an ignored or symlinked directory, or a
+    /// spelling that differs from the one on disk. Answered from the last
+    /// scoped sweep when it covered `prefix`, else from the manifest.
+    pub fn has_files_under(&self, prefix: &Path) -> bool {
+        if let Some((_, has)) = self.scope_presence.iter().find(|(p, _)| p == prefix) {
+            return *has;
+        }
+        self.manifest
+            .live_entries()
+            .any(|e| e.path.starts_with(prefix))
     }
 
     /// Every live file, split by `FLAG_HIDDEN` into (plain, hidden), both
@@ -479,6 +498,12 @@ impl Index {
             Some(s) => walk::sweep_scoped_unsorted(&self.root, s)?,
             None => walk::sweep_unsorted(&self.root)?,
         };
+        if let Some(s) = scope {
+            self.scope_presence = s
+                .iter()
+                .map(|p| (p.clone(), swept.iter().any(|m| m.path.starts_with(p))))
+                .collect();
+        }
         if let Some(t) = &mut timings {
             t.stage("sweep_walk");
         }

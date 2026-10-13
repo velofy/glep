@@ -1,4 +1,4 @@
-use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
+use crate::index::manifest::{FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
 use crate::index::Index;
 use crate::timing::Timings;
 use crate::{filters, messages, plan, search, walk};
@@ -669,6 +669,34 @@ fn discover_index_root(cwd: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((cwd_canon, PathBuf::new()))
 }
 
+/// A path the walk yielded relative to the cwd, as a root-relative path:
+/// `.` and `..` fold lexically, and a path that climbs above the root
+/// keeps its leading `..` components (display_rel turns it back into the
+/// same cwd-relative path).
+fn root_relative(cwd_rel: &Path, p: &Path) -> PathBuf {
+    let mut parts: Vec<&std::ffi::OsStr> = cwd_rel.iter().collect();
+    let mut ups = 0usize;
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(s) => parts.push(s),
+            std::path::Component::ParentDir => {
+                if parts.pop().is_none() {
+                    ups += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = PathBuf::new();
+    for _ in 0..ups {
+        out.push("..");
+    }
+    for s in parts {
+        out.push(s);
+    }
+    out
+}
+
 fn normalize_path_filters(paths: &mut [PathBuf], root: &std::path::Path, cwd_rel: &Path) {
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for p in paths.iter_mut() {
@@ -856,10 +884,13 @@ fn wsl_prefix() -> Option<String> {
 struct Scope {
     operands: Vec<filters::Operand>,
     filters: filters::Filters,
+    /// No path operand was given: rg's implicit scope, the only one its
+    /// nothing-searched warning applies to.
+    implicit: bool,
 }
 
 impl Scope {
-    fn new(args: &Args, root: &Path, cwd_rel: &Path) -> anyhow::Result<Scope> {
+    fn new(args: &Args, root: &Path, cwd_rel: &Path, implicit: bool) -> anyhow::Result<Scope> {
         let filters = filters::Filters::new(
             &filters::FilterSpec {
                 globs: &args.globs,
@@ -895,7 +926,100 @@ impl Scope {
                 })
                 .collect()
         };
-        Ok(Scope { operands, filters })
+        Ok(Scope {
+            operands,
+            filters,
+            implicit,
+        })
+    }
+
+    /// rg's walker configuration for this run: the ignore sources the
+    /// flags leave on, --hidden, -L, --one-file-system, --max-depth, and
+    /// the run's globs, types and --ignore-file rules.
+    fn live_config<'a>(filters: &'a filters::Filters, args: &'a Args) -> walk::LiveWalk<'a> {
+        walk::LiveWalk {
+            flags: walk::WalkFlags {
+                dot: !args.no_ignore_dot,
+                vcs: !args.no_ignore_vcs,
+                exclude: !args.no_ignore_exclude,
+                global: !args.no_ignore_global,
+            },
+            parents: !args.no_ignore_parent,
+            require_git: args.require_git,
+            show_hidden: args.hidden,
+            follow: args.follow,
+            one_file_system: args.one_file_system,
+            max_depth: args.max_depth,
+            overrides: filters.overrides(),
+            types: filters.types(),
+            ignore_files: &args.ignore_file,
+            ignore_file_case_insensitive: args.ignore_file_case_insensitive,
+        }
+    }
+
+    /// rg's walk of one directory operand, as root-relative paths.
+    fn walk_operand(cfg: &walk::LiveWalk<'_>, op: &Path, cwd_rel: &Path) -> Vec<PathBuf> {
+        // Walk the operand as rg is given it, relative to the cwd, so
+        // globs and --ignore-file rules see rg's paths.
+        let start = search::display_rel(op, cwd_rel);
+        walk::live_walk(&start, cfg)
+            .into_iter()
+            .map(|p| root_relative(cwd_rel, &p))
+            .collect()
+    }
+
+    /// The live escape hatches' file list: every operand walked by rg's
+    /// rules (a file operand as itself), in command-line order.
+    fn walk_all(&mut self, args: &Args, cwd_rel: &Path) -> Vec<PathBuf> {
+        let cfg = Scope::live_config(&self.filters, args);
+        let mut out = Vec::new();
+        for op in &self.operands {
+            match op.kind {
+                filters::OperandKind::File => out.push(op.path.clone()),
+                _ => out.extend(Scope::walk_operand(&cfg, &op.path, cwd_rel)),
+            }
+        }
+        out
+    }
+
+    /// Walk live every directory operand the index cannot serve (`served`
+    /// says it holds no file under it): an ignored directory, a symlink to
+    /// a directory, a spelling that differs from the one on disk. rg walks
+    /// those like any other operand, and the operand itself is never
+    /// filtered. The root operand always comes from the index.
+    fn walk_unserved(&mut self, args: &Args, cwd_rel: &Path, served: impl Fn(&Path) -> bool) {
+        let cfg = Scope::live_config(&self.filters, args);
+        for op in self.operands.iter_mut() {
+            if matches!(op.kind, filters::OperandKind::Dir)
+                && !op.path.as_os_str().is_empty()
+                && !served(&op.path)
+            {
+                op.kind =
+                    filters::OperandKind::Walked(Scope::walk_operand(&cfg, &op.path, cwd_rel));
+            }
+        }
+    }
+
+    /// Whether the implicit scope's walk would search at least one file
+    /// (rg's nothing-searched check), stopping at the first file that
+    /// survives the filters instead of building the list.
+    fn searches_anything<'a>(&mut self, live: impl Iterator<Item = (&'a Path, bool)>) -> bool {
+        let Some(op) = self.operands.first() else {
+            return false;
+        };
+        match &op.kind {
+            filters::OperandKind::File => true,
+            filters::OperandKind::Walked(files) => !files.is_empty(),
+            filters::OperandKind::Dir => {
+                let base = op.path.components().count();
+                let prefix = op.path.clone();
+                let filters = &mut self.filters;
+                let mut live = live;
+                live.any(|(f, hidden)| {
+                    (base == 0 || f.starts_with(&prefix)) && filters.keep(f, base, hidden)
+                })
+            }
+        }
     }
 
     /// rg's file list from a path-sorted file set split by the sweep's
@@ -916,11 +1040,24 @@ fn files_glob(args: &Args) -> anyhow::Result<Option<globset::GlobMatcher>> {
     }
 }
 
-/// Keep the paths the --files glob matches.
+/// Keep the paths the --files glob matches, in order. Parallel: 86k
+/// globset matches on a kernel-scale tree cost ~15ms serially, ~2ms
+/// across the pool.
 fn retain_glob(files: &mut Vec<PathBuf>, glob: Option<&globset::GlobMatcher>, cwd_rel: &Path) {
     if let Some(g) = glob {
-        files.retain(|f| g.is_match(&*search::display_rel(f, cwd_rel)));
+        use rayon::prelude::*;
+        *files = std::mem::take(files)
+            .into_par_iter()
+            .filter(|f| g.is_match(&*search::display_rel(f, cwd_rel)))
+            .collect();
     }
+}
+
+/// Whether a path-sorted list holds a path under `prefix`: in component
+/// order, everything under a directory sorts right after it.
+fn sorted_has_under(list: &[PathBuf], prefix: &Path) -> bool {
+    let i = list.partition_point(|x| x.as_path() < prefix);
+    list.get(i).is_some_and(|x| x.starts_with(prefix))
 }
 
 /// Split read-only sweep extras by rg's hidden rule (whitelist rescue
@@ -1241,27 +1378,28 @@ fn exit_code(args: &Args, had_error: bool, hit: bool) -> i32 {
     }
 }
 
-/// Shared tail of every live-scan escape hatch (`--no-ignore`, `-L`,
-/// `--require-git` outside a repo, `--one-file-system`, `--no-ignore-*`,
-/// `--no-index`): --files listing and content search over an
-/// already-computed file set (no index narrowing, so the set IS the
-/// universe). `cwd_rel` feeds display paths, `had_error` propagates
-/// missing-path exit 2.
-fn run_live_files(
+/// Every live-scan escape hatch: --no-ignore and the -u ladder, the
+/// --no-ignore-* toggles, -L, --one-file-system, --require-git outside a
+/// repo, and --no-index. The index never holds what these flags add
+/// (ignored trees, files behind links, other filesystems) and must never
+/// learn about them, so this never opens, updates or writes it: each
+/// operand is walked live with rg's own walker configuration, rooted at
+/// the operand like rg (so --no-ignore-parent drops the ignore files
+/// above it). The walker applies every filter, so its result is the file
+/// list; the cost is rg's, every time.
+fn run_live(
     root: &Path,
     cwd_rel: &Path,
     args: &Args,
     scope: &mut Scope,
     timings: &mut Timings,
-    (mut plain, mut hidden): (Vec<PathBuf>, Vec<PathBuf>),
     had_error: bool,
 ) -> anyhow::Result<i32> {
+    let mut files = scope.walk_all(args, cwd_rel);
+    timings.stage("live_walk");
     if args.files {
         // With --files the pattern slot is the glob.
-        let glob = files_glob(args)?;
-        retain_glob(&mut plain, glob.as_ref(), cwd_rel);
-        retain_glob(&mut hidden, glob.as_ref(), cwd_rel);
-        let mut files = scope.select(plain, hidden);
+        retain_glob(&mut files, files_glob(args)?.as_ref(), cwd_rel);
         apply_sort(&mut files, args, root, cwd_rel)?;
         print_paths(&files, cwd_rel, args)?;
         timings.finish();
@@ -1269,183 +1407,27 @@ fn run_live_files(
     }
 
     let (pattern, effective_fixed) = resolve_pattern(args);
-    let mut files = scope.select(plain, hidden);
     apply_sort(&mut files, args, root, cwd_rel)?;
     timings.stage("candidates");
+    let nothing_searched = scope.implicit && files.is_empty();
+    if nothing_searched {
+        report_nothing_searched();
+    }
     let mut opts = search_opts(args, cwd_rel);
     opts.fixed = effective_fixed;
     let mut out = search::StdoutOut;
     let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
-    Ok(exit_code(args, had_error, found))
+    Ok(exit_code(args, had_error || nothing_searched, found))
 }
 
-/// `--no-ignore`: content mode and `--files` mode both bypass the index
-/// entirely (no open, no update, no write, not even a read-only fallback
-/// sweep) in favor of a live scan via `walk::sweep_unfiltered`, which
-/// walks with every ignore source disabled. This is the escape hatch's
-/// whole point: ignored trees must never enter the index, so the only
-/// sound way to search them is to never touch the index at all for this
-/// run. Slower than the indexed path (full walk + full scan every time,
-/// same cost as `rg --no-ignore` itself), but that trade is deliberate.
-///
-/// `args.hidden` gates hidden files exactly as it does on the indexed
-/// path; `sweep_unfiltered` does that gating itself (see its doc comment
-/// in walk.rs), so the result is not re-filtered by hidden here.
-/// `args.follow` passes through to the walker (-L composes).
-fn run_no_ignore(
-    root: &Path,
-    cwd_rel: &Path,
-    args: &Args,
-    scope: &mut Scope,
-    timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_unfiltered(root, args.hidden, args.follow)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_unfiltered");
-    // The walker gates hidden entries itself: nothing arrives flagged.
-    run_live_files(
-        root,
-        cwd_rel,
-        args,
-        scope,
-        timings,
-        (files, Vec::new()),
-        had_error,
-    )
-}
-
-/// `-L`/`--follow`: live-scan escape hatch. Files reached through
-/// symlinked directories are never in the manifest, so index narrowing
-/// cannot find them; sweep the followed tree (ignore rules still
-/// applied, `-L` only changes traversal) and search everything.
-fn run_follow(
-    root: &Path,
-    cwd_rel: &Path,
-    args: &Args,
-    scope: &mut Scope,
-    timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_follow(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_follow");
-    // The walker gates hidden entries itself: nothing arrives flagged.
-    run_live_files(
-        root,
-        cwd_rel,
-        args,
-        scope,
-        timings,
-        (files, Vec::new()),
-        had_error,
-    )
-}
-
-/// `--require-git` outside a repo: git-derived ignore rules are inert,
-/// so files the manifest lacks (gitignored) can match. Live scan over
-/// `sweep_no_git` (git sources off, `.ignore`/`.rgignore` still on).
-fn run_require_git(
-    root: &Path,
-    cwd_rel: &Path,
-    args: &Args,
-    scope: &mut Scope,
-    timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_no_git(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_no_git");
-    // The walker gates hidden entries itself: nothing arrives flagged.
-    run_live_files(
-        root,
-        cwd_rel,
-        args,
-        scope,
-        timings,
-        (files, Vec::new()),
-        had_error,
-    )
-}
-
-/// `--one-file-system`: live-scan escape hatch. Mount-point subtrees
-/// never enter the index, so this sweeps with `same_file_system` on
-/// (ignores still applied) and never touches `.glep`.
-fn run_one_fs(
-    root: &Path,
-    cwd_rel: &Path,
-    args: &Args,
-    scope: &mut Scope,
-    timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    let files: Vec<PathBuf> = walk::sweep_one_fs(root, args.hidden)?
-        .into_iter()
-        .map(|m| m.path)
-        .collect();
-    timings.stage("sweep_one_fs");
-    // The walker gates hidden entries itself: nothing arrives flagged.
-    run_live_files(
-        root,
-        cwd_rel,
-        args,
-        scope,
-        timings,
-        (files, Vec::new()),
-        had_error,
-    )
-}
-
-/// Any --no-ignore-* toggle: live-scan over a selectively-configured
-/// walker (never touches `.glep`: the disabled-source file set can't
-/// narrow through the index anyway).
-fn run_selective(
-    root: &Path,
-    cwd_rel: &Path,
-    args: &Args,
-    scope: &mut Scope,
-    timings: &mut Timings,
-    had_error: bool,
-) -> anyhow::Result<i32> {
-    // The walk is rooted at the cwd (the rg "operand"), not the index
-    // root: --no-ignore-parent gates ignore files above the operand, and
-    // parent ignores of the index root itself still apply through the
-    // walker's own parent chain when the flag is off.
-    let scan_root = root.join(cwd_rel);
-    let files: Vec<PathBuf> = walk::sweep_selective(
-        &scan_root,
-        args.hidden,
-        args.follow,
-        walk::WalkFlags {
-            dot: !args.no_ignore_dot,
-            vcs: !args.no_ignore_vcs,
-            exclude: !args.no_ignore_exclude,
-            global: !args.no_ignore_global,
-        },
-        !args.no_ignore_parent,
-    )?
-    .into_iter()
-    .map(|m| cwd_rel.join(m.path))
-    .collect();
-    timings.stage("sweep_selective");
-    // The walker gates hidden entries itself: nothing arrives flagged.
-    run_live_files(
-        root,
-        cwd_rel,
-        args,
-        scope,
-        timings,
-        (files, Vec::new()),
-        had_error,
-    )
+/// rg's nothing-searched warning: with no path operand, a walk that
+/// yields no file at all (filters ate everything) is an error, exit 2.
+fn report_nothing_searched() {
+    messages::error(
+        "No files were searched, which means glep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped.",
+    );
 }
 
 /// True when no flag changes what the listing cache would list or the
@@ -1472,15 +1454,11 @@ fn listing_cache_eligible(args: &Args) -> bool {
 /// freshness-sweep path. Filtering inside keeps the loaded tree's
 /// ownership local to this function.
 #[cfg(target_os = "macos")]
-fn listing_via_cache<F>(
+fn listing_via_cache(
     root: &Path,
     index_dir: &Path,
-    keep: F,
     timings: &mut Timings,
-) -> Option<(Vec<PathBuf>, Vec<PathBuf>)>
-where
-    F: Fn(&crate::walk::FileMeta) -> bool + Sync,
-{
+) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     // Ancestor .ignore/.rgignore files apply to the whole tree but sit
     // outside both the bulk walker's matcher stack and the cache's
     // fingerprint: never serve a listing they could change.
@@ -1513,14 +1491,12 @@ where
         };
         let _ = updated.save(index_dir);
     }
-    // Parallel filter: 86k globset matches on a kernel-scale tree cost
-    // ~15ms serial, ~2ms across the pool. The sweep's hidden flag splits
-    // the result, like the index's live_files_split.
+    // The sweep's hidden flag splits the result, like the index's
+    // live_files_split.
     use rayon::prelude::*;
     let (hidden, plain): (Vec<PathBuf>, Vec<PathBuf>) = outcome
         .files
         .par_iter()
-        .filter(|m| keep(m))
         .map(|m| (m.hidden, m.path.clone()))
         .partition_map(|(h, p)| {
             if h {
@@ -1927,6 +1903,8 @@ pub fn run() -> anyhow::Result<i32> {
         .collect();
     // No explicit paths: the implicit scope is the cwd subtree (rg's
     // default `.`). At the discovered root itself this is "": everything.
+    // Only an implicit scope can trip rg's nothing-searched warning.
+    let implicit = args.paths.is_empty();
     if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
         args.paths.push(cwd_rel.clone());
     }
@@ -1976,50 +1954,25 @@ pub fn run() -> anyhow::Result<i32> {
     }
 
     let mut timings = Timings::new();
-    let mut scope = Scope::new(&args, &root, &cwd_rel)?;
+    let mut scope = Scope::new(&args, &root, &cwd_rel, implicit)?;
 
-    // Escape hatches: each never reads or writes the index.
-    if args.no_ignore {
-        return run_no_ignore(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
-    }
-    if args.require_git && walk::find_git_root(&root).is_none() {
-        return run_require_git(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
-    }
-    if args.one_file_system {
-        return run_one_fs(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
-    }
-    // Individual --no-ignore-* toggles: files excluded only by a disabled
-    // source aren't in the manifest, so index narrowing can't find them:
-    // the same live-scan escape hatch as --no-ignore/--require-git.
-    if args.no_ignore_dot
+    // Live-scan escape hatches, which never read or write the index:
+    // --no-ignore and the -u ladder, the --no-ignore-* toggles (files
+    // excluded only by a disabled source aren't in the manifest),
+    // --require-git outside a repo (git rules go inert), and
+    // --one-file-system, -L and --no-index (no narrowing at all).
+    if args.no_ignore
+        || args.no_ignore_dot
         || args.no_ignore_vcs
         || args.no_ignore_exclude
         || args.no_ignore_global
         || args.no_ignore_parent
+        || (args.require_git && walk::find_git_root(&root).is_none())
+        || args.one_file_system
+        || args.follow
+        || args.no_index
     {
-        return run_selective(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
-    }
-    if args.follow {
-        return run_follow(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
-    }
-    if args.no_index {
-        // Live gitignore-aware scan of the discovered tree: same file set
-        // as the indexed path would yield, minus all trigram narrowing.
-        let (hidden, files): (Vec<_>, Vec<_>) = walk::sweep(&root)?
-            .into_iter()
-            .partition(|m| m.hidden && !args.hidden);
-        let files = files.into_iter().map(|m| m.path).collect();
-        let hidden = hidden.into_iter().map(|m| m.path).collect();
-        timings.stage("sweep");
-        return run_live_files(
-            &root,
-            &cwd_rel,
-            &args,
-            &mut scope,
-            &mut timings,
-            (files, hidden),
-            had_error,
-        );
+        return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
     }
 
     // Dir-mtime cached listing (macOS only), consulted BEFORE even
@@ -2030,16 +1983,8 @@ pub fn run() -> anyhow::Result<i32> {
     // cwd scope and every other filter apply after the listing.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
-        let glob_matcher = files_glob(&args)?;
-        let glob_cwd = cwd_rel.clone();
-        let keep = move |m: &crate::walk::FileMeta| -> bool {
-            match &glob_matcher {
-                Some(g) => g.is_match(&*search::display_rel(&m.path, &glob_cwd)),
-                None => true,
-            }
-        };
         if let Some((mut plain, mut hidden)) =
-            listing_via_cache(&root, &root.join(".glep"), keep, &mut timings)
+            listing_via_cache(&root, &root.join(".glep"), &mut timings)
         {
             // Path order first: the scope groups by operand from it.
             use rayon::prelude::*;
@@ -2048,7 +1993,11 @@ pub fn run() -> anyhow::Result<i32> {
             }
             plain.par_sort();
             hidden.sort();
+            scope.walk_unserved(&args, &cwd_rel, |op| {
+                sorted_has_under(&plain, op) || sorted_has_under(&hidden, op)
+            });
             let mut files = scope.select(plain, hidden);
+            retain_glob(&mut files, files_glob(&args)?.as_ref(), &cwd_rel);
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
@@ -2072,6 +2021,8 @@ pub fn run() -> anyhow::Result<i32> {
     // manifest entry yet), so the same rule is computed here, whitelist
     // rescue included.
     let (extra_plain, extra_hidden) = split_extra(&root, &extra, args.hidden);
+    scope.walk_unserved(&args, &cwd_rel, |op| idx.has_files_under(op));
+    timings.stage("operands");
     // Every live file (the --files listing, the --files-without-match
     // universe), split by the hidden flag.
     let live_split = || {
@@ -2082,12 +2033,10 @@ pub fn run() -> anyhow::Result<i32> {
     };
 
     if args.files {
-        let (mut plain, mut hidden) = live_split();
-        // With --files the pattern slot is the glob.
-        let glob = files_glob(&args)?;
-        retain_glob(&mut plain, glob.as_ref(), &cwd_rel);
-        retain_glob(&mut hidden, glob.as_ref(), &cwd_rel);
+        let (plain, hidden) = live_split();
         let mut files = scope.select(plain, hidden);
+        // With --files the pattern slot is the glob.
+        retain_glob(&mut files, files_glob(&args)?.as_ref(), &cwd_rel);
         apply_sort(&mut files, &args, &root, &cwd_rel)?;
         print_paths(&files, &cwd_rel, &args)?;
         timings.finish();
@@ -2194,19 +2143,22 @@ pub fn run() -> anyhow::Result<i32> {
     let mut opts = search_opts(&args, &cwd_rel);
     opts.fixed = effective_fixed;
 
-    // rg's nothing-searched heuristic: with the implicit path scope, an
-    // empty walked pool (ignore rules or filters ate everything) warns on
-    // stderr and exits 2. An empty set produced by trigram narrowing is a
-    // plain no-match (exit 1): the pool was still searched.
+    // rg's nothing-searched heuristic: with the implicit path scope (also
+    // from a subdirectory), an empty walked pool (ignore rules or filters
+    // ate everything) warns on stderr and exits 2. An empty set produced
+    // by trigram narrowing is a plain no-match (exit 1): the pool was
+    // still searched. The check stops at the first surviving file.
     let mut nothing_searched = false;
-    if files.is_empty() && args.paths.is_empty() {
-        let (plain, hidden) = live_split();
-        let pool = scope.select(plain, hidden);
-        if pool.is_empty() {
+    if files.is_empty() && scope.implicit {
+        let live = idx
+            .manifest
+            .live_entries()
+            .map(|e| (e.path.as_path(), e.flags & FLAG_HIDDEN != 0))
+            .chain(extra_plain.iter().map(|p| (p.as_path(), false)))
+            .chain(extra_hidden.iter().map(|p| (p.as_path(), true)));
+        if !scope.searches_anything(live) {
             nothing_searched = true;
-            messages::error(
-                "No files were searched, which means glep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped.",
-            );
+            report_nothing_searched();
         }
     }
 

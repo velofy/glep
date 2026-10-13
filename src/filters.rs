@@ -166,6 +166,16 @@ impl Filters {
         })
     }
 
+    /// The override matcher, for walkers that apply it themselves.
+    pub fn overrides(&self) -> Option<&Override> {
+        self.overrides.as_ref()
+    }
+
+    /// The type matcher, for walkers that apply it themselves.
+    pub fn types(&self) -> Option<&Types> {
+        self.types.as_ref()
+    }
+
     /// Whether rg would yield `f` (root-relative) when walking the operand
     /// whose path has `base` components. `hidden` is the sweep's flag:
     /// some dot-named component of `f` is not whitelisted by ignore rules.
@@ -281,6 +291,9 @@ pub enum OperandKind {
     File,
     /// A directory served from the index or a sweep's file set.
     Dir,
+    /// A directory the index cannot serve, already walked live with rg's
+    /// rules: these are its files, root-relative and in path order.
+    Walked(Vec<PathBuf>),
 }
 
 /// Merge two path-sorted lists.
@@ -319,8 +332,10 @@ impl Filters {
         hidden: Vec<PathBuf>,
     ) -> Vec<PathBuf> {
         if let [op] = operands {
-            if let OperandKind::File = op.kind {
-                return vec![op.path.clone()];
+            match &op.kind {
+                OperandKind::File => return vec![op.path.clone()],
+                OperandKind::Walked(files) => return files.clone(),
+                OperandKind::Dir => {}
             }
             let base = op.path.components().count();
             let p = &op.path;
@@ -333,8 +348,9 @@ impl Filters {
         }
         let mut out = Vec::new();
         for op in operands {
-            match op.kind {
+            match &op.kind {
                 OperandKind::File => out.push(op.path.clone()),
+                OperandKind::Walked(files) => out.extend(files.iter().cloned()),
                 OperandKind::Dir => {
                     let base = op.path.components().count();
                     let p = &op.path;

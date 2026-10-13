@@ -526,84 +526,6 @@ fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     Ok(collected.into_inner().unwrap())
 }
 
-/// Live, index-bypassing sweep for `-L/--follow`: identical filtering
-/// semantics to `sweep_walker` (gitignore/.ignore/global excludes apply,
-/// `.git`/`.glep` hard-excluded) but follows symlinks during traversal.
-/// Ignore rules are NOT bypassed here: `-L` only changes traversal.
-///
-/// Why this is a live-scan escape hatch and not an index mode: files
-/// reached THROUGH a symlinked directory are not in the manifest at all
-/// (the index sweep doesn't descend links), so index narrowing couldn't
-/// find them; scanning the followed tree is the only sound option.
-/// `include_hidden` gates hidden entries the same as `sweep_unfiltered`.
-///
-/// Portable walker only (like `sweep_unfiltered`): the macOS bulk path
-/// has no loop detection and no link handling, and `-L` is a deliberate
-/// full-scan path anyway.
-pub fn sweep_follow(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
-    );
-    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
-    let walker = ignore::WalkBuilder::new(root)
-        .require_git(false)
-        .hidden(!include_hidden)
-        .follow_links(true)
-        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
-        .build_parallel();
-    let mut builder = CollectorBuilder {
-        root,
-        global: &collected,
-        whitelists: true,
-        flags: WalkFlags::all(),
-    };
-    walker.visit(&mut builder);
-    let mut v = collected.into_inner().unwrap();
-    v.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(v)
-}
-
-/// `--require-git` on a non-repo tree: gitignore rules are inert so
-/// files that the index sweep skips (gitignored) can still appear in
-/// results; a live scan is the only sound option (the index doesn't
-/// have them). `.ignore`/`.rgignore`/global excludes still apply; only
-/// the git-derived sources are switched off. `include_hidden` gates
-/// hidden entries the same as `sweep_unfiltered`.
-pub fn sweep_no_git(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
-    );
-    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(!include_hidden)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
-        .build_parallel();
-    let mut builder = CollectorBuilder {
-        root,
-        global: &collected,
-        // gitignore-derived whitelists are inert here (git sources off),
-        // but .ignore `!` rules still apply.
-        whitelists: true,
-        flags: WalkFlags {
-            dot: true,
-            vcs: false,
-            exclude: false,
-            global: false,
-        },
-    };
-    walker.visit(&mut builder);
-    let mut v = collected.into_inner().unwrap();
-    v.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(v)
-}
-
 /// Live, index-bypassing sweep for `--no-ignore`: same shape as `sweep`
 /// (root.is_dir() ensure with identical error text, Err-entry warnings on
 /// stderr, output sorted by relative path, `.git`/`.glep` hard-excluded at
@@ -626,6 +548,7 @@ pub fn sweep_no_git(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<Fil
 /// On macOS the walk runs on `walk_bulk::sweep_bulk_unfiltered` (one bulk
 /// attribute call per directory) unless `follow` asks for symlink
 /// traversal, which only the portable walker implements.
+#[cfg(test)]
 pub fn sweep_unfiltered(
     root: &Path,
     include_hidden: bool,
@@ -678,78 +601,128 @@ pub fn sweep_unfiltered(
     Ok(v)
 }
 
-/// Live sweep honoring individual ignore-source toggles
-/// (`--no-ignore-dot`/`--no-ignore-vcs`/`--no-ignore-exclude`/
-/// `--no-ignore-global`/`--no-ignore-parent`): like `--require-git`
-/// outside a repo, a file excluded by a disabled source simply isn't in
-/// the index, so the only sound path is a live scan, never the index.
-/// Whitelist `!` rules in a DISABLED source go inert with it.
-pub fn sweep_selective(
-    root: &Path,
-    include_hidden: bool,
-    follow: bool,
-    flags: WalkFlags,
-    parents: bool,
-) -> anyhow::Result<Vec<FileMeta>> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
-    );
-    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
-    let walker = ignore::WalkBuilder::new(root)
-        .require_git(false)
-        .hidden(!include_hidden)
-        .ignore(flags.dot)
-        .git_ignore(flags.vcs)
-        .git_exclude(flags.exclude)
-        .git_global(flags.global)
-        .parents(parents)
-        .follow_links(follow)
-        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
-        .build_parallel();
-    let mut builder = CollectorBuilder {
-        root,
-        global: &collected,
-        whitelists: true,
-        flags,
-    };
-    walker.visit(&mut builder);
-    let mut v = collected.into_inner().unwrap();
-    v.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(v)
+/// How a live walk filters: rg's walker configuration for one run.
+pub struct LiveWalk<'a> {
+    /// The ignore sources honored (each --no-ignore-X turns one off).
+    pub flags: WalkFlags,
+    /// Ignore files in directories above the walked operand
+    /// (--no-ignore-parent turns them off).
+    pub parents: bool,
+    /// Git ignore sources apply only inside a git repository.
+    pub require_git: bool,
+    pub show_hidden: bool,
+    pub follow: bool,
+    pub one_file_system: bool,
+    pub max_depth: Option<usize>,
+    pub overrides: Option<&'a ignore::overrides::Override>,
+    pub types: Option<&'a ignore::types::Types>,
+    pub ignore_files: &'a [PathBuf],
+    pub ignore_file_case_insensitive: bool,
 }
 
-/// Portable sweep that stays on the root's filesystem
-/// (`--one-file-system`): all ignore sources on, hidden gated at the
-/// walker, and `same_file_system(true)` descends only into directories
-/// whose `st_dev` equals the root's. Deliberately walker-based (like
-/// `sweep_follow`): the macOS bulk sweep has no mount filtering, and
-/// mount-point subtrees must not enter the index either; callers route
-/// this through the live-scan path.
-pub fn sweep_one_fs(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
-    anyhow::ensure!(
-        root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
-    );
-    let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
-    let walker = ignore::WalkBuilder::new(root)
-        .require_git(false)
-        .hidden(!include_hidden)
-        .same_file_system(true)
-        .filter_entry(|entry| !is_hard_excluded_component(entry.file_name()))
-        .build_parallel();
-    let mut builder = CollectorBuilder {
-        root,
-        global: &collected,
-        whitelists: true,
-        flags: WalkFlags::all(),
+/// rg's walk of one directory operand, for everything the index cannot
+/// serve: the live-scan escape hatches and operands the index holds no
+/// file under (an ignored or symlinked directory, a differently spelled
+/// path). `start` is the operand relative to the current directory ("" is
+/// the current directory itself), so -g globs and --ignore-file rules see
+/// the paths rg's walk yields, and the operand itself is never filtered.
+/// Returns the files the walk yields, relative to the current directory
+/// (no leading `./`), in path order. `.git` and `.glep` are never
+/// entered. Walk errors are reported (exit 2) and the walk goes on.
+pub fn live_walk(start: &Path, cfg: &LiveWalk<'_>) -> Vec<PathBuf> {
+    let from = if start.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        start
     };
-    walker.visit(&mut builder);
-    let mut v = collected.into_inner().unwrap();
-    v.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(v)
+    // macOS fast path for a walk with no rules at all (--no-ignore with no
+    // glob, type, ignore file or depth limit): one bulk attribute call per
+    // directory. Its hidden gating is rg's (a dot-named entry below the
+    // start is skipped, the start itself never is).
+    #[cfg(target_os = "macos")]
+    {
+        let unfiltered = !cfg.flags.dot
+            && !cfg.flags.vcs
+            && !cfg.flags.exclude
+            && !cfg.flags.global
+            && !cfg.parents
+            && !cfg.follow
+            && !cfg.one_file_system
+            && cfg.max_depth.is_none()
+            && cfg.overrides.is_none()
+            && cfg.types.is_none()
+            && cfg.ignore_files.is_empty();
+        if unfiltered && std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
+            if let Ok(metas) = crate::walk_bulk::sweep_bulk_unfiltered(from, cfg.show_hidden) {
+                let mut v: Vec<PathBuf> = metas.into_iter().map(|m| start.join(m.path)).collect();
+                v.sort();
+                return v;
+            }
+        }
+    }
+    let mut wb = ignore::WalkBuilder::new(from);
+    wb.require_git(cfg.require_git)
+        .hidden(!cfg.show_hidden)
+        .ignore(cfg.flags.dot)
+        .git_ignore(cfg.flags.vcs)
+        .git_exclude(cfg.flags.exclude)
+        .git_global(cfg.flags.global)
+        .parents(cfg.parents)
+        .follow_links(cfg.follow)
+        .same_file_system(cfg.one_file_system)
+        .max_depth(cfg.max_depth)
+        .ignore_case_insensitive(cfg.ignore_file_case_insensitive)
+        .filter_entry(|e| !is_hard_excluded_component(e.file_name()));
+    if let Some(o) = cfg.overrides {
+        wb.overrides(o.clone());
+    }
+    if let Some(t) = cfg.types {
+        wb.types(t.clone());
+    }
+    for f in cfg.ignore_files {
+        // Unreadable files were already reported when the run's filters
+        // were built.
+        let _ = wb.add_ignore(f);
+    }
+    let found: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    wb.build_parallel().run(|| {
+        let mut flush = FlushOnDrop {
+            local: Vec::new(),
+            into: &found,
+        };
+        Box::new(move |res| {
+            match res {
+                Ok(ent) => {
+                    if ent.depth() > 0 && ent.file_type().is_some_and(|t| t.is_file()) {
+                        let p = ent.path();
+                        flush
+                            .local
+                            .push(p.strip_prefix(".").unwrap_or(p).to_path_buf());
+                    }
+                }
+                Err(err) => crate::messages::error(err),
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    let mut v = found.into_inner().unwrap();
+    v.sort();
+    v
+}
+
+/// A walker thread's results, merged into the shared list once, when
+/// the thread's visitor is dropped.
+struct FlushOnDrop<'a> {
+    local: Vec<PathBuf>,
+    into: &'a Mutex<Vec<PathBuf>>,
+}
+
+impl Drop for FlushOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.local.is_empty() {
+            self.into.lock().unwrap().append(&mut self.local);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -781,8 +754,28 @@ mod scoped_tests {
 #[cfg(test)]
 mod tests {
 
+    fn live(root: &Path, parents: bool) -> Vec<PathBuf> {
+        let cfg = crate::walk::LiveWalk {
+            flags: crate::walk::WalkFlags::all(),
+            parents,
+            require_git: false,
+            show_hidden: false,
+            follow: false,
+            one_file_system: false,
+            max_depth: None,
+            overrides: None,
+            types: None,
+            ignore_files: &[],
+            ignore_file_case_insensitive: false,
+        };
+        crate::walk::live_walk(root, &cfg)
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect()
+    }
+
     #[test]
-    fn sweep_selective_parent_off() {
+    fn live_walk_parent_off() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
@@ -790,23 +783,15 @@ mod tests {
         std::fs::write(root.join("b.txt"), "x").unwrap();
         // parent ignore file ignoring a.txt: should NOT apply with parents off
         std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
-        let flags = crate::walk::WalkFlags::all();
-        let on: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, true)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.path)
-            .collect();
-        let off: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, false)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.path)
-            .collect();
-        eprintln!("on={on:?} off={off:?}");
-        assert_eq!(off, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+        assert_eq!(live(&root, true), vec![PathBuf::from("b.txt")]);
+        assert_eq!(
+            live(&root, false),
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
     }
 
     #[test]
-    fn sweep_selective_parent_off_inside_git_repo() {
+    fn live_walk_parent_off_inside_git_repo() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -814,15 +799,8 @@ mod tests {
         std::fs::write(root.join("x.log"), "x").unwrap();
         std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
         std::fs::write(dir.path().join(".ignore"), "a.txt\n").unwrap();
-        let flags = crate::walk::WalkFlags::all();
-        let off: Vec<_> = crate::walk::sweep_selective(&root, false, false, flags, false)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.path)
-            .collect();
-        eprintln!("off={off:?}");
         // a.txt rescued (parent .ignore off), x.log still gitignored
-        assert_eq!(off, vec![PathBuf::from("a.txt")]);
+        assert_eq!(live(&root, false), vec![PathBuf::from("a.txt")]);
     }
 
     use super::*;

@@ -1438,8 +1438,89 @@ fn subdirectory_runs_match_rg() {
         &["-l", "-g", "!/main.rs", "fn|answer"],
         &["-l", "-g", "!deep", "answer|hello"],
         &["--files", "-g", "deep/*"],
+        // The cwd scope is still rg's implicit path: when filters leave
+        // nothing to search, rg warns and exits 2.
+        &["-g", "*.zz", "hello"],
+        &["--max-depth", "0", "hello"],
+        &["-t", "json", "hello"],
+        &["-l", "-g", "src/**", "hello"],
     ];
     check_cases(&sub, "subdir", cases);
+}
+
+/// Directory operands the index holds no file under are walked live with
+/// rg's rules, because rg walks them like any other operand and never
+/// filters an operand itself: an ignored directory (as an operand or as
+/// the cwd), a symlink to a directory, a hidden cwd, and a spelling that
+/// differs from the one on disk on a case-insensitive filesystem. The
+/// live escape hatches walk from each operand too, so --no-ignore-parent
+/// drops the ignore files above an operand.
+#[test]
+fn operands_the_index_cannot_serve_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A repository root: .ignore and .gitignore rules apply to `sub` from
+    // above, unless --no-ignore-parent.
+    std::fs::create_dir_all(d.join(".git")).unwrap();
+    std::fs::write(d.join(".gitignore"), "build/\n*.log\nt.txt\n").unwrap();
+    std::fs::write(d.join(".ignore"), "s.txt\n").unwrap();
+    for (p, body) in [
+        ("README.md", "hello readme\n"),
+        ("build/out.txt", "hello build\n"),
+        ("build/deep/more.txt", "hello build deep\n"),
+        ("build/x.log", "hello log\n"),
+        (".hdir/inner.rs", "hello hdir\n"),
+        ("src/main.rs", "hello main\n"),
+        ("sub/in/s.txt", "hello s\n"),
+        ("sub/in/t.txt", "hello t\n"),
+        ("sub/in/u.txt", "hello u\n"),
+    ] {
+        let p = d.join(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let (_, code) = glep_out(d, &["-c", "hello"]);
+    assert_eq!(code, 0);
+    let mut cases: Vec<&[&str]> = vec![
+        &["-n", "hello", "build"],
+        &["-c", "hello", "build", "src"],
+        &["-l", "hello", "src", "build"],
+        &["-l", "-g", "!deep", "hello", "build"],
+        &["--max-depth", "1", "-l", "hello", "build"],
+        &["-l", "hello", ".hdir"],
+        &["-l", "hello", "sub"],
+        &["--no-ignore-parent", "hello", "sub"],
+        &["--no-ignore-parent", "-l", "hello"],
+        &["--no-ignore", "-l", "hello", ".hdir"],
+        &["--no-ignore-vcs", "-l", "hello", "sub"],
+        &["--files-without-match", "zz_absent", "build"],
+    ];
+    #[cfg(unix)]
+    {
+        // Forward-slash operands print as typed in rg, so these stay off
+        // Windows, where glep prints native separators.
+        std::os::unix::fs::symlink("../sub/in", d.join("src/link_dir")).unwrap();
+        cases.extend_from_slice(&[
+            &["-n", "hello", "src/link_dir"],
+            &["-c", "hello", "src/link_dir", "src"],
+            &["--no-ignore-parent", "-l", "hello", "sub/in"],
+        ]);
+    }
+    // A case-insensitive filesystem (macOS and Windows defaults) finds
+    // `SRC`; rg prints the operand as typed.
+    if d.join("SRC").exists() {
+        cases.extend_from_slice(&[&["-n", "hello", "SRC"], &["-l", "hello", "Src", "build"]]);
+    }
+    check_cases(d, "unserved", &cases);
+    // The cwd itself inside an ignored or a hidden directory.
+    let in_build: &[&[&str]] = &[&["hello"], &["-l", "hello"], &["-c", "hello", "deep"]];
+    check_cases(&d.join("build"), "cwd build", in_build);
+    let in_hdir: &[&[&str]] = &[&["hello"], &["-c", "hello"]];
+    check_cases(&d.join(".hdir"), "cwd .hdir", in_hdir);
 }
 
 /// Warm the listing cache (macOS: `.glep/dirtree.bin`) so a later
