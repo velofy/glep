@@ -129,7 +129,20 @@ impl Index {
         }
         let (lock, read_only) = Self::acquire_lock(&dir);
         anyhow::ensure!(!read_only, "another glep holds the index lock");
+        Self::build_locked(root, max_filesize, lock)
+    }
 
+    /// The full build, under a lock this process already holds. Compaction
+    /// rebuilds through here without ever letting go of its lock: dropping
+    /// and re-taking it raced with any child process forked in between (the
+    /// child shares the lock's open file until it execs), which then
+    /// failed the rebuild with "another glep holds the index lock".
+    fn build_locked(
+        root: &Path,
+        max_filesize: u64,
+        lock: Option<std::fs::File>,
+    ) -> anyhow::Result<Index> {
+        let dir = root.join(".glep");
         let generation = new_generation();
         let metas = walk::sweep(root)?;
         let mut man = Manifest::default();
@@ -656,8 +669,9 @@ impl Index {
             .map(|m| m.len())
             .unwrap_or(0);
         if !scoped && main_size > 0 && delta_size > main_size / 10 {
-            drop(self.lock.take()); // release before build re-acquires
-            *self = Index::build(&self.root, max_filesize)?;
+            // Rebuild under the lock this update already holds.
+            let lock = self.lock.take();
+            *self = Index::build_locked(&self.root.clone(), max_filesize, lock)?;
         }
         if let Some(t) = &mut timings {
             t.stage("index_write");

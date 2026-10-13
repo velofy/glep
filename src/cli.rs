@@ -1039,6 +1039,7 @@ fn retain_glob(files: &mut Vec<PathBuf>, glob: Option<&globset::GlobMatcher>, cw
 
 /// Whether a path-sorted list holds a path under `prefix`: in component
 /// order, everything under a directory sorts right after it.
+#[cfg(target_os = "macos")]
 fn sorted_has_under(list: &[PathBuf], prefix: &Path) -> bool {
     let i = list.partition_point(|x| x.as_path() < prefix);
     list.get(i).is_some_and(|x| x.starts_with(prefix))
