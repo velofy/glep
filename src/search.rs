@@ -89,10 +89,10 @@ pub struct SearchOpts {
     pub stop_on_nonmatch: bool,
     /// rg --no-messages: suppress per-file nonfatal warnings.
     pub no_messages: bool,
-    /// OSC8 hyperlink format for emitted paths (rg --hyperlink-format).
-    pub hyperlink_format: Option<String>,
-    /// Hostname variable inside hyperlink formats (rg --hostname-bin).
-    pub hostname_bin: Option<String>,
+    /// OSC8 hyperlinks for emitted paths (rg --hyperlink-format), resolved
+    /// once in cli (format parsed, {host} from --hostname-bin or the
+    /// platform). Like rg, links are only written when color is on.
+    pub hyperlink: Option<grep_printer::HyperlinkConfig>,
     /// Worker thread count (rg -j); None or 0 means one per core.
     pub threads: Option<usize>,
     /// -r: rewrite matched text in output lines (capture refs like $1
@@ -165,8 +165,7 @@ impl Default for SearchOpts {
             max_columns_preview: false,
             stop_on_nonmatch: false,
             no_messages: false,
-            hyperlink_format: None,
-            hostname_bin: None,
+            hyperlink: None,
             threads: None,
             replace: None,
             pre: None,
@@ -421,14 +420,6 @@ impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
     }
 }
 
-/// Hostname for `{host}` hyperlink variables: same lookup the reference
-/// uses (gethostname); None when undiscoverable.
-fn hostname() -> Option<String> {
-    hostname::get()
-        .ok()
-        .map(|h| h.to_string_lossy().into_owned())
-}
-
 /// The StandardBuilder config shared by the no-color and ANSI paths.
 /// Built once per worker and reused for every file (building a printer
 /// from it only clones the config).
@@ -448,12 +439,8 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         .path_terminator(opts.path_terminator)
         .separator_path(opts.path_separator)
         .stats(opts.stats);
-    if let Some(fmt) = &opts.hyperlink_format {
-        if let Ok(hf) = fmt.parse::<grep_printer::HyperlinkFormat>() {
-            let mut env = grep_printer::HyperlinkEnvironment::new();
-            env.host(opts.hostname_bin.clone().or_else(hostname));
-            b.hyperlink(hf.into_config(env));
-        }
+    if let Some(h) = &opts.hyperlink {
+        b.hyperlink(h.clone());
     }
     if let Some(s) = &opts.field_match_separator {
         b.separator_field_match(s.clone());
@@ -465,15 +452,20 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
         b.separator_context(if s.is_empty() { None } else { Some(s.clone()) });
     }
     if opts.color {
-        let mut all = grep_printer::default_color_specs();
-        for s in &opts.color_specs {
-            if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
-                all.push(spec);
-            }
-        }
-        b.color_specs(grep_printer::ColorSpecs::new(&all));
+        b.color_specs(color_specs(&opts.color_specs));
     }
     b
+}
+
+/// rg's default color specs plus any --colors overrides.
+pub(crate) fn color_specs(user: &[String]) -> grep_printer::ColorSpecs {
+    let mut all = grep_printer::default_color_specs();
+    for s in user {
+        if let Ok(spec) = s.parse::<grep_printer::UserColorSpec>() {
+            all.push(spec);
+        }
+    }
+    grep_printer::ColorSpecs::new(&all)
 }
 
 /// Per-thread search state: one `Searcher` (and one configured printer
@@ -486,6 +478,8 @@ fn standard_printer_builder(opts: &SearchOpts) -> grep_printer::StandardBuilder 
 struct WorkerState {
     searcher: Searcher,
     printer: grep_printer::StandardBuilder,
+    /// Path rendering for the summary-style modes (-l/-c).
+    paths: PathStyle,
 }
 
 impl WorkerState {
@@ -527,6 +521,7 @@ impl WorkerState {
         WorkerState {
             searcher: sb.build(),
             printer: standard_printer_builder(opts),
+            paths: PathStyle::new(opts),
         }
     }
 }
@@ -618,6 +613,69 @@ impl<'a> Haystack<'a> {
 
     fn is_stream(&self) -> bool {
         matches!(self, Haystack::Gz(_) | Haystack::Pre(..))
+    }
+}
+
+/// How a bare path record is rendered: the -l/-c/--count-matches/
+/// --files-without-match records and the --files listing. Without color
+/// it is the path's bytes with --path-separator applied. Under --color it
+/// goes through grep-printer's `PathPrinter`, the printer rg itself uses
+/// for --files, which writes exactly what rg's summary printer writes for
+/// a path: the hyperlink opener (when --hyperlink-format is set), the
+/// path color spec, the path, a reset, and the hyperlink closer.
+pub(crate) struct PathStyle {
+    sep: Option<u8>,
+    styled: Option<grep_printer::PathPrinterBuilder>,
+}
+
+impl PathStyle {
+    pub(crate) fn new(opts: &SearchOpts) -> PathStyle {
+        PathStyle::with(
+            opts.path_separator,
+            opts.color,
+            &opts.color_specs,
+            opts.hyperlink.as_ref(),
+        )
+    }
+
+    pub(crate) fn with(
+        sep: Option<u8>,
+        color: bool,
+        user_specs: &[String],
+        hyperlink: Option<&grep_printer::HyperlinkConfig>,
+    ) -> PathStyle {
+        let styled = color.then(|| {
+            let mut b = grep_printer::PathPrinterBuilder::new();
+            b.color_specs(color_specs(user_specs))
+                .separator(sep)
+                .terminator(b'\n');
+            if let Some(h) = hyperlink {
+                b.hyperlink(h.clone());
+            }
+            b
+        });
+        PathStyle { sep, styled }
+    }
+
+    /// True when a path renders as its plain bytes (no color, no
+    /// separator rewrite): callers can then copy the bytes directly.
+    pub(crate) fn is_plain(&self) -> bool {
+        self.sep.is_none() && self.styled.is_none()
+    }
+
+    /// Append `rel` to `out` with no record terminator.
+    pub(crate) fn write(&self, out: &mut Vec<u8>, rel: &Path) {
+        match &self.styled {
+            None => write_path(out, rel, self.sep),
+            Some(b) => {
+                // PathPrinter always ends a path with its one-byte
+                // terminator; callers append their own record terminator
+                // (`:`, NUL, or the searcher's line terminator), so drop it.
+                if b.build(termcolor::Ansi::new(&mut *out)).write(rel).is_ok() {
+                    out.pop();
+                }
+            }
+        }
     }
 }
 
@@ -769,7 +827,7 @@ fn search_one<M: Matcher>(
             // is NUL under --null-data.
             let mut line = Vec::with_capacity(display.as_os_str().len() + 12);
             if opts.with_filename {
-                write_path(&mut line, display, opts.path_separator);
+                state.paths.write(&mut line, display);
                 line.push(opts.path_terminator.unwrap_or(b':'));
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
@@ -809,7 +867,7 @@ fn search_one<M: Matcher>(
         };
         let mut buf = Vec::new();
         if matched && opts.files_with_matches {
-            write_path(&mut buf, display, opts.path_separator);
+            state.paths.write(&mut buf, display);
             buf.push(opts.path_terminator.unwrap_or(b'\n'));
         }
         return Ok(FileResult {
@@ -1355,11 +1413,12 @@ fn finish(
                     .collect()
             })
             .unwrap_or_default();
+        let paths = PathStyle::new(opts);
         let mut buf = Vec::new();
         for p in universe.unwrap_or(files) {
             if !matched.contains(p.as_path()) {
                 found = true;
-                write_path(&mut buf, &display_path(p, opts), opts.path_separator);
+                paths.write(&mut buf, &display_path(p, opts));
                 buf.push(opts.path_terminator.unwrap_or(b'\n'));
             }
         }

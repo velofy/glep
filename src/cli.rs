@@ -200,11 +200,14 @@ pub struct Args {
     #[arg(long)]
     pub ignore_file_case_insensitive: bool,
     /// Emit OSC8 hyperlinks for file paths, in the given format
-    /// (rg --hyperlink-format; e.g. kitty, default, file)
+    /// (rg --hyperlink-format; e.g. kitty, default, file). Like the
+    /// reference, links are only written when color is on.
     #[arg(long, value_name = "FORMAT")]
     pub hyperlink_format: Option<String>,
-    /// The hostname part embedded in hyperlinks (rg --hostname-bin)
-    #[arg(long, value_name = "HOSTNAME")]
+    /// Program whose trimmed stdout is the hostname used by {host} in
+    /// hyperlink formats; falls back to the platform hostname
+    /// (rg --hostname-bin)
+    #[arg(long, value_name = "COMMAND")]
     pub hostname_bin: Option<String>,
     /// Verbose debug output on stderr (rg --debug)
     #[arg(long, conflicts_with = "quiet")]
@@ -559,18 +562,88 @@ fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool
     missing
 }
 
-/// --color WHEN resolution: `always` and `auto`+tty enable ANSI output;
-/// `never` and anything else disable it. `auto` on a piped stream is the
-/// common path (agents capture stdout), so it stays colorless there.
+/// --color WHEN resolution: `always`/`ansi` and `auto`+tty enable ANSI
+/// output; `never` disables it (other values were rejected in `run`).
+/// `auto` on a piped stream is the common path (agents capture stdout),
+/// so it stays colorless there.
 fn want_color(args: &Args) -> bool {
     match args.color.as_deref() {
-        Some("always") => true,
+        Some("always") | Some("ansi") => true,
         Some("auto") | None => {
             use std::io::IsTerminal;
             std::io::stdout().is_terminal()
         }
         _ => false,
     }
+}
+
+/// Reject output-styling values the reference rejects at flag-parse time
+/// (exit 2): an unknown --color choice, a malformed --colors spec, or an
+/// invalid --hyperlink-format.
+fn validate_output_flags(args: &Args) -> anyhow::Result<()> {
+    if let Some(c) = args.color.as_deref() {
+        if !matches!(c, "never" | "auto" | "always" | "ansi") {
+            anyhow::bail!("error parsing flag --color: choice '{c}' is unrecognized");
+        }
+    }
+    for spec in &args.color_specs {
+        if let Err(e) = spec.parse::<grep_printer::UserColorSpec>() {
+            anyhow::bail!("error parsing flag --colors: {e}");
+        }
+    }
+    if let Some(f) = args.hyperlink_format.as_deref() {
+        if let Err(e) = f.parse::<grep_printer::HyperlinkFormat>() {
+            anyhow::bail!("error parsing flag --hyperlink-format: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// rg's hyperlink setup: the --hyperlink-format template (or alias) with
+/// `{host}` resolved from --hostname-bin's output, else the platform
+/// hostname, and `{wslprefix}` under WSL. None when color is off (links
+/// are a color-mode feature in the reference: its plain writer never
+/// emits them), or when the format is empty (`none`). Called at most once
+/// per run, so --hostname-bin's program runs at most once.
+fn hyperlink_config(args: &Args) -> Option<grep_printer::HyperlinkConfig> {
+    let fmt: grep_printer::HyperlinkFormat = args.hyperlink_format.as_deref()?.parse().ok()?;
+    if fmt.is_empty() || !want_color(args) {
+        return None;
+    }
+    let mut env = grep_printer::HyperlinkEnvironment::new();
+    env.host(hyperlink_host(args.hostname_bin.as_deref()))
+        .wsl_prefix(wsl_prefix());
+    Some(fmt.into_config(env))
+}
+
+/// The `{host}` value: --hostname-bin's trimmed stdout when the program
+/// runs, succeeds and prints something; otherwise the platform hostname
+/// (gethostname), like the reference.
+fn hyperlink_host(bin: Option<&str>) -> Option<String> {
+    let platform = || hostname::get().ok().and_then(|h| h.into_string().ok());
+    let Some(bin) = bin else {
+        return platform();
+    };
+    let out = std::process::Command::new(bin)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => match String::from_utf8(o.stdout) {
+            Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => platform(),
+        },
+        _ => platform(),
+    }
+}
+
+/// `{wslprefix}`: `wsl$/<distro>` when running under WSL, as in rg.
+fn wsl_prefix() -> Option<String> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let distro = std::env::var_os("WSL_DISTRO_NAME")?;
+    Some(format!("wsl$/{}", distro.to_str()?))
 }
 
 /// Post-filters shared by every listing and search path: path operands,
@@ -815,26 +888,27 @@ fn apply_sort(
 /// Print `files` one record per path into ONE buffered write: stdout is a
 /// LineWriter, so a per-path println! costs one flush syscall per line
 /// (27k syscalls on a kernel-scale .c listing). Paths print relative to
-/// the cwd, with --path-separator and the -0 terminator applied.
-fn print_paths(files: &[PathBuf], cwd_rel: &Path, sep: Option<u8>, term: u8) -> anyhow::Result<()> {
+/// the cwd, with --path-separator, the -0 terminator and, under --color,
+/// rg's path color and hyperlinks applied (rg's --files printer).
+fn print_paths(files: &[PathBuf], cwd_rel: &Path, args: &Args) -> anyhow::Result<()> {
+    let term = if args.null { 0 } else { b'\n' };
+    let style = search::PathStyle::with(
+        args.path_separator,
+        want_color(args),
+        &args.color_specs,
+        hyperlink_config(args).as_ref(),
+    );
+    let plain = style.is_plain();
     let mut buf = Vec::with_capacity(files.len() * 48);
     for f in files {
         let d = search::display_rel(f, cwd_rel);
-        match sep {
+        if plain {
             // Raw bytes: Path::display().to_string() goes through the fmt
             // machinery per path (~0.7us each, ~20ms for a kernel-scale .c
             // listing); the bytes are identical for the paths we emit.
-            None => buf.extend_from_slice(d.as_os_str().as_encoded_bytes()),
-            Some(sep) => {
-                let mut first = true;
-                for c in d.components() {
-                    if !first {
-                        buf.push(sep);
-                    }
-                    first = false;
-                    buf.extend_from_slice(c.as_os_str().as_encoded_bytes());
-                }
-            }
+            buf.extend_from_slice(d.as_os_str().as_encoded_bytes());
+        } else {
+            style.write(&mut buf, &d);
         }
         buf.push(term);
     }
@@ -938,8 +1012,7 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         max_columns_preview: args.max_columns_preview,
         stop_on_nonmatch: args.stop_on_nonmatch,
         no_messages: args.no_messages || args.no_ignore_messages,
-        hyperlink_format: args.hyperlink_format.clone(),
-        hostname_bin: args.hostname_bin.clone(),
+        hyperlink: hyperlink_config(args),
         threads: args.threads,
         replace: args.replace.as_deref().map(|s| s.as_bytes().to_vec()),
         pre: args.pre.clone(),
@@ -987,12 +1060,7 @@ fn run_live_files(
         }
         apply_filters(&mut files, args, root)?;
         apply_sort(&mut files, args, root, cwd_rel)?;
-        print_paths(
-            &files,
-            cwd_rel,
-            args.path_separator,
-            if args.null { 0 } else { b'\n' },
-        )?;
+        print_paths(&files, cwd_rel, args)?;
         timings.finish();
         return Ok(exit_code(had_error, !files.is_empty()));
     }
@@ -1373,6 +1441,7 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
     validate_sort(&args)?;
+    validate_output_flags(&args)?;
     if let Some(g) = &args.pre_glob {
         build_glob_icase(g, false)?;
     }
@@ -1473,12 +1542,7 @@ pub fn run() -> anyhow::Result<i32> {
             use rayon::prelude::*;
             files.par_sort();
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
-            print_paths(
-                &files,
-                &cwd_rel,
-                args.path_separator,
-                if args.null { 0 } else { b'\n' },
-            )?;
+            print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
             timings.finish();
             return Ok(exit_code(had_error, !files.is_empty()));
@@ -1517,12 +1581,7 @@ pub fn run() -> anyhow::Result<i32> {
         }
         apply_filters(&mut files, &args, &root)?;
         apply_sort(&mut files, &args, &root, &cwd_rel)?;
-        print_paths(
-            &files,
-            &cwd_rel,
-            args.path_separator,
-            if args.null { 0 } else { b'\n' },
-        )?;
+        print_paths(&files, &cwd_rel, &args)?;
         timings.finish();
         // Rebuild the listing cache from the authoritative sweep (macOS
         // only). Only a full, written sweep certifies the whole manifest:

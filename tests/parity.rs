@@ -446,3 +446,193 @@ fn sort_by_timestamp_ties_follow_rg_walk_order() {
     }
     check("partially tied");
 }
+
+/// `corpus()` plus enough extra files that every search takes the
+/// worker-pool path (more than search.rs's SMALL_WORKLOAD files survive
+/// filtering), with a mix of matching and non-matching files spread over
+/// several directories.
+fn pool_corpus() -> tempfile::TempDir {
+    let dir = corpus();
+    for i in 0..48 {
+        let p = dir.path().join(format!("pool/d{}/f{i:02}.txt", i % 4));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let body = match i % 3 {
+            0 => format!("before {i}\nhello pool {i}\nafter {i}\n"),
+            1 => format!("foo {i} and foo again\nplain {i}\n"),
+            _ => format!("nothing {i}\n"),
+        };
+        std::fs::write(&p, body).unwrap();
+    }
+    dir
+}
+
+fn check_cases(dir: &Path, label: &str, cases: &[&[&str]]) {
+    for args in cases {
+        let (g, gc) = glep_out(dir, args);
+        let (r, rc) = rg_out(dir, args);
+        assert_eq!(g, r, "{label}: stdout diverged for {:?}", args);
+        assert_eq!(gc, rc, "{label}: exit code diverged for {:?}", args);
+    }
+}
+
+/// Under --color always rg styles the path of every summary record (-l,
+/// -c, --count-matches, --files-without-match) and of the --files listing
+/// with the path color spec, and wraps it in an OSC 8 hyperlink when
+/// --hyperlink-format is set. Without color neither happens. Invalid
+/// --color, --colors and --hyperlink-format values are flag errors.
+#[test]
+fn colored_and_hyperlinked_paths_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["--color", "always", "-l", "hello"],
+        &["--color", "always", "-c", "hello"],
+        &["--color", "always", "--count-matches", "hello"],
+        &["--color", "always", "--files"],
+
+        &["--color", "always", "-0", "-l", "hello"],
+        &["--color", "always", "-0", "-c", "hello"],
+        &["--color", "always", "--path-separator", "%", "-c", "hello"],
+        &["--color", "always", "--path-separator", "%", "--files"],
+        &["--color", "always", "-c", "--include-zero", "hello"],
+        &[
+            "--color",
+            "always",
+            "--colors",
+            "path:fg:red",
+            "--colors",
+            "path:style:bold",
+            "-l",
+            "hello",
+        ],
+        &["--color", "always", "--colors", "path:none", "-c", "hello"],
+        &["--color", "ansi", "-l", "hello"],
+        &["--color", "always", "--heading", "hello"],
+        &["--color", "always", "-C", "1", "hello"],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "-l",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "file://{path}",
+            "-c",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "--files",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "none",
+            "-l",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "vscode",
+            "--vimgrep",
+            "hello",
+        ],
+        &[
+            "--color",
+            "never",
+            "--hyperlink-format",
+            "default",
+            "-l",
+            "hello",
+        ],
+        &["--hyperlink-format", "default", "-c", "hello"],
+        // Flag errors: exit 2, nothing on stdout.
+        &["--color", "bogus", "hello"],
+        &["--colors", "path:fg:nope", "hello"],
+        &["--colors", "zz:fg:red", "hello"],
+        &["--hyperlink-format", "{bogus}", "hello"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    check_cases(pool_corpus().path(), "pool", cases);
+}
+
+/// --hostname-bin names a PROGRAM whose trimmed stdout becomes {host};
+/// a program that cannot run falls back to the platform hostname.
+#[cfg(unix)]
+#[test]
+fn hostname_bin_runs_a_program_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = corpus();
+    let bin_dir = tempfile::tempdir().unwrap();
+    let bin = bin_dir.path().join("fakehost");
+    std::fs::write(&bin, "#!/bin/sh\necho '  fake.host  '\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = bin.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "--hostname-bin",
+            bin,
+            "-l",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "--hostname-bin",
+            bin,
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "--hostname-bin",
+            bin,
+            "--files",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "default",
+            "--hostname-bin",
+            "/nonexistent/glep-test-host",
+            "-c",
+            "hello",
+        ],
+    ];
+    check_cases(dir.path(), "hostname-bin", cases);
+    let (g, _) = glep_out(dir.path(), cases[0]);
+    assert!(g.contains("file://fake.host/"), "{g:?}");
+}
