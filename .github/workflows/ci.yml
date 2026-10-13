@@ -12,7 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install ripgrep
+      # With PCRE2, so the -P and --engine auto parity cases run too; the
+      # suite gates them on `rg --pcre2-version` and passes without it.
+      - run: cargo install ripgrep --features pcre2
         shell: bash
       - run: cargo test --all
         shell: bash

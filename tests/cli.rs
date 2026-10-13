@@ -552,19 +552,19 @@ fn multiple_e_patterns_union() {
         .args(["-e", "there", "-e", "hello_world", "-l"])
         .assert()
         .success()
-        .stdout("notes.txt\nsrc/lib.rs\n");
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
     // -F with multiple -e: each arm is a literal, metachars don't parse.
     glep(dir.path())
         .args(["-F", "-e", "() {}", "-e", "kenobi", "-l"])
         .assert()
         .success()
-        .stdout("notes.txt\nsrc/lib.rs\n");
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
     // -e makes positionals paths
     glep(dir.path())
         .args(["-e", "hello", "-l", "src"])
         .assert()
         .success()
-        .stdout("src/lib.rs\n");
+        .stdout(p("src/lib.rs\n"));
 }
 
 #[cfg(unix)]
@@ -632,14 +632,14 @@ fn pattern_file_unions_with_positional() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("notes.txt"), "{s}");
-    assert!(s.contains("src/lib.rs"), "{s}");
+    assert!(s.contains(p("src/lib.rs").as_str()), "{s}");
     // -f + positional-as-path: 'src' is a path since -f is present
     let out = glep(dir.path())
         .args(["-f", "pats.txt", "-l", "src"])
         .assert()
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert_eq!(s, "src/lib.rs\n");
+    assert_eq!(s, p("src/lib.rs\n"));
 }
 
 #[test]
@@ -1222,4 +1222,66 @@ fn open_stdin_pipe_never_blocks_a_search() {
         };
         assert!(status.success(), "{args:?}: {status}");
     }
+}
+
+/// GLEP_INDEX_PATH points at an index directory: its parent is the tree
+/// searched, whatever the cwd, and no index is built anywhere else. A
+/// path that is not a directory is an error (exit 2), and a relative one
+/// resolves against the cwd.
+#[test]
+fn index_path_env_override() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    let idx = dir.path().join(".glep");
+    let elsewhere = tempfile::tempdir().unwrap();
+    glep(elsewhere.path())
+        .env("GLEP_INDEX_PATH", &idx)
+        .args(["-l", "hello"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+    assert!(!elsewhere.path().join(".glep").exists());
+    let out = glep(elsewhere.path())
+        .env("GLEP_INDEX_PATH", elsewhere.path().join("no_such_index"))
+        .args(["-l", "hello"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not an index directory"), "{err}");
+    assert!(!elsewhere.path().join("no_such_index").exists());
+    glep(dir.path())
+        .env("GLEP_INDEX_PATH", ".glep")
+        .args(["-l", "hello"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+}
+
+/// A run from a subdirectory finds the ancestor's index and searches the
+/// cwd subtree with cwd-relative paths; it never builds a second .glep
+/// below the root.
+#[test]
+fn subdirectory_run_uses_the_ancestor_index() {
+    let dir = corpus();
+    glep(dir.path()).arg("index").assert().success();
+    let sub = dir.path().join("src");
+    glep(&sub)
+        .args(["-l", "hello"])
+        .assert()
+        .success()
+        .stdout("lib.rs\n");
+    glep(&sub)
+        .arg("--files")
+        .assert()
+        .success()
+        .stdout("lib.rs\n");
+    glep(&sub)
+        .args(["-l", "hello", "../notes.txt"])
+        .assert()
+        .success()
+        .stdout(p("../notes.txt\n"));
+    assert!(!sub.join(".glep").exists());
 }

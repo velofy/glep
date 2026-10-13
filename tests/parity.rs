@@ -866,12 +866,9 @@ fn matcher_config_matches_rg() {
         &["-U", "--crlf", "hello\\r\\nsecond"],
         &["-U", "--crlf", "end$"],
         &["-U", "--crlf", "-c", "line$"],
-        &["-P", "--crlf", "-c", "o$"],
-        &["--null-data", "--crlf", "-P", "-c", "o$"],
         // NUL can only be matched without binary detection.
         &["-c", "a\\x00"],
         &["-a", "-c", "a\\x00"],
-        &["-P", "-c", "\\x00"],
         // -s/-i/-S: last wins.
         &["-s", "-i", "HELLO"],
         &["-i", "-s", "HELLO"],
@@ -890,12 +887,9 @@ fn matcher_config_matches_rg() {
         &["-m", "0", "--stats", "hello"],
         &["-m", "0", "-v", "hello"],
         &["-m", "0", "hello", "no_such_operand"],
-        // --engine auto falls back to PCRE2 per pattern; -P and --engine
-        // are a last-wins pair.
-        &["--engine", "auto", "-c", "hel(?=lo)"],
-        &["--engine", "auto", "-c", "a\\nb"],
+        // --engine auto keeps the default engine when it can; -P and
+        // --engine are a last-wins pair.
         &["--engine", "auto", "-c", "hello"],
-        &["--engine", "default", "-P", "-c", "hel(?=lo)"],
         &["-P", "--engine", "default", "-c", "hel(?=lo)"],
         // -E: auto/none keywords, a real label, an unknown label.
         &["-E", "none", "hello"],
@@ -905,6 +899,42 @@ fn matcher_config_matches_rg() {
     check_cases(corpus().path(), "small", cases);
     let pool = pool_corpus();
     assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
+}
+
+/// rg reports whether it was built with PCRE2: `rg --pcre2-version` exits
+/// 0 only then (`cargo install ripgrep` leaves it out unless
+/// `--features pcre2`).
+fn rg_has_pcre2() -> bool {
+    std::process::Command::new("rg")
+        .arg("--pcre2-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The PCRE2 side of the matcher configuration: CRLF-aware anchors, NUL
+/// matching, --engine auto falling back to PCRE2 per pattern, and -P
+/// winning over an earlier --engine. Compared only against an rg that
+/// has PCRE2: without it rg rejects every one of these patterns.
+#[test]
+fn pcre2_matcher_config_matches_rg() {
+    if !have_rg() || !rg_has_pcre2() {
+        eprintln!("parity: rg without PCRE2, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["-P", "--crlf", "-c", "o$"],
+        &["--null-data", "--crlf", "-P", "-c", "o$"],
+        &["-P", "-c", "\\x00"],
+        &["--engine", "auto", "-c", "hel(?=lo)"],
+        &["--engine", "auto", "-c", "a\\nb"],
+        &["--engine", "default", "-P", "-c", "hel(?=lo)"],
+        &["-P", "-c", "(?<=hel)lo"],
+        &["-P", "-o", "(\\w)\\1"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    let pool = pool_corpus();
     check_cases(pool.path(), "pool", cases);
 }
 
@@ -1195,7 +1225,6 @@ fn remaining_stack_flags_match_rg() {
         &["hello", "src", "README.md"],
         &["hello", "src/deep", "src"],
         &["hello", "README.md", "src"],
-        &["hello", "src/main.rs", "src"],
         &["-l", "hello", "src", "README.md", "crlf.txt"],
         &["--sortr", "path", "hello", "src", "README.md"],
         &["-d", "0", "hello", "src", "README.md"],
@@ -1206,6 +1235,17 @@ fn remaining_stack_flags_match_rg() {
     let pool = pool_corpus();
     assert_eq!(search_path(pool.path(), &["hello"]), "pool");
     check_cases(pool.path(), "pool", cases);
+    // A file operand inside a directory operand. rg prints a file operand
+    // exactly as typed and glep prints the cwd-relative path, which agree
+    // when the typed path uses the native separator (on Windows a typed
+    // `src/main.rs` prints as `src\main.rs`, see README).
+    let main_rs = format!("src{}main.rs", std::path::MAIN_SEPARATOR);
+    let native: &[&[&str]] = &[
+        &["hello", &main_rs, "src"],
+        &["-c", "hello", "src", &main_rs],
+    ];
+    check_cases(corpus().path(), "small", native);
+    check_cases(pool.path(), "pool", native);
 }
 
 /// Like rg, a repeated flag is last-wins instead of an error (wrappers and
