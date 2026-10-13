@@ -2044,3 +2044,114 @@ fn explicit_file_operands_match_rg() {
     let pool = pool_corpus();
     check_cases(pool.path(), "pool", cases);
 }
+
+/// Run glep and rg in `dir` with git's global configuration isolated in
+/// `home`: HOME (USERPROFILE on Windows) points there and no
+/// GIT_CONFIG_GLOBAL or system file is read, so both tools take
+/// `core.excludesFile` from `home/.gitconfig`.
+fn check_cases_home(dir: &Path, home: &Path, label: &str, cases: &[&[&str]]) {
+    let isolate = |cmd: &mut std::process::Command| {
+        cmd.current_dir(dir)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join("xdg"))
+            .env("GIT_CONFIG_SYSTEM", home.join("no-system-gitconfig"))
+            .env_remove("GIT_CONFIG_GLOBAL");
+    };
+    for args in cases {
+        let mut g = std::process::Command::new(assert_cmd::cargo::cargo_bin("glep"));
+        isolate(&mut g);
+        let g = g.args(*args).output().unwrap();
+        let mut r = std::process::Command::new("rg");
+        isolate(&mut r);
+        let r = r
+            .args([
+                "-n",
+                "--no-heading",
+                "--color=never",
+                "--sort",
+                "path",
+                "--no-require-git",
+            ])
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&g.stdout),
+            String::from_utf8_lossy(&r.stdout),
+            "{label}: stdout diverged for {args:?}"
+        );
+        assert_eq!(
+            g.status.code(),
+            r.status.code(),
+            "{label}: exit code diverged for {args:?}"
+        );
+    }
+}
+
+/// .git/info/exclude and the global gitignore (`core.excludesFile`) are
+/// VCS ignore sources: --no-ignore-vcs turns them off together with
+/// .gitignore, and --ignore-exclude or --ignore-global cannot bring one
+/// back while VCS ignores are off, as in rg.
+#[test]
+fn no_ignore_vcs_drops_exclude_and_global_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        "[core]\n\texcludesFile = ~/global.ignore\n",
+    )
+    .unwrap();
+    std::fs::write(home.path().join("global.ignore"), "pad.txt\n*.glob\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(repo.join(".git/info")).unwrap();
+    std::fs::write(repo.join(".git/info/exclude"), "docs/\n*.excl\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    for (p, body) in [
+        ("repo/main.txt", "hello main\n"),
+        ("repo/pad.txt", "hello pad\n"),
+        ("repo/q.excl", "hello excl\n"),
+        ("repo/docs/x.py", "hello docs\n"),
+        ("repo/a.log", "hello log\n"),
+        ("repo/sub/b.glob", "hello glob\n"),
+        ("plain/main.txt", "hello main\n"),
+        ("plain/pad.txt", "hello pad\n"),
+    ] {
+        let p = dir.path().join(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["-l", "hello"],
+        &["--files"],
+        &["--no-ignore-vcs", "-l", "hello"],
+        &["--no-ignore-vcs", "--files"],
+        &["--no-ignore-vcs", "-c", "hello"],
+        &["--no-ignore-exclude", "-l", "hello"],
+        &["--no-ignore-global", "-l", "hello"],
+        &["--no-ignore-vcs", "--ignore-exclude", "-l", "hello"],
+        &["--no-ignore-vcs", "--ignore-global", "--files"],
+        &["--ignore-vcs", "--no-ignore-vcs", "-l", "hello"],
+        &["--no-ignore", "--ignore-vcs", "-l", "hello"],
+        &["--no-ignore", "--ignore-exclude", "-l", "hello"],
+        &["--no-ignore", "--ignore-global", "-l", "hello"],
+    ];
+    check_cases_home(&repo, home.path(), "repo", cases);
+    check_cases_home(&plain, home.path(), "no repo", cases);
+    // rg ranks equal timestamps by its walk, which must see the files the
+    // exclude and global rules no longer hide.
+    stamp_all(
+        &repo,
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_650_000_000),
+    );
+    let sorted: &[&[&str]] = &[
+        &["--no-ignore-vcs", "--sort", "modified", "--files"],
+        &["--no-ignore-vcs", "--sortr", "modified", "-l", "hello"],
+    ];
+    check_cases_home(&repo, home.path(), "repo sorted", sorted);
+}

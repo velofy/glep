@@ -164,7 +164,8 @@ pub struct Args {
     /// hatch.
     #[arg(long)]
     pub no_ignore_dot: bool,
-    /// Don't respect .gitignore files (rg --no-ignore-vcs).
+    /// Don't respect VCS ignore rules: .gitignore, .git/info/exclude and
+    /// the global gitignore (rg --no-ignore-vcs).
     #[arg(long)]
     pub no_ignore_vcs: bool,
     /// Don't respect .git/info/exclude (rg --no-ignore-exclude).
@@ -1602,8 +1603,12 @@ fn resolve_flag_families(args: &mut Args, matches: &clap::ArgMatches) -> anyhow:
     };
     let dot = respected("no_ignore_dot", "ignore_dot");
     let vcs = respected("no_ignore_vcs", "ignore_vcs");
-    let exclude = respected("no_ignore_exclude", "ignore_exclude");
-    let global = respected("no_ignore_global", "ignore_global");
+    // .git/info/exclude and the global gitignore are git sources too: rg
+    // reads them only while VCS ignores are on (`--no-ignore-vcs` turns
+    // all three off, and `--ignore-exclude` alone does not bring exclude
+    // back), so the walker flags below are the effective ones.
+    let exclude = vcs && respected("no_ignore_exclude", "ignore_exclude");
+    let global = vcs && respected("no_ignore_global", "ignore_global");
     let parent = respected("no_ignore_parent", "ignore_parent");
     args.no_ignore_dot = !dot;
     args.no_ignore_vcs = !vcs;
