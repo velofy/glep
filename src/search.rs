@@ -94,8 +94,7 @@ pub struct SearchOpts {
     /// non-matching line that follows a match (a per-file searcher
     /// setting, exactly like rg).
     pub stop_on_nonmatch: bool,
-    /// rg --no-messages: suppress per-file nonfatal warnings.
-    pub no_messages: bool,
+
     /// OSC8 hyperlinks for emitted paths (rg --hyperlink-format), resolved
     /// once in cli (format parsed, {host} from --hostname-bin or the
     /// platform). Like rg, links are only written when color is on.
@@ -201,7 +200,7 @@ impl Default for SearchOpts {
             search_zip: false,
             max_columns_preview: false,
             stop_on_nonmatch: false,
-            no_messages: false,
+
             hyperlink: None,
             threads: None,
             replace: None,
@@ -687,14 +686,52 @@ enum Haystack<'a> {
     Map(memmap2::Mmap),
     Path(PathBuf),
     Gz(PathBuf),
-    Pre(&'a str, PathBuf),
+    /// --pre: the command, the file it reads as stdin, and the path it
+    /// gets as its argument (the cwd-relative display path, as in rg).
+    Pre(&'a str, PathBuf, PathBuf),
+}
+
+/// Records whether a reader reached end of input (rg's preprocessor
+/// reader does the same to tell a failed command from a broken pipe).
+struct EofReader<R> {
+    inner: R,
+    eof: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for EofReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+}
+
+/// A failed command's stderr the way rg shows it: the trimmed text framed
+/// by two 79-dash rules, or `<stderr is empty>`.
+fn stderr_text(err: &[u8]) -> String {
+    let msg = String::from_utf8_lossy(err);
+    let msg = msg.trim();
+    if msg.is_empty() {
+        "<stderr is empty>".to_string()
+    } else {
+        let div = "-".repeat(79);
+        format!("\n{div}\n{msg}\n{div}")
+    }
 }
 
 impl<'a> Haystack<'a> {
-    fn open(full: &Path, rel: &Path, opts: &'a SearchOpts, convert: bool) -> Haystack<'a> {
+    fn open(
+        full: &Path,
+        rel: &Path,
+        display: &Path,
+        opts: &'a SearchOpts,
+        convert: bool,
+    ) -> Haystack<'a> {
         if let Some(cmd) = &opts.pre {
             if opts.pre_glob.as_ref().is_none_or(|g| g.is_match(rel)) {
-                return Haystack::Pre(cmd, full.to_path_buf());
+                return Haystack::Pre(cmd, full.to_path_buf(), display.to_path_buf());
             }
         }
         if opts.search_zip && rel.extension().is_some_and(|x| x == "gz") {
@@ -742,29 +779,57 @@ impl<'a> Haystack<'a> {
                 let dec = flate2::read::GzDecoder::new(file);
                 searcher.search_reader(matcher, dec, sink)
             }
-            Haystack::Pre(cmd, p) => {
+            Haystack::Pre(cmd, file, arg) => {
                 // rg's contract: the path is the sole argument and the file
-                // is also the command's stdin.
+                // is also the command's stdin. A command that exits nonzero
+                // is an error for this file (exit 2), reported with its
+                // stderr, unless the search stopped early (-l, -q, -m) and
+                // stderr is empty: that failure is the broken pipe our early
+                // stop caused.
                 use grep_searcher::SinkError;
-                let stdin = std::fs::File::open(p).map_err(S::Error::error_io)?;
-                let mut child = std::process::Command::new(cmd)
-                    .arg(p)
+                let stdin = std::fs::File::open(file).map_err(S::Error::error_io)?;
+                let mut command = std::process::Command::new(cmd);
+                command
+                    .arg(arg)
                     .stdin(stdin)
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map_err(|e| {
-                        S::Error::error_message(format!(
-                            "preprocessor command could not start: '{cmd}': {e}"
-                        ))
-                    })?;
-                let stdout = child.stdout.take().expect("piped stdout");
-                // search_reader consumes (and so closes) the pipe before
-                // the wait: a sink that stops early (-l, -q, -m) makes the
-                // child see EPIPE instead of blocking on a full pipe.
-                let r = searcher.search_reader(matcher, stdout, sink);
-                let _ = child.wait();
-                r
+                    .stderr(std::process::Stdio::piped());
+                let mut child = command.spawn().map_err(|e| {
+                    S::Error::error_message(format!(
+                        "preprocessor command could not start: '{command:?}': {e}"
+                    ))
+                })?;
+                // stderr drains on its own thread so a chatty command can
+                // never block on a full pipe while its stdout is searched.
+                let mut err_pipe = child.stderr.take().expect("piped stderr");
+                let err_reader = std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
+                    buf
+                });
+                let mut out = EofReader {
+                    inner: child.stdout.take().expect("piped stdout"),
+                    eof: false,
+                };
+                let searched = searcher.search_reader(matcher, &mut out, sink);
+                // Close our end before the wait: a sink that stopped early
+                // makes the child see EPIPE instead of blocking.
+                let eof = out.eof;
+                drop(out);
+                let status = child.wait();
+                let err = err_reader.join().unwrap_or_default();
+                searched?;
+                match status {
+                    Ok(s) if s.success() => Ok(()),
+                    Ok(_) if !eof && err.is_empty() => Ok(()),
+                    Ok(_) => Err(S::Error::error_message(format!(
+                        "preprocessor command failed: '{command:?}': {}",
+                        stderr_text(&err)
+                    ))),
+                    Err(e) => Err(S::Error::error_message(format!(
+                        "preprocessor command failed: '{command:?}': {e}"
+                    ))),
+                }
             }
         }
     }
@@ -998,7 +1063,7 @@ fn search_detected<M: Matcher>(
 ) -> anyhow::Result<FileResult> {
     // Convert detection rewrites NULs, which needs the searcher's buffer.
     let convert = state.searcher.binary_detection().convert_byte().is_some();
-    let hay = Haystack::open(full, rel, opts, convert);
+    let hay = Haystack::open(full, rel, display, opts, convert);
     let (res, consumed) = search_hay(state, matcher, &hay, display, opts)?;
     if let Haystack::Map(map) = &hay {
         // A file that matched nothing and printed nothing reads the same
@@ -1169,8 +1234,9 @@ fn search_hay<M: Matcher>(
     Ok((res, consumed))
 }
 
-/// Run `search_one`, turning a per-file error into rg's warn-and-continue
-/// behavior: report on stderr (unless --no-messages), treat as unmatched.
+/// Run `search_one`, turning a per-file error into rg's report-and-continue
+/// behavior: the error is reported (unless --no-messages) and makes the
+/// exit code 2, and the file counts as unmatched.
 fn search_one_or_warn<M: Matcher>(
     state: &mut WorkerState,
     matcher: &M,
@@ -1181,9 +1247,7 @@ fn search_one_or_warn<M: Matcher>(
     match search_one(state, matcher, root, rel, opts) {
         Ok(r) => r,
         Err(e) => {
-            if !opts.no_messages {
-                eprintln!("glep: {}: {}", rel.display(), e);
-            }
+            crate::messages::error(format!("{}: {}", display_path(rel, opts).display(), e));
             FileResult::empty()
         }
     }

@@ -570,13 +570,13 @@ fn load_git_exclude(gitroot: &Path) -> anyhow::Result<Option<Gitignore>> {
     }
     let mut builder = GitignoreBuilder::new(gitroot);
     if let Some(err) = builder.add(&exclude_path) {
-        eprintln!("glep: {}: {err}", exclude_path.display());
+        crate::messages::ignore_warning(format!("{}: {err}", exclude_path.display()));
         return Ok(None);
     }
     match builder.build() {
         Ok(gi) => Ok(Some(gi)),
         Err(err) => {
-            eprintln!("glep: {}: {err}", exclude_path.display());
+            crate::messages::ignore_warning(format!("{}: {err}", exclude_path.display()));
             Ok(None)
         }
     }
@@ -606,7 +606,7 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
     // never calls `.current_dir()` either, so this matches it exactly).
     let (global, err) = Gitignore::global();
     if let Some(err) = err {
-        eprintln!("glep: global gitignore: {err}");
+        crate::messages::ignore_warning(format!("global gitignore: {err}"));
     }
     if !global.is_empty() {
         stack.push(Arc::new(global));
@@ -651,12 +651,12 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
         }
         let mut builder = GitignoreBuilder::new(&dir);
         if let Some(err) = builder.add(&gi_path) {
-            eprintln!("glep: {}: {err}", gi_path.display());
+            crate::messages::ignore_warning(format!("{}: {err}", gi_path.display()));
             continue;
         }
         match builder.build() {
             Ok(gi) => stack.push(Arc::new(gi)),
-            Err(err) => eprintln!("glep: {}: {err}", gi_path.display()),
+            Err(err) => crate::messages::ignore_warning(format!("{}: {err}", gi_path.display())),
         }
     }
 
@@ -688,7 +688,7 @@ fn scan_recursive<'scope>(
     let scan = match bulk_scan_dir(&dir) {
         Ok(s) => s,
         Err(ScanError::Soft(msg)) => {
-            eprintln!("glep: {msg}");
+            crate::messages::error(msg);
             return;
         }
         Err(ScanError::Fatal(e)) => {
@@ -730,11 +730,14 @@ fn scan_recursive<'scope>(
     if has_local_gitignore {
         let mut builder = GitignoreBuilder::new(&dir);
         if let Some(err) = builder.add(dir.join(".gitignore")) {
-            eprintln!("glep: {}: {err}", dir.join(".gitignore").display());
+            crate::messages::ignore_warning(format!("{}: {err}", dir.join(".gitignore").display()));
         }
         match builder.build() {
             Ok(gi) => stack.push(Arc::new(gi)),
-            Err(err) => eprintln!("glep: {}: {err}", dir.join(".gitignore").display()),
+            Err(err) => crate::messages::ignore_warning(format!(
+                "{}: {err}",
+                dir.join(".gitignore").display()
+            )),
         }
     }
 
@@ -1082,7 +1085,7 @@ fn scan_listing<'a, 'b>(
     let scan = match bulk_scan_dir(&dir) {
         Ok(s) => s,
         Err(ScanError::Soft(msg)) => {
-            eprintln!("glep: {msg}");
+            crate::messages::error(msg);
             return;
         }
         Err(ScanError::Fatal(e)) => {
@@ -1126,11 +1129,14 @@ fn scan_listing<'a, 'b>(
     if has_local_gitignore {
         let mut builder = GitignoreBuilder::new(&dir);
         if let Some(err) = builder.add(dir.join(".gitignore")) {
-            eprintln!("glep: {}: {err}", dir.join(".gitignore").display());
+            crate::messages::ignore_warning(format!("{}: {err}", dir.join(".gitignore").display()));
         }
         match builder.build() {
             Ok(gi) => stack.push(Arc::new(gi)),
-            Err(err) => eprintln!("glep: {}: {err}", dir.join(".gitignore").display()),
+            Err(err) => crate::messages::ignore_warning(format!(
+                "{}: {err}",
+                dir.join(".gitignore").display()
+            )),
         }
     }
 
@@ -1307,7 +1313,7 @@ fn scan_unfiltered<'a>(
     let scan = match bulk_scan_dir(&dir) {
         Ok(s) => s,
         Err(ScanError::Soft(msg)) => {
-            eprintln!("glep: {msg}");
+            crate::messages::error(msg);
             return;
         }
         Err(ScanError::Fatal(e)) => {

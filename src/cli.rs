@@ -1,7 +1,7 @@
 use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
 use crate::index::Index;
 use crate::timing::Timings;
-use crate::{plan, search, walk};
+use crate::{messages, plan, search, walk};
 use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -173,9 +173,9 @@ pub struct Args {
     /// (rg --no-ignore-messages). Nonfatal IO warnings stay.
     #[arg(long)]
     pub no_ignore_messages: bool,
-    /// Suppress all nonfatal per-file warnings (rg --no-messages). Only
-    /// errors are silenced; the missing-path check in run() still
-    /// reports operand problems (same class split as the reference).
+    /// Suppress error messages (rg --no-messages): unreadable files and
+    /// directories, missing operands, failing --pre commands. Like rg it
+    /// hides the text only; such errors still make the exit code 2.
     #[arg(long = "no-messages")]
     pub no_messages: bool,
     /// Search case sensitively, the default (rg -s/--case-sensitive).
@@ -634,25 +634,25 @@ fn resolve_pattern(args: &Args) -> (String, bool) {
     (joined, false)
 }
 
-/// Drop path filters that don't exist on disk, printing the rg-style
-/// error for each. Returns true if any path was missing (final exit code
-/// must be 2 regardless of matches).
+/// Report every path operand that doesn't exist on disk with rg's error
+/// (an error like any other: exit 2 unless -q found a match). Returns
+/// true if any path was missing.
 fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool {
     let mut missing = false;
     for p in paths {
         if !cwd.join(p).exists() {
             missing = true;
             if files_mode {
-                eprintln!(
-                    "glep: {}: IO error for operation on {}: No such file or directory (os error 2)",
+                messages::error(format!(
+                    "{}: IO error for operation on {}: No such file or directory (os error 2)",
                     p.display(),
                     p.display()
-                );
+                ));
             } else {
-                eprintln!(
-                    "glep: {}: No such file or directory (os error 2)",
+                messages::error(format!(
+                    "{}: No such file or directory (os error 2)",
                     p.display()
-                );
+                ));
             }
         }
     }
@@ -1134,7 +1134,7 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
         quiet: args.quiet,
         max_columns_preview: args.max_columns_preview,
         stop_on_nonmatch: args.stop_on_nonmatch,
-        no_messages: args.no_messages || args.no_ignore_messages,
+
         hyperlink: hyperlink_config(args),
         threads: args.threads,
         replace: args.replace.as_deref().map(|s| s.as_bytes().to_vec()),
@@ -1150,13 +1150,16 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
     }
 }
 
-/// Exit code convention shared by every path: 2 when an operand was
-/// missing (or nothing could be searched), else 0 on a hit, 1 otherwise.
-fn exit_code(had_error: bool, hit: bool) -> i32 {
-    if had_error {
-        2
-    } else if hit {
+/// rg's exit status, shared by every path: 0 on a hit (even after
+/// errors, as long as -q asked only whether something matches), 2 when
+/// anything errored (a missing operand, an unreadable file or directory,
+/// a failing --pre command, nothing searched at all), else 1.
+fn exit_code(args: &Args, had_error: bool, hit: bool) -> i32 {
+    let errored = had_error || messages::errored();
+    if hit && (args.quiet || !errored) {
         0
+    } else if errored {
+        2
     } else {
         1
     }
@@ -1186,7 +1189,7 @@ fn run_live_files(
         apply_sort(&mut files, args, root, cwd_rel)?;
         print_paths(&files, cwd_rel, args)?;
         timings.finish();
-        return Ok(exit_code(had_error, !files.is_empty()));
+        return Ok(exit_code(args, had_error, !files.is_empty()));
     }
 
     let (pattern, effective_fixed) = resolve_pattern(args);
@@ -1199,7 +1202,7 @@ fn run_live_files(
     let found = search::run(&pattern, root, &files, None, &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
-    Ok(exit_code(had_error, found))
+    Ok(exit_code(args, had_error, found))
 }
 
 /// `--no-ignore`: content mode and `--files` mode both bypass the index
@@ -1408,6 +1411,7 @@ pub fn run() -> anyhow::Result<i32> {
     use clap::{CommandFactory, FromArgMatches};
     let matches = Args::command().get_matches();
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    messages::configure(!args.no_messages, !args.no_ignore_messages);
     if let Some(n) = args.threads {
         // Global rayon pool (sweeps, filters); the search pool reads
         // SearchOpts::threads. A second init keeps the first (only ever
@@ -1732,7 +1736,7 @@ pub fn run() -> anyhow::Result<i32> {
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
             timings.finish();
-            return Ok(exit_code(had_error, !files.is_empty()));
+            return Ok(exit_code(&args, had_error, !files.is_empty()));
         }
     }
 
@@ -1787,7 +1791,7 @@ pub fn run() -> anyhow::Result<i32> {
                 let _ = tree.save(&idx.dir);
             }
         }
-        return Ok(exit_code(had_error, !files.is_empty()));
+        return Ok(exit_code(&args, had_error, !files.is_empty()));
     }
 
     let (pattern, effective_fixed) = resolve_pattern(&args);
@@ -1885,8 +1889,8 @@ pub fn run() -> anyhow::Result<i32> {
         apply_filters(&mut pool, &args, &root, &cwd_rel)?;
         if pool.is_empty() {
             nothing_searched = true;
-            eprintln!(
-                "glep: No files were searched, which means glep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped."
+            messages::error(
+                "No files were searched, which means glep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped.",
             );
         }
     }
@@ -1895,7 +1899,7 @@ pub fn run() -> anyhow::Result<i32> {
     let found = search::run(&pattern, &root, &files, universe.as_ref(), &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
-    Ok(exit_code(had_error || nothing_searched, found))
+    Ok(exit_code(&args, had_error || nothing_searched, found))
 }
 
 #[cfg(test)]

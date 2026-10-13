@@ -312,7 +312,9 @@ impl ParallelVisitor for Collector<'_> {
                     }
                 }
             }
-            Err(err) => eprintln!("glep: {err}"),
+            // rg reports walk errors (an unreadable directory, a dangling
+            // link or a loop under -L) and exits 2 once it is done.
+            Err(err) => crate::messages::error(err),
         }
         WalkState::Continue
     }
