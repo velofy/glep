@@ -6,7 +6,10 @@ use crate::timing::Timings;
 use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
-use manifest::{Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use manifest::{
+    Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_NUL_LATE, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE,
+    FLAG_TRANSCODE,
+};
 use postings::Postings;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,12 @@ fn new_generation() -> u64 {
         .unwrap_or(1)
 }
 
+/// grep-searcher's first buffer (`DEFAULT_BUFFER_CAPACITY`): rg checks it
+/// for binary data before searching a single line, so a NUL in this
+/// window means the file can never produce output under the default
+/// quit detection.
+pub const BINARY_SNIFF: usize = 64 * 1024;
+
 /// Read content and record trigrams unless the file is skip-flagged.
 /// Returns the flags to store for this entry.
 fn index_file(
@@ -67,14 +76,24 @@ fn index_file(
         Ok(c) => c,
         Err(_) => return FLAG_SKIP_TOO_LARGE, // unreadable: treat as live-scan-only
     };
-    let sniff = &content[..content.len().min(8192)];
-    if sniff.contains(&0) {
+    // A UTF-16 BOM precedes any NUL, so this check comes before the
+    // binary sniff: raw UTF-16 bytes are NUL-heavy but rg transcodes the
+    // file and searches it as text.
+    if content.starts_with(&[0xFF, 0xFE]) || content.starts_with(&[0xFE, 0xFF]) {
+        return FLAG_TRANSCODE;
+    }
+    let sniff = &content[..content.len().min(BINARY_SNIFF)];
+    if memchr::memchr(0, sniff).is_some() {
         return FLAG_SKIP_BINARY;
+    }
+    let mut flags = 0;
+    if content.len() > BINARY_SNIFF && memchr::memchr(0, &content[BINARY_SNIFF..]).is_some() {
+        flags |= FLAG_NUL_LATE;
     }
     for tri in trigram::extract(&content) {
         map.entry(tri).or_default().push(id);
     }
-    0
+    flags
 }
 
 impl Index {
@@ -285,13 +304,14 @@ impl Index {
                     }
                     union.extend(acc);
                 }
-                // Skip-flagged text files were never indexed; always scan
-                // them. Binary files too, when the caller can surface them.
+                // Skip-flagged text files (oversized, UTF-16 BOM) were
+                // never indexed; always scan them. Binary files too, when
+                // the caller can surface them.
                 union.extend(
                     self.manifest
                         .live_entries()
                         .filter(|e| {
-                            e.flags & FLAG_SKIP_TOO_LARGE != 0
+                            e.flags & (FLAG_SKIP_TOO_LARGE | FLAG_TRANSCODE) != 0
                                 || (search_binary && e.flags & FLAG_SKIP_BINARY != 0)
                         })
                         .map(|e| e.id),
@@ -312,6 +332,18 @@ impl Index {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    /// Live files rg would detect as binary under quit detection without
+    /// finding a match first when it reads them whole: a NUL in the first
+    /// buffer (`FLAG_SKIP_BINARY`) or later (`FLAG_NUL_LATE`). Hidden
+    /// files are included; callers intersect with their own file sets.
+    pub fn binary_files(&self) -> std::collections::HashSet<PathBuf> {
+        self.manifest
+            .live_entries()
+            .filter(|e| e.flags & (FLAG_SKIP_BINARY | FLAG_NUL_LATE) != 0)
+            .map(|e| e.path.clone())
+            .collect()
     }
 
     /// Live entries whose names carry a compressed extension (`-z`).
@@ -595,6 +627,59 @@ mod tests {
         assert_eq!(by_path("big.txt").flags, manifest::FLAG_SKIP_TOO_LARGE);
         let files = idx.live_files(false);
         assert_eq!(files.len(), 4);
+    }
+
+    /// The binary sniff covers the searcher's whole first buffer: a NUL
+    /// anywhere in the first 64 KB marks the file binary, a later NUL
+    /// only sets FLAG_NUL_LATE (the file stays indexed: rg prints its
+    /// matches before the NUL). UTF-16 BOM files are never indexed and
+    /// always scanned (FLAG_TRANSCODE): rg transcodes them as text.
+    #[test]
+    fn binary_flags_follow_the_searchers_first_buffer() {
+        let dir = corpus();
+        let mut u16le = vec![0xFF, 0xFE];
+        for b in "needle utf16\n".bytes() {
+            u16le.extend_from_slice(&[b, 0]);
+        }
+        std::fs::write(dir.path().join("u16.txt"), &u16le).unwrap();
+        let mut u16be = vec![0xFE, 0xFF];
+        for b in "needle utf16\n".bytes() {
+            u16be.extend_from_slice(&[0, b]);
+        }
+        std::fs::write(dir.path().join("u16be.txt"), &u16be).unwrap();
+        let mut mid = b"needle mid\n".to_vec();
+        mid.extend(std::iter::repeat_n(b'x', 20_000));
+        mid.extend_from_slice(b"\n\x00\n");
+        std::fs::write(dir.path().join("mid.txt"), &mid).unwrap();
+        let mut late = b"needle late\n".to_vec();
+        late.extend(std::iter::repeat_n(b'y', 70_000));
+        late.extend_from_slice(b"\n\x00\n");
+        std::fs::write(dir.path().join("late.txt"), &late).unwrap();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let flags = |p: &str| {
+            idx.manifest
+                .entries
+                .iter()
+                .find(|e| e.path.to_string_lossy() == p)
+                .unwrap()
+                .flags
+        };
+        assert_eq!(flags("u16.txt"), manifest::FLAG_TRANSCODE);
+        assert_eq!(flags("u16be.txt"), manifest::FLAG_TRANSCODE);
+        assert_eq!(flags("mid.txt"), manifest::FLAG_SKIP_BINARY);
+        assert_eq!(flags("late.txt"), manifest::FLAG_NUL_LATE);
+        let plan = crate::plan::build("needle", true, false);
+        let c = idx.candidates(&plan, false, false, false);
+        for p in ["u16.txt", "u16be.txt", "late.txt"] {
+            assert!(c.contains(&PathBuf::from(p)), "{p} must be a candidate");
+        }
+        assert!(!c.contains(&PathBuf::from("mid.txt")));
+        let bin = idx.binary_files();
+        for p in ["bin.dat", "mid.txt", "late.txt"] {
+            assert!(bin.contains(Path::new(p)), "{p} is binary to rg");
+        }
+        assert!(!bin.contains(Path::new("u16.txt")));
+        assert!(!bin.contains(Path::new("a.txt")));
     }
 
     #[test]

@@ -390,7 +390,14 @@ fn build_matcher(pattern: &str, opts: &SearchOpts) -> anyhow::Result<grep_regex:
     Ok(b.build(pattern)?)
 }
 
-struct FoundSink(bool);
+/// Stops at the first match (-q, -l, --files-without-match).
+#[derive(Default)]
+struct FoundSink {
+    found: bool,
+    /// Binary data seen under quit detection; rg's summary printer then
+    /// squashes the file's record (see `FileResult::squashed`).
+    binary_quit: bool,
+}
 
 impl grep_searcher::Sink for FoundSink {
     type Error = std::io::Error;
@@ -399,8 +406,16 @@ impl grep_searcher::Sink for FoundSink {
         _: &grep_searcher::Searcher,
         _: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
-        self.0 = true;
+        self.found = true;
         Ok(false) // stop at first match
+    }
+    fn binary_data(
+        &mut self,
+        searcher: &grep_searcher::Searcher,
+        _: u64,
+    ) -> Result<bool, std::io::Error> {
+        self.binary_quit |= searcher.binary_detection().quit_byte().is_some();
+        Ok(true)
     }
 }
 
@@ -417,6 +432,8 @@ struct CountSink<'a, M: Matcher> {
     occurrences: u64,
     /// When -c counts occurrences: count_matches || multiline || only_matching.
     count_occurrences: bool,
+    /// Binary data seen under quit detection (see `FoundSink`).
+    binary_quit: bool,
 }
 
 impl<'a, M: Matcher> CountSink<'a, M> {
@@ -428,6 +445,20 @@ impl<'a, M: Matcher> CountSink<'a, M> {
             count: 0,
             occurrences: 0,
             count_occurrences,
+            binary_quit: false,
+        }
+    }
+
+    /// -l/--files-without-match under --stats: real occurrence and line
+    /// counts instead of the early-exit sink.
+    fn for_stats(matcher: &'a M) -> CountSink<'a, M> {
+        CountSink {
+            matcher,
+            occurrences_mode: true,
+            count: 0,
+            occurrences: 0,
+            count_occurrences: false,
+            binary_quit: false,
         }
     }
 }
@@ -457,6 +488,57 @@ impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
             self.occurrences += 1;
         }
         Ok(true)
+    }
+    fn binary_data(
+        &mut self,
+        searcher: &grep_searcher::Searcher,
+        _: u64,
+    ) -> Result<bool, std::io::Error> {
+        self.binary_quit |= searcher.binary_detection().quit_byte().is_some();
+        Ok(true)
+    }
+}
+
+/// Forwards every event to the wrapped sink and records how many bytes
+/// the searcher consumed (`SinkFinish::byte_count`): rg's bytes-searched
+/// figure, and how far a slice search got.
+struct Tracked<S> {
+    inner: S,
+    consumed: u64,
+}
+
+impl<S: grep_searcher::Sink> grep_searcher::Sink for Tracked<S> {
+    type Error = S::Error;
+    fn matched(
+        &mut self,
+        s: &grep_searcher::Searcher,
+        m: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, S::Error> {
+        self.inner.matched(s, m)
+    }
+    fn context(
+        &mut self,
+        s: &grep_searcher::Searcher,
+        c: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, S::Error> {
+        self.inner.context(s, c)
+    }
+    fn context_break(&mut self, s: &grep_searcher::Searcher) -> Result<bool, S::Error> {
+        self.inner.context_break(s)
+    }
+    fn binary_data(&mut self, s: &grep_searcher::Searcher, offset: u64) -> Result<bool, S::Error> {
+        self.inner.binary_data(s, offset)
+    }
+    fn begin(&mut self, s: &grep_searcher::Searcher) -> Result<bool, S::Error> {
+        self.inner.begin(s)
+    }
+    fn finish(
+        &mut self,
+        s: &grep_searcher::Searcher,
+        f: &grep_searcher::SinkFinish,
+    ) -> Result<(), S::Error> {
+        self.consumed = f.byte_count();
+        self.inner.finish(s, f)
     }
 }
 
@@ -608,7 +690,22 @@ impl<'a> Haystack<'a> {
         }
     }
 
+    /// Search with `sink`; returns how many bytes the searcher consumed.
     fn search<M: Matcher, S: grep_searcher::Sink>(
+        &self,
+        searcher: &mut Searcher,
+        matcher: &M,
+        sink: S,
+    ) -> Result<u64, S::Error> {
+        let mut sink = Tracked {
+            inner: sink,
+            consumed: 0,
+        };
+        self.search_raw(searcher, matcher, &mut sink)?;
+        Ok(sink.consumed)
+    }
+
+    fn search_raw<M: Matcher, S: grep_searcher::Sink>(
         &self,
         searcher: &mut Searcher,
         matcher: &M,
@@ -649,10 +746,43 @@ impl<'a> Haystack<'a> {
             }
         }
     }
+}
 
-    fn is_stream(&self) -> bool {
-        matches!(self, Haystack::Gz(_) | Haystack::Pre(..))
+/// grep-searcher's first buffer size (`DEFAULT_BUFFER_CAPACITY`): rg's
+/// reader checks it for binary data before searching any line, and a
+/// slice search checks the same window up front.
+const FIRST_BUFFER: usize = 64 * 1024;
+
+/// A memory map is searched as one slice, where grep-searcher checks the
+/// first-buffer window up front and afterwards only matched and context
+/// lines for binary data; rg's default reader checks every buffer it
+/// reads. The two can only disagree when the slice search consumed lines
+/// past the window's complete lines and a NUL sits past the window. In
+/// that rare case (true here) the caller searches the file again through
+/// the reader, so the output, counts and exit status stay rg's.
+fn reader_disagrees<M: Matcher>(
+    map: &[u8],
+    consumed: u64,
+    searcher: &Searcher,
+    matcher: &M,
+    opts: &SearchOpts,
+) -> bool {
+    if map.len() <= FIRST_BUFFER || opts.null_data || opts.binary.quit_byte().is_none() {
+        return false;
     }
+    // Multi-line searches and transcoded files go through the same
+    // whole-haystack or reader path either way.
+    let bom = map.starts_with(&[0xEF, 0xBB, 0xBF])
+        || map.starts_with(&[0xFF, 0xFE])
+        || map.starts_with(&[0xFE, 0xFF]);
+    if searcher.multi_line_with_matcher(matcher)
+        || opts.encoding.is_some()
+        || (opts.bom_sniffing && bom)
+    {
+        return false;
+    }
+    let first_lines_end = memchr::memrchr(b'\n', &map[..FIRST_BUFFER]).map_or(0, |i| i + 1);
+    consumed > first_lines_end as u64 && memchr::memchr(0, &map[FIRST_BUFFER..]).is_some()
 }
 
 /// How a bare path record is rendered: the -l/-c/--count-matches/
@@ -736,20 +866,16 @@ fn write_path(out: &mut Vec<u8>, rel: &Path, sep: Option<u8>) {
     }
 }
 
-/// Stats for paths searched in count/-l modes: occurrences, matched
-/// lines, one search, bytes from the file size (a decoded stream has no
-/// stat()able size, so it reports 0 bytes searched).
-fn file_stats(full: Option<&Path>, matched_lines: u64, matches: u64) -> grep_printer::Stats {
+/// Stats for paths searched in count/-l modes, like rg's summary
+/// printer: occurrences, matched lines, one search, and the bytes the
+/// searcher consumed (decoded bytes for streams).
+fn file_stats(bytes_searched: u64, matched_lines: u64, matches: u64) -> grep_printer::Stats {
     let mut s = grep_printer::Stats::new();
     s.add_searches(1);
     s.add_searches_with_match(u64::from(matched_lines > 0));
     s.add_matched_lines(matched_lines);
     s.add_matches(matches);
-    if let Some(full) = full {
-        if let Ok(m) = std::fs::metadata(full) {
-            s.add_bytes_searched(m.len());
-        }
-    }
+    s.add_bytes_searched(bytes_searched);
     s
 }
 
@@ -758,6 +884,12 @@ fn file_stats(full: Option<&Path>, matched_lines: u64, matches: u64) -> grep_pri
 struct FileResult {
     buf: Vec<u8>,
     matched: bool,
+    /// A summary mode (-c, -l, --files-without-match) saw binary data
+    /// under quit detection: like rg's summary printer, the file gets no
+    /// record at all (not even `path:0` under --include-zero) and does
+    /// not match, yet --files-without-match counts it as a file without a
+    /// match for the exit status without listing it.
+    squashed: bool,
     stats: Option<grep_printer::Stats>,
 }
 
@@ -766,6 +898,7 @@ impl FileResult {
         FileResult {
             buf: Vec::new(),
             matched: false,
+            squashed: false,
             stats: None,
         }
     }
@@ -817,11 +950,31 @@ fn search_one<M: Matcher>(
     let display = display_path(rel, opts);
     let display: &Path = &display;
     let hay = Haystack::open(&full, rel, opts);
-    let stat_path = if hay.is_stream() {
-        None
-    } else {
-        Some(full.as_path())
-    };
+    let (res, consumed) = search_hay(state, matcher, &hay, display, opts)?;
+    if let Haystack::Map(map) = &hay {
+        // A file that matched nothing and printed nothing reads the same
+        // through the reader (which searches a prefix of the same bytes),
+        // unless --files-without-match reports the miss. Skipping those
+        // keeps the common case (big files without a hit) free of the
+        // extra NUL scan.
+        let observable = res.matched || !res.buf.is_empty() || opts.files_without_match;
+        if observable && reader_disagrees(map, consumed, &state.searcher, matcher, opts) {
+            let hay = Haystack::Path(full);
+            return Ok(search_hay(state, matcher, &hay, display, opts)?.0);
+        }
+    }
+    Ok(res)
+}
+
+/// One search of one haystack in the output mode `opts` selects: the
+/// rendered result plus how many bytes the searcher consumed.
+fn search_hay<M: Matcher>(
+    state: &mut WorkerState,
+    matcher: &M,
+    hay: &Haystack<'_>,
+    display: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<(FileResult, u64)> {
     let searcher = &mut state.searcher;
     if opts.quiet {
         // -q: nothing is written; the exit code carries the answer. Under
@@ -831,7 +984,7 @@ fn search_one<M: Matcher>(
             let mut scratch = Vec::new();
             let mut printer = grep_printer::JSONBuilder::new().build(&mut scratch);
             let mut sink = printer.sink_with_path(matcher, display);
-            hay.search(searcher, matcher, &mut sink)?;
+            let consumed = hay.search(searcher, matcher, &mut sink)?;
             // -q printed nothing: bytes_printed stays 0, like rg's summary.
             let s = sink.stats();
             let mut stats = grep_printer::Stats::new();
@@ -840,26 +993,37 @@ fn search_one<M: Matcher>(
             stats.add_bytes_searched(s.bytes_searched());
             stats.add_matched_lines(s.matched_lines());
             stats.add_matches(s.matches());
-            return Ok(FileResult {
-                buf: Vec::new(),
+            let res = FileResult {
                 matched: sink.has_match(),
                 stats: Some(stats),
-            });
+                ..FileResult::empty()
+            };
+            return Ok((res, consumed));
         }
-        let mut sink = FoundSink(false);
-        hay.search(searcher, matcher, &mut sink)?;
-        return Ok(FileResult {
-            buf: Vec::new(),
-            matched: sink.0,
-            stats: None,
-        });
+        let mut sink = FoundSink::default();
+        let consumed = hay.search(searcher, matcher, &mut sink)?;
+        let res = FileResult {
+            matched: sink.found,
+            ..FileResult::empty()
+        };
+        return Ok((res, consumed));
     }
     if opts.count || opts.count_matches {
         let mut sink = CountSink::new(matcher, opts);
-        hay.search(searcher, matcher, &mut sink)?;
+        let consumed = hay.search(searcher, matcher, &mut sink)?;
         let stats = opts
             .stats
-            .then(|| file_stats(stat_path, sink.count, sink.occurrences));
+            .then(|| file_stats(consumed, sink.count, sink.occurrences));
+        if sink.binary_quit {
+            // rg's summary printer squashes the file: no record at all,
+            // even under --include-zero; its stats keep the counts.
+            let res = FileResult {
+                squashed: true,
+                stats,
+                ..FileResult::empty()
+            };
+            return Ok((res, consumed));
+        }
         if sink.count > 0 || opts.include_zero {
             // `path` + field terminator (`:` normally, NUL under --null) +
             // count; bare `N` when the path is suppressed. The record ends
@@ -872,77 +1036,87 @@ fn search_one<M: Matcher>(
             }
             line.extend_from_slice(sink.count.to_string().as_bytes());
             line.extend_from_slice(opts.line_term());
-            return Ok(FileResult {
+            let res = FileResult {
                 buf: line,
                 matched: sink.count > 0,
                 stats,
-            });
+                ..FileResult::empty()
+            };
+            return Ok((res, consumed));
         }
-        return Ok(FileResult {
-            buf: Vec::new(),
-            matched: false,
+        let res = FileResult {
             stats,
-        });
+            ..FileResult::empty()
+        };
+        return Ok((res, consumed));
     }
     if opts.files_with_matches || opts.files_without_match {
-        let (matched, stats) = if opts.stats {
+        let (matched, squashed, stats, consumed) = if opts.stats {
             // --stats needs real counts: run the count sink instead of
-            // the early-exit one.
-            let mut sink = CountSink {
-                matcher,
-                occurrences_mode: true,
-                count: 0,
-                occurrences: 0,
-                count_occurrences: false,
-            };
-            hay.search(searcher, matcher, &mut sink)?;
+            // the early-exit one (rg's summary printer likewise reads the
+            // whole file when it tracks stats).
+            let mut sink = CountSink::for_stats(matcher);
+            let consumed = hay.search(searcher, matcher, &mut sink)?;
+            let stats = file_stats(consumed, sink.count, sink.occurrences);
             (
-                sink.count > 0,
-                Some(file_stats(stat_path, sink.count, sink.occurrences)),
+                sink.count > 0 && !sink.binary_quit,
+                sink.binary_quit,
+                Some(stats),
+                consumed,
             )
         } else {
-            let mut sink = FoundSink(false);
-            hay.search(searcher, matcher, &mut sink)?;
-            (sink.0, None)
+            let mut sink = FoundSink::default();
+            let consumed = hay.search(searcher, matcher, &mut sink)?;
+            (
+                sink.found && !sink.binary_quit,
+                sink.binary_quit,
+                None,
+                consumed,
+            )
         };
         let mut buf = Vec::new();
         if matched && opts.files_with_matches {
             state.paths.write(&mut buf, display);
             opts.push_record_end(&mut buf);
         }
-        return Ok(FileResult {
+        let res = FileResult {
             buf,
             matched,
+            squashed,
             stats,
-        });
+        };
+        return Ok((res, consumed));
     }
     let mut buf = Vec::new();
     let matched;
     let stats;
+    let consumed;
     if opts.json {
         let mut printer = grep_printer::JSONBuilder::new().build(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
-        hay.search(searcher, matcher, &mut sink)?;
+        consumed = hay.search(searcher, matcher, &mut sink)?;
         matched = sink.has_match();
         stats = Some(sink.stats().clone());
     } else if opts.color {
         let mut printer = state.printer.build(termcolor::Ansi::new(&mut buf));
         let mut sink = printer.sink_with_path(matcher, display);
-        hay.search(searcher, matcher, &mut sink)?;
+        consumed = hay.search(searcher, matcher, &mut sink)?;
         matched = sink.has_match();
         stats = sink.stats().cloned();
     } else {
         let mut printer = state.printer.build_no_color(&mut buf);
         let mut sink = printer.sink_with_path(matcher, display);
-        hay.search(searcher, matcher, &mut sink)?;
+        consumed = hay.search(searcher, matcher, &mut sink)?;
         matched = sink.has_match();
         stats = sink.stats().cloned();
     }
-    Ok(FileResult {
+    let res = FileResult {
         buf,
         matched,
         stats,
-    })
+        ..FileResult::empty()
+    };
+    Ok((res, consumed))
 }
 
 /// Run `search_one`, turning a per-file error into rg's warn-and-continue
@@ -1006,9 +1180,10 @@ struct Printer {
     printed_any: bool,
     found: bool,
     total_stats: grep_printer::Stats,
-    /// --files-without-match: which file indices matched (the complement
-    /// over the universe prints after the search).
-    matched_idx: Option<Vec<bool>>,
+    /// --files-without-match: each searched file's outcome (MATCHED,
+    /// SQUASHED or NO_MATCH); the complement over the universe prints
+    /// after the search.
+    file_states: Option<Vec<u8>>,
     /// Write coalescing buffer: a kernel-scale every-file search issues
     /// one write syscall per file (~86k syscalls, ~150ms). Batching into
     /// 256KB flushes cuts that to a few hundred with byte-identical
@@ -1046,7 +1221,7 @@ impl Printer {
             printed_any: false,
             found: false,
             total_stats: grep_printer::Stats::new(),
-            matched_idx: opts.files_without_match.then(|| vec![false; total]),
+            file_states: opts.files_without_match.then(|| vec![NO_MATCH; total]),
             out_buf: Vec::with_capacity(if total > SMALL_WORKLOAD {
                 PRINT_BATCH + 64 * 1024
             } else {
@@ -1127,13 +1302,20 @@ impl Printer {
         let FileResult {
             buf,
             matched,
+            squashed,
             stats,
         } = res;
         if let Some(s) = &stats {
             merge_stats(&mut self.total_stats, s);
         }
-        if let Some(m) = &mut self.matched_idx {
-            m[idx] = matched;
+        if let Some(m) = &mut self.file_states {
+            m[idx] = if matched {
+                MATCHED
+            } else if squashed {
+                SQUASHED
+            } else {
+                NO_MATCH
+            };
         }
         if matched {
             self.found = true;
@@ -1203,19 +1385,35 @@ impl std::io::Write for StdoutOut {
     }
 }
 
+/// --files-without-match's domain, when an index narrowed the search.
+pub struct Universe {
+    /// The full live, filtered file set, in output order. Files the
+    /// index narrowed out cannot contain the pattern, so they are
+    /// "without match" by construction and print without being searched.
+    pub files: Vec<PathBuf>,
+    /// Files rg would detect as binary under quit detection (index flags;
+    /// empty when binary files are searched as text or converted). An
+    /// unsearched one is never listed but still counts as a file without
+    /// a match for the exit status, like rg's squashed summary records.
+    pub binary: std::collections::HashSet<PathBuf>,
+}
+
+/// Outcomes of a searched file under --files-without-match.
+const NO_MATCH: u8 = 0;
+const MATCHED: u8 = 1;
+const SQUASHED: u8 = 2;
+
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
 /// in input order for determinism. Returns true if anything matched (for
-/// --files-without-match: if any file was listed).
+/// --files-without-match: if any file had no match).
 ///
-/// `universe` is --files-without-match's domain: the full live, filtered
-/// file set. Files that were narrowed out by the index can't contain the
-/// pattern, so they are "without match" by construction and print
-/// without being searched; the index still narrows what is searched.
+/// `universe` is --files-without-match's domain (see `Universe`); without
+/// one, the searched files are the domain.
 pub fn run(
     pattern: &str,
     root: &Path,
     files: &[PathBuf],
-    universe: Option<&[PathBuf]>,
+    universe: Option<&Universe>,
     opts: &SearchOpts,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<bool> {
@@ -1254,7 +1452,7 @@ fn run_impl<M: Matcher + Sync>(
     matcher: &M,
     root: &Path,
     files: &[PathBuf],
-    universe: Option<&[PathBuf]>,
+    universe: Option<&Universe>,
     opts: &SearchOpts,
     out: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<bool> {
@@ -1443,7 +1641,7 @@ fn run_printer(
 fn finish(
     printer: &mut Printer,
     files: &[PathBuf],
-    universe: Option<&[PathBuf]>,
+    universe: Option<&Universe>,
     opts: &SearchOpts,
     out: &mut (dyn std::io::Write + Send),
     start: Instant,
@@ -1451,25 +1649,37 @@ fn finish(
     let mut found = printer.found;
     if opts.files_without_match {
         found = false;
-        let matched: std::collections::HashSet<&Path> = printer
-            .matched_idx
+        // Searched files that matched or were squashed; every other file
+        // in the domain had no match.
+        let decided: std::collections::HashMap<&Path, u8> = printer
+            .file_states
             .as_ref()
             .map(|m| {
                 files
                     .iter()
                     .zip(m.iter())
-                    .filter(|(_, &hit)| hit)
-                    .map(|(p, _)| p.as_path())
+                    .filter(|(_, &s)| s != NO_MATCH)
+                    .map(|(p, &s)| (p.as_path(), s))
                     .collect()
             })
             .unwrap_or_default();
+        let (domain, binary) = match universe {
+            Some(u) => (u.files.as_slice(), Some(&u.binary)),
+            None => (files, None),
+        };
         let paths = PathStyle::new(opts);
         let mut buf = Vec::new();
-        for p in universe.unwrap_or(files) {
-            if !matched.contains(p.as_path()) {
-                found = true;
-                paths.write(&mut buf, &display_path(p, opts));
-                opts.push_record_end(&mut buf);
+        for p in domain {
+            match decided.get(p.as_path()) {
+                Some(&MATCHED) => {}
+                // Squashed binary files: no match, but never listed.
+                Some(_) => found = true,
+                None if binary.is_some_and(|b| b.contains(p)) => found = true,
+                None => {
+                    found = true;
+                    paths.write(&mut buf, &display_path(p, opts));
+                    opts.push_record_end(&mut buf);
+                }
             }
         }
         out.write_all(&buf)?;

@@ -1,4 +1,4 @@
-use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE};
+use crate::index::manifest::{FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE};
 use crate::index::Index;
 use crate::timing::Timings;
 use crate::{plan, search, walk};
@@ -25,16 +25,18 @@ pub struct Args {
     /// List files matching a glob instead of searching content
     #[arg(long)]
     pub files: bool,
-    /// List files that do NOT match the pattern (rg --files-without-match)
-    #[arg(long, conflicts_with_all = ["files_with_matches", "json", "count"])]
+    /// List files that do NOT match the pattern (rg --files-without-match).
+    /// The output modes -l, --files-without-match, -c, --count-matches
+    /// and --json are last-wins, like rg's search modes.
+    #[arg(long, overrides_with_all = ["files_with_matches", "json", "count", "count_matches"])]
     pub files_without_match: bool,
     #[arg(short = 'i', long, overrides_with = "smart_case")]
     pub ignore_case: bool,
     #[arg(short = 'F', long)]
     pub fixed_strings: bool,
-    #[arg(short = 'l', long, conflicts_with = "json")]
+    #[arg(short = 'l', long, overrides_with_all = ["files_without_match", "json", "count", "count_matches"])]
     pub files_with_matches: bool,
-    #[arg(short = 'c', long = "count", conflicts_with_all = ["files_with_matches", "json"])]
+    #[arg(short = 'c', long = "count", overrides_with_all = ["files_with_matches", "files_without_match", "json", "count_matches"])]
     pub count: bool,
     /// Filter candidate files by glob (repeatable; gitignore-style `!`
     /// negation, last match wins). --iglob is an alias for ag compat.
@@ -55,7 +57,7 @@ pub struct Args {
     pub sortr: Option<String>,
     /// Count match occurrences per file instead of matching lines
     /// (rg --count-matches; differs from -c which counts lines)
-    #[arg(long, conflicts_with_all = ["files_with_matches", "json", "count"])]
+    #[arg(long, overrides_with_all = ["files_with_matches", "files_without_match", "json", "count"])]
     pub count_matches: bool,
     /// Accepted for script compat; glep reads no config file anyway
     #[arg(long, hide = true)]
@@ -71,7 +73,7 @@ pub struct Args {
     pub after_context: Option<usize>,
     #[arg(short = 'B', long = "before-context")]
     pub before_context: Option<usize>,
-    #[arg(long)]
+    #[arg(long, overrides_with_all = ["files_with_matches", "files_without_match", "count", "count_matches"])]
     pub json: bool,
     /// Allow matches to span multiple lines (patterns may contain \n).
     /// Overrides --stop-on-nonmatch.
@@ -227,7 +229,7 @@ pub struct Args {
     #[arg(long, value_name = "COMMAND")]
     pub hostname_bin: Option<String>,
     /// Verbose debug output on stderr (rg --debug)
-    #[arg(long, conflicts_with = "quiet")]
+    #[arg(long)]
     pub debug: bool,
     /// Trace-level debug output on stderr (rg --trace)
     #[arg(long)]
@@ -1578,10 +1580,12 @@ pub fn run() -> anyhow::Result<i32> {
                 let skipped = idx
                     .manifest
                     .live_entries()
-                    .filter(|e| e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE) != 0)
+                    .filter(|e| {
+                        e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE | FLAG_TRANSCODE) != 0
+                    })
                     .count();
                 println!("files: {live}");
-                println!("skipped (binary/oversized): {skipped}");
+                println!("skipped (binary/oversized/utf16): {skipped}");
                 println!("last sweep epoch: {}", idx.manifest.last_sweep_epoch);
                 return Ok(0);
             }
@@ -1769,6 +1773,8 @@ pub fn run() -> anyhow::Result<i32> {
 
     // --files-without-match needs the full live set as its universe:
     // narrowed-out files can't match, so they emit without searching.
+    // Under quit detection rg never lists a file it detects as binary,
+    // so the index's binary flags ride along for the unsearched ones.
     let universe = if args.files_without_match {
         let mut u = idx.live_files(args.hidden);
         u.extend(extra.iter().cloned());
@@ -1776,7 +1782,14 @@ pub fn run() -> anyhow::Result<i32> {
         u.dedup();
         apply_filters(&mut u, &args, &root)?;
         apply_sort(&mut u, &args, &root, &cwd_rel)?;
-        Some(u)
+        Some(search::Universe {
+            files: u,
+            binary: if search_binary {
+                Default::default()
+            } else {
+                idx.binary_files()
+            },
+        })
     } else {
         None
     };
@@ -1802,14 +1815,7 @@ pub fn run() -> anyhow::Result<i32> {
     }
 
     let mut out = search::StdoutOut;
-    let found = search::run(
-        &pattern,
-        &root,
-        &files,
-        universe.as_deref(),
-        &opts,
-        &mut out,
-    )?;
+    let found = search::run(&pattern, &root, &files, universe.as_ref(), &opts, &mut out)?;
     timings.stage("search");
     timings.finish();
     Ok(exit_code(had_error || nothing_searched, found))

@@ -498,6 +498,7 @@ fn colored_and_hyperlinked_paths_match_rg() {
         &["--color", "always", "-l", "hello"],
         &["--color", "always", "-c", "hello"],
         &["--color", "always", "--count-matches", "hello"],
+        &["--color", "always", "--files-without-match", "hello"],
         &["--color", "always", "--files"],
         &["--color", "always", "-0", "-l", "hello"],
         &["--color", "always", "-0", "-c", "hello"],
@@ -539,6 +540,14 @@ fn colored_and_hyperlinked_paths_match_rg() {
             "--hyperlink-format",
             "file://{path}",
             "-c",
+            "hello",
+        ],
+        &[
+            "--color",
+            "always",
+            "--hyperlink-format",
+            "kitty",
+            "--files-without-match",
             "hello",
         ],
         &[
@@ -664,6 +673,8 @@ fn terminators_and_separators_match_rg() {
         &["--crlf", "-c", "hello"],
         &["--crlf", "-l", "hello"],
         &["--crlf", "--count-matches", "hello"],
+        &["--crlf", "--files-without-match", "hello"],
+        &["--crlf", "-0", "--files-without-match", "hello"],
         &["--crlf", "-c", "--include-zero", "hello"],
         &["--crlf", "-C", "1", "hello"],
         &["--crlf", "--heading", "hello"],
@@ -803,6 +814,136 @@ fn matcher_config_matches_rg() {
         &["-E", "none", "hello"],
         &["-E", "utf-16le", "-c", "hello"],
         &["-E", "bogus", "hello"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    check_cases(pool_corpus().path(), "pool", cases);
+}
+
+/// Binary files the way rg's default reader sees them. `nul20k.txt` has
+/// its first NUL past 8 KB but inside the searcher's first 64 KB buffer,
+/// so it is binary before any line is searched; `nullate.txt` has a
+/// match, then a NUL past 64 KB, then another match, so rg prints the
+/// first match and its "stopped searching binary file" warning. UTF-16
+/// files with a byte-order mark are transcoded and searched.
+fn binary_corpus(pool: bool) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("plain.txt"), "hello plain\nnothing\n").unwrap();
+    std::fs::write(d.join("binnul.bin"), b"all\x00binary hello\n").unwrap();
+    let mut nul20k = b"hello early\n".to_vec();
+    nul20k.extend(std::iter::repeat_n(b'x', 20_000));
+    nul20k.extend_from_slice(b"\nnul\x00here\nhello late\n");
+    std::fs::write(d.join("nul20k.txt"), nul20k).unwrap();
+    let mut nullate = b"hello early\n".to_vec();
+    for _ in 0..800 {
+        nullate.extend(std::iter::repeat_n(b'y', 99));
+        nullate.push(b'\n');
+    }
+    nullate.extend_from_slice(b"nul\x00here\nhello late\n");
+    std::fs::write(d.join("nullate.txt"), nullate).unwrap();
+    // Same late NUL but no match anywhere: only --files-without-match
+    // and -c --include-zero can show it, and rg shows it in neither.
+    let mut quietlate = b"quiet early\n".to_vec();
+    quietlate.extend(std::iter::repeat_n(b'z', 70_000));
+    quietlate.extend_from_slice(b"\nnul\x00here\n");
+    std::fs::write(d.join("quietlate.txt"), quietlate).unwrap();
+    let mut u16le = vec![0xFF, 0xFE];
+    for b in "hello utf16token\nsecond\n".bytes() {
+        u16le.extend_from_slice(&[b, 0]);
+    }
+    std::fs::write(d.join("utf16le.txt"), u16le).unwrap();
+    let mut u16be = vec![0xFE, 0xFF];
+    for b in "hello utf16be\n".bytes() {
+        u16be.extend_from_slice(&[0, b]);
+    }
+    std::fs::write(d.join("utf16be.txt"), u16be).unwrap();
+    std::fs::write(d.join("bom8.txt"), b"\xEF\xBB\xBFhello bom8\n").unwrap();
+    if pool {
+        for i in 0..40 {
+            let body = if i % 2 == 0 {
+                format!("hello pool {i}\n")
+            } else {
+                format!("quiet pool {i}\n")
+            };
+            std::fs::write(d.join(format!("p{i:02}.txt")), body).unwrap();
+        }
+    }
+    dir
+}
+
+/// Default quit detection, the summary modes' binary squash (no record
+/// at all, yet --files-without-match counts the file for its exit
+/// status), -a, --binary, -E none and BOM transcoding, all byte for byte
+/// against rg, on the small path and the worker pool.
+#[test]
+fn binary_files_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-c", "hello"],
+        &["-c", "--include-zero", "hello"],
+        &["-c", "--include-zero", "zz_absent_zz"],
+        &["--count-matches", "hello"],
+        &["-l", "hello"],
+        &["--files-without-match", "hello"],
+        &["--files-without-match", "zz_absent_zz"],
+        &["--files-without-match", "-c", "zz_absent_zz"],
+        &["-c", "--files-without-match", "zz_absent_zz"],
+        &["-l", "--files-without-match", "hello"],
+        &["--files-without-match", "-l", "hello"],
+        &["-q", "late"],
+        &["late"],
+        &["-o", "hello"],
+        &["-m", "1", "hello"],
+        &["-A", "1", "hello"],
+        &["-v", "-c", "hello"],
+        &["-U", "hello"],
+        &["--no-mmap", "hello"],
+        &["-a", "hello"],
+        &["-a", "-c", "hello"],
+        &["-a", "--files-without-match", "zz_absent_zz"],
+        &["--binary", "hello"],
+        &["--binary", "-c", "hello"],
+        &["--binary", "--files-without-match", "zz_absent_zz"],
+        &["utf16token"],
+        &["-c", "utf16token"],
+        &["-l", "utf16"],
+        &["-E", "none", "hello"],
+        &["-E", "none", "-c", "hello"],
+        &["-E", "auto", "-c", "hello"],
+        &["--no-encoding", "-c", "hello"],
+    ];
+    check_cases(binary_corpus(false).path(), "small", cases);
+    check_cases(binary_corpus(true).path(), "pool", cases);
+}
+
+/// rg's search modes (-l, --files-without-match, -c, --count-matches,
+/// --json) are last-wins: the later flag decides the output.
+#[test]
+fn search_modes_are_last_wins_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["-l", "-c", "hello"],
+        &["-c", "-l", "hello"],
+        &["--files-without-match", "-c", "hello"],
+        &["-c", "--files-without-match", "hello"],
+        &["-l", "--files-without-match", "hello"],
+        &["--files-without-match", "-l", "hello"],
+        &["--count-matches", "-c", "o"],
+        &["-c", "--count-matches", "o"],
+        &["--json", "-l", "hello"],
+        &["--json", "-c", "hello"],
+        &["--json", "--count-matches", "hello"],
+        &["--json", "--files-without-match", "hello"],
+        &["-l", "--count-matches", "hello"],
+        &["--count-matches", "-l", "hello"],
+        &["-q", "--debug", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
     check_cases(pool_corpus().path(), "pool", cases);

@@ -5,8 +5,11 @@ use std::path::Path;
 const MAGIC: &[u8; 8] = b"GLEPPOST";
 // Version history: 2 = hidden flagging, 3 = UTF-16 transcode entries,
 // 4 = whitelist-rescued dotfiles (FLAG_HIDDEN must be recomputed for
-// files a `!` rule un-hides; bumping forces a one-time rebuild).
-const VERSION: u32 = 4;
+// files a `!` rule un-hides; bumping forces a one-time rebuild),
+// 5 = binary sniff widened to the searcher's 64 KB first buffer,
+// FLAG_TRANSCODE for UTF-16 BOM files and FLAG_NUL_LATE (every entry's
+// flags must be recomputed).
+const VERSION: u32 = 5;
 const HEADER: usize = 24; // magic 8 + version 4 + count 4 + generation 8
 const ENTRY: usize = 16; // trigram 4 + offset 8 + len 4
 

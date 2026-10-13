@@ -302,7 +302,9 @@ fn status_skipped_count_ignores_hidden_flag() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("skipped (binary/oversized): 0"));
+        .stdout(predicates::str::contains(
+            "skipped (binary/oversized/utf16): 0",
+        ));
 }
 
 /// The whole point of --no-ignore: a plain query never sees a gitignored
@@ -945,11 +947,29 @@ fn generate_completions_and_man() {
     assert!(s.contains(".TH glep"), "{s}");
 }
 
+/// The output modes are last-wins, like rg's search modes: `-l --json`
+/// is a JSON search and `--json -l` lists paths. (-r still conflicts
+/// with --json: rg 15's JSON carries replacements, grep-printer 0.2's
+/// JSON printer cannot.)
 #[test]
-fn files_with_matches_conflicts_with_json() {
+fn output_modes_are_last_wins() {
     let dir = corpus();
-    glep(dir.path())
+    let out = glep(dir.path())
         .args(["-l", "--json", "hello"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("\"type\":\"summary\""), "{s}");
+    glep(dir.path())
+        .args(["--json", "-l", "hello"])
+        .assert()
+        .success()
+        .stdout(p("notes.txt\nsrc/lib.rs\n"));
+    glep(dir.path())
+        .args(["-r", "x", "--json", "hello"])
         .assert()
         .code(2);
 }
@@ -1152,7 +1172,10 @@ fn pattern_file_dash_reads_stdin() {
 #[test]
 fn short_s_is_case_sensitive() {
     let dir = corpus();
-    glep(dir.path()).args(["-i", "-s", "HELLO"]).assert().code(1);
+    glep(dir.path())
+        .args(["-i", "-s", "HELLO"])
+        .assert()
+        .code(1);
     glep(dir.path())
         .args(["-s", "-i", "HELLO", "-l"])
         .assert()

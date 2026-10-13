@@ -363,6 +363,7 @@ dependencies = [
  "hostname",
  "ignore",
  "libc",
+ "memchr",
  "memmap2",
  "predicates",
  "rayon",
