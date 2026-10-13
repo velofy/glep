@@ -421,6 +421,10 @@ pub struct Args {
     /// The resolved pattern list for a content search (set in `run`).
     #[arg(skip)]
     pub pattern_set: Vec<String>,
+    /// Path operands that name files (root-relative, set in `run`): rg
+    /// searches these unconditionally, with --binary's detection.
+    #[arg(skip)]
+    pub explicit_files: Vec<PathBuf>,
     /// --engine auto (set in `run`).
     #[arg(skip)]
     pub engine_auto: bool,
@@ -750,18 +754,23 @@ fn apply_filters(
     root: &Path,
     cwd_rel: &Path,
 ) -> anyhow::Result<()> {
-    // Path operands, with --max-depth counted from each operand (a file
-    // operand itself is depth 0; with no operand the root is the operand).
-    // rg walks its operands one after another, so with several operands
-    // the results group by operand in command-line order (path order
-    // within each), and a file under two operands is searched and printed
-    // twice. `files` arrives in path order.
+    // Path operands, with --max-depth counted from each operand (with no
+    // operand the root is the operand). rg walks its operands one after
+    // another, so with several operands the results group by operand in
+    // command-line order (path order within each), and a file under two
+    // operands is searched and printed twice. An explicit FILE operand is
+    // always searched, as in rg: it bypasses ignore rules, the hidden
+    // filter, binary flags, -g/-t/--ignore-file and --max-depth, and it is
+    // added even when the index never held it. `files` arrives in path
+    // order.
+    let explicit = |f: &Path| args.explicit_files.iter().any(|e| e == f);
     let within = |f: &Path, base: usize| {
         args.max_depth
             .is_none_or(|d| f.components().count().saturating_sub(base) <= d)
     };
     match args.paths.as_slice() {
         [] => files.retain(|f| within(f, 0)),
+        [p] if explicit(p) => *files = vec![p.clone()],
         [p] => {
             let base = p.components().count();
             files.retain(|f| f.starts_with(p) && within(f, base));
@@ -769,6 +778,10 @@ fn apply_filters(
         operands => {
             let mut grouped = Vec::with_capacity(files.len());
             for p in operands {
+                if explicit(p) {
+                    grouped.push(p.clone());
+                    continue;
+                }
                 let base = p.components().count();
                 grouped.extend(
                     files
@@ -796,7 +809,7 @@ fn apply_filters(
             ob.add(g)?;
         }
         let overrides = ob.build()?;
-        files.retain(|f| !overrides.matched(f, false).is_ignore());
+        files.retain(|f| explicit(f) || !overrides.matched(f, false).is_ignore());
     }
     if !args.ignore_file.is_empty() {
         // Each extra rules file matches relative to the directory glep
@@ -815,8 +828,10 @@ fn apply_filters(
             // The cwd-relative form, with `..` for files reached through
             // an operand above the cwd, like the paths rg's walk yields.
             let rel = search::display_rel(f, cwd_rel);
-            !gis.iter()
-                .any(|g| g.matched_path_or_any_parents(&rel, false).is_ignore())
+            explicit(f)
+                || !gis
+                    .iter()
+                    .any(|g| g.matched_path_or_any_parents(&rel, false).is_ignore())
         });
     }
     if !args.types.is_empty()
@@ -844,7 +859,7 @@ fn apply_filters(
             let m = types.matched(f, false);
             // -t present: require whitelist; -T only: keep unless
             // explicitly ignored (same rule as globs' overrides).
-            !m.is_ignore() && (args.types.is_empty() || m.is_whitelist())
+            explicit(f) || (!m.is_ignore() && (args.types.is_empty() || m.is_whitelist()))
         });
     }
     Ok(())
@@ -1131,6 +1146,7 @@ fn search_opts(args: &Args, root: &Path, cwd_rel: &Path) -> search::SearchOpts {
             .and_then(|g| build_glob_icase(g, false).ok()),
         crlf: args.crlf,
         no_mmap: args.no_mmap,
+        explicit_files: args.explicit_files.iter().cloned().collect(),
     }
 }
 
@@ -1573,6 +1589,12 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
     normalize_path_filters(&mut args.paths, &root, &cwd_rel);
+    args.explicit_files = args
+        .paths
+        .iter()
+        .filter(|p| root.join(p).is_file())
+        .cloned()
+        .collect();
     // No explicit paths: the implicit scope is the cwd subtree (rg's
     // default `.`). At the discovered root itself this is "": everything.
     if args.paths.is_empty() && !cwd_rel.as_os_str().is_empty() {
@@ -1818,7 +1840,13 @@ pub fn run() -> anyhow::Result<i32> {
             binary: if search_binary {
                 Default::default()
             } else {
-                idx.binary_files()
+                let mut b = idx.binary_files();
+                // Explicit file operands are always searched (and with
+                // --binary's detection), so their own outcome decides.
+                for e in &args.explicit_files {
+                    b.remove(e);
+                }
+                b
             },
         })
     } else {

@@ -116,6 +116,10 @@ pub struct SearchOpts {
     /// --no-mmap: read every file through the searcher's buffer instead of
     /// searching a memory map (glep maps by default; --mmap is a no-op).
     pub no_mmap: bool,
+    /// Path operands that name files (root-relative). Like rg, they are
+    /// searched with --binary's detection (binary data is reported, not
+    /// hidden) unless -a/--null-data turn detection off.
+    pub explicit_files: std::collections::HashSet<PathBuf>,
     pub word: bool,
     pub line_regexp: bool,
     pub smart_case: bool,
@@ -205,6 +209,7 @@ impl Default for SearchOpts {
             pre_glob: None,
             crlf: false,
             no_mmap: false,
+            explicit_files: Default::default(),
             word: false,
             line_regexp: false,
             smart_case: false,
@@ -600,6 +605,11 @@ struct WorkerState {
     printer: grep_printer::StandardBuilder,
     /// Path rendering for the summary-style modes (-l/-c).
     paths: PathStyle,
+    /// Binary detection for files found by the walk/index (the searcher's
+    /// configured mode) and for explicit file operands (rg's
+    /// `binary_explicit`: convert unless detection is off).
+    implicit_binary: BinaryDetection,
+    explicit_binary: BinaryDetection,
 }
 
 impl WorkerState {
@@ -621,7 +631,7 @@ impl WorkerState {
             opts.binary.clone()
         };
         let mut sb = SearcherBuilder::new();
-        sb.binary_detection(detection)
+        sb.binary_detection(detection.clone())
             .line_number(need_line_numbers)
             .invert_match(opts.invert)
             .max_matches(opts.max_count)
@@ -639,10 +649,17 @@ impl WorkerState {
         } else if opts.crlf {
             sb.line_terminator(grep_matcher::LineTerminator::crlf());
         }
+        let explicit_binary = if detection == BinaryDetection::none() {
+            BinaryDetection::none()
+        } else {
+            BinaryDetection::convert(b'\x00')
+        };
         WorkerState {
             searcher: sb.build(),
             printer: standard_printer_builder(opts),
             paths: PathStyle::new(opts),
+            implicit_binary: detection,
+            explicit_binary,
         }
     }
 }
@@ -669,7 +686,7 @@ enum Haystack<'a> {
 }
 
 impl<'a> Haystack<'a> {
-    fn open(full: &Path, rel: &Path, opts: &'a SearchOpts) -> Haystack<'a> {
+    fn open(full: &Path, rel: &Path, opts: &'a SearchOpts, convert: bool) -> Haystack<'a> {
         if let Some(cmd) = &opts.pre {
             if opts.pre_glob.as_ref().is_none_or(|g| g.is_match(rel)) {
                 return Haystack::Pre(cmd, full.to_path_buf());
@@ -678,7 +695,7 @@ impl<'a> Haystack<'a> {
         if opts.search_zip && rel.extension().is_some_and(|x| x == "gz") {
             return Haystack::Gz(full.to_path_buf());
         }
-        if opts.no_mmap || (opts.binary.convert_byte().is_some() && !opts.null_data) {
+        if opts.no_mmap || convert {
             return Haystack::Path(full.to_path_buf());
         }
         match std::fs::File::open(full) {
@@ -767,7 +784,7 @@ fn reader_disagrees<M: Matcher>(
     matcher: &M,
     opts: &SearchOpts,
 ) -> bool {
-    if map.len() <= FIRST_BUFFER || opts.null_data || opts.binary.quit_byte().is_none() {
+    if map.len() <= FIRST_BUFFER || searcher.binary_detection().quit_byte().is_none() {
         return false;
     }
     // Multi-line searches and transcoded files go through the same
@@ -949,7 +966,34 @@ fn search_one<M: Matcher>(
     let full = root.join(rel);
     let display = display_path(rel, opts);
     let display: &Path = &display;
-    let hay = Haystack::open(&full, rel, opts);
+    // Explicit file operands get rg's explicit binary detection for this
+    // one search; every other file keeps the worker's configured mode.
+    let explicit = !opts.explicit_files.is_empty() && opts.explicit_files.contains(rel);
+    if explicit {
+        state
+            .searcher
+            .set_binary_detection(state.explicit_binary.clone());
+    }
+    let res = search_detected(state, matcher, &full, rel, display, opts);
+    if explicit {
+        state
+            .searcher
+            .set_binary_detection(state.implicit_binary.clone());
+    }
+    res
+}
+
+fn search_detected<M: Matcher>(
+    state: &mut WorkerState,
+    matcher: &M,
+    full: &Path,
+    rel: &Path,
+    display: &Path,
+    opts: &SearchOpts,
+) -> anyhow::Result<FileResult> {
+    // Convert detection rewrites NULs, which needs the searcher's buffer.
+    let convert = state.searcher.binary_detection().convert_byte().is_some();
+    let hay = Haystack::open(full, rel, opts, convert);
     let (res, consumed) = search_hay(state, matcher, &hay, display, opts)?;
     if let Haystack::Map(map) = &hay {
         // A file that matched nothing and printed nothing reads the same
@@ -959,7 +1003,7 @@ fn search_one<M: Matcher>(
         // extra NUL scan.
         let observable = res.matched || !res.buf.is_empty() || opts.files_without_match;
         if observable && reader_disagrees(map, consumed, &state.searcher, matcher, opts) {
-            let hay = Haystack::Path(full);
+            let hay = Haystack::Path(full.to_path_buf());
             return Ok(search_hay(state, matcher, &hay, display, opts)?.0);
         }
     }

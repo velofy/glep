@@ -1333,3 +1333,50 @@ fn listing_cache_filters_match_rg() {
     ];
     check_cases(dir.path(), "cache", cases);
 }
+
+/// rg searches an explicit FILE operand unconditionally: ignore rules,
+/// the hidden filter, -g/-t/--ignore-file and --max-depth never drop it,
+/// and binary data in it is reported ("binary file matches") instead of
+/// hiding the file.
+#[test]
+fn explicit_file_operands_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let extra = tempfile::tempdir().unwrap();
+    let ignore_md = extra.path().join("md.ignore");
+    std::fs::write(&ignore_md, "*.md\n").unwrap();
+    let ignore_md = ignore_md.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        &["hello", "skipme.log"],
+        &["hello", "skipme2.txt"],
+        &["hiddentoken", ".hidden.txt"],
+        &["nopetoken", "dotkit/.nope"],
+        &["match", "binpre.bin"],
+        &["-c", "match", "binpre.bin"],
+        &["-l", "binary", "binnul.bin", "binpre.bin"],
+        &["-a", "binary", "binnul.bin"],
+        &["--binary", "binary", "binnul.bin"],
+        &[
+            "--files-without-match",
+            "zz_absent_zz",
+            "skipme.log",
+            "binpre.bin",
+            "README.md",
+        ],
+        &["-c", "--include-zero", "zz_absent_zz", "skipme.log"],
+        &["-g", "!*.log", "hello", "skipme.log"],
+        &["-t", "rust", "hello", "README.md"],
+        &["--ignore-file", ignore_md, "hello", "README.md"],
+        &["-d", "0", "hello", "src/main.rs"],
+        &["hello", "skipme.log", "src"],
+        &["hello", "src", "skipme.log"],
+        &["-c", "hello", "skipme.log", ".hidden.txt", "README.md"],
+        &["--no-ignore", "hello", "skipme.log", "src"],
+        &["--hidden", "-l", "hello", ".hidden.txt", "skipme.log"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    let pool = pool_corpus();
+    check_cases(pool.path(), "pool", cases);
+}
