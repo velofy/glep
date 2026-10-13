@@ -714,8 +714,14 @@ fn worker_count_never_changes_output() {
             let out = glep_threads_cmd(d, &full, threads).output().unwrap();
             let g = String::from_utf8(out.stdout).unwrap();
             let gc = out.status.code().unwrap_or(-1);
-            assert_eq!(g, r, "GLEP_THREADS={threads:?}: stdout diverged for {full:?}");
-            assert_eq!(gc, rc, "GLEP_THREADS={threads:?}: exit code diverged for {full:?}");
+            assert_eq!(
+                g, r,
+                "GLEP_THREADS={threads:?}: stdout diverged for {full:?}"
+            );
+            assert_eq!(
+                gc, rc,
+                "GLEP_THREADS={threads:?}: exit code diverged for {full:?}"
+            );
         }
     }
 }
@@ -3355,5 +3361,326 @@ fn killed_background_build_is_redone_and_queries_stay_correct() {
             err.contains("index_open") && !err.contains("first_sweep"),
             "{err}"
         );
+    }
+}
+
+/// Where rg's reader stops searching a file under quit detection, with
+/// no context lines kept and the 64 KiB buffer it starts every search
+/// with: it fills the buffer whole (tripling it while no line ends in
+/// it) and searches the complete lines in it, and a fill that finds a NUL
+/// ends the search before anything in it is searched. Returns how many
+/// bytes were searched and the NUL's offset, if the search stopped at
+/// one. This is rg 15.0's reader; rg 15.1 and later search after any read
+/// that ends a line and read a file's first three bytes on their own.
+fn rg_reader_stop(data: &[u8]) -> (usize, Option<usize>) {
+    let mut cap = 64 * 1024;
+    let (mut start, mut end) = (0usize, 0usize);
+    loop {
+        if cap == end - start {
+            cap *= 3;
+        }
+        let k = (cap - (end - start)).min(data.len() - end);
+        if k == 0 {
+            return (data.len(), None);
+        }
+        if let Some(i) = data[end..end + k].iter().position(|&b| b == 0) {
+            return (start, Some(end + i));
+        }
+        end += k;
+        if end - start == cap {
+            if let Some(j) = data[start..end].iter().rposition(|&b| b == b'\n') {
+                start += j + 1;
+            }
+        }
+    }
+}
+
+/// `rg -n PATTERN` over one file as rg 15.0 prints it, for a literal
+/// PATTERN: every searched line holding it, then the binary warning when
+/// a NUL ended the search after a match.
+fn rg_15_0_lines(name: &str, data: &[u8], pattern: &[u8]) -> Vec<u8> {
+    let (searched, nul) = rg_reader_stop(data);
+    let mut out = Vec::new();
+    let mut matched = false;
+    for (i, line) in data[..searched]
+        .split_inclusive(|&b| b == b'\n')
+        .enumerate()
+    {
+        let text = line.strip_suffix(b"\n").unwrap_or(line);
+        if text.windows(pattern.len()).any(|w| w == pattern) {
+            matched = true;
+            out.extend_from_slice(format!("{name}:{}:", i + 1).as_bytes());
+            out.extend_from_slice(text);
+            out.push(b'\n');
+        }
+    }
+    if let (true, Some(at)) = (matched, nul) {
+        out.extend_from_slice(
+            format!(
+                "{name}: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset {at})\n"
+            )
+            .as_bytes(),
+        );
+    }
+    out
+}
+
+/// Whether the rg on PATH reads files the way rg 15.0 does
+/// (`rg_reader_stop`): it prints nothing from a binary file whose first
+/// line is one byte long, where rg 15.1 and later print that line.
+fn rg_reads_like_15_0() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("probe.bin"), b"a\nab\x00cd\n").unwrap();
+    let (out, code) = rg_out(dir.path(), &["a"]);
+    out.is_empty() && code == 1
+}
+
+/// Binary files whose NUL sits past the first 64 KiB, or behind a first
+/// line one or two bytes long, with lines one to eight bytes long and
+/// NULs on both sides of the buffer boundaries; plain text files to fill
+/// the worker pool; a UTF-16 and a UTF-8 file with a byte-order mark and
+/// a late NUL. No line is 64 KiB long: one that long would grow rg's
+/// buffer for every file it searches after it (see the README).
+fn late_nul_corpus() -> (tempfile::TempDir, Vec<(String, Vec<u8>)>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for len in [1usize, 2, 3, 4, 8] {
+        for nul in [
+            65_536usize,
+            65_537,
+            65_538,
+            65_539,
+            70_000,
+            131_071,
+            131_072,
+            140_000,
+        ] {
+            let mut d = if len == 1 {
+                b"\n".repeat(nul)
+            } else {
+                let mut line = vec![b'a'; len - 1];
+                line.push(b'\n');
+                let mut d = line.repeat(nul / len + 1);
+                d.truncate(nul);
+                d
+            };
+            d.push(0);
+            d.extend_from_slice(&b"a\n".repeat(100));
+            files.push((format!("l{len}_n{nul}.bin"), d));
+        }
+    }
+    let mut short_first = |name: &str, d: &[u8]| files.push((name.to_string(), d.to_vec()));
+    short_first("s1.bin", b"a\nab\x00cd\n");
+    short_first("s2.bin", b"a\n\x00\n");
+    short_first("s3.bin", b"\n\na\x00\n");
+    let mut s4 = b"a\n".to_vec();
+    s4.extend_from_slice(&b"ab\n".repeat(30_000));
+    s4.push(0);
+    short_first("s4.bin", &s4);
+    for i in 0..12 {
+        files.push((format!("t{i:02}.txt"), b"a\nb\nab\n".repeat(50 * (i + 1))));
+    }
+    let mut u16 = vec![0xFF, 0xFE];
+    for b in "a\n".repeat(40_000).bytes().chain(*b"\0a\n") {
+        u16.extend_from_slice(&[b, 0]);
+    }
+    files.push(("u16.bin".to_string(), u16));
+    let mut u8bom = vec![0xEF, 0xBB, 0xBF];
+    u8bom.extend_from_slice(&b"a\n".repeat(40_000));
+    u8bom.extend_from_slice(b"\0a\n");
+    files.push(("u8bom.bin".to_string(), u8bom));
+    for (name, d) in &files {
+        std::fs::write(dir.path().join(name), d).unwrap();
+    }
+    files.sort();
+    (dir, files)
+}
+
+/// Binary files stop where rg's reader stops, through the slice search,
+/// its reread of a file with a late NUL, `--no-mmap`'s reader, the worker
+/// pool, the small path, and with and without the index: `-n a` prints
+/// what `rg_reader_stop` says rg 15.0 prints. When the rg on PATH reads
+/// like rg 15.0, every mode also prints rg's bytes and exit code: the
+/// summary modes, `--stats`, context, `-m`, `-v`, `-E latin1` and the
+/// transcoded files among them. (rg 15.1 and later read differently
+/// here; see the README.)
+#[test]
+fn binary_files_stop_where_rgs_reader_stops() {
+    let (dir, files) = late_nul_corpus();
+    let d = dir.path();
+    let model: Vec<u8> = files
+        .iter()
+        .filter(|(name, _)| !name.starts_with('u'))
+        .flat_map(|(name, data)| rg_15_0_lines(name, data, b"a"))
+        .collect();
+    let bytes_out = |args: &[&str], sync: bool| -> (Vec<u8>, i32) {
+        let mut c = Command::cargo_bin("glep").unwrap();
+        c.current_dir(d).args(args);
+        if sync {
+            c.env("GLEP_SYNC_BUILD", "1");
+        }
+        let out = c.output().unwrap();
+        (out.stdout, out.status.code().unwrap_or(-1))
+    };
+    for extra in [&[][..], &["--no-mmap"], &["-j1"]] {
+        for index in [false, true] {
+            let mut args: Vec<&str> = vec!["-g", "!u*", "a"];
+            args.extend_from_slice(extra);
+            if !index {
+                args.insert(0, "--no-index");
+            }
+            let (out, code) = bytes_out(&args, true);
+            assert_eq!(code, 0, "{args:?}");
+            assert!(
+                out == model,
+                "{args:?}: {} lines printed, {} expected",
+                out.split(|&b| b == b'\n').count(),
+                model.split(|&b| b == b'\n').count()
+            );
+        }
+    }
+    // One file at a time, on the small path.
+    for (name, data) in files.iter().filter(|(n, _)| n.starts_with('s')) {
+        let want = rg_15_0_lines(name, data, b"a");
+        let (out, _) = bytes_out(&["--no-index", "-g", name, "a"], false);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&want),
+            "{name}"
+        );
+    }
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping the rg comparison");
+        return;
+    }
+    if !rg_reads_like_15_0() {
+        eprintln!("parity: rg reads like rg 15.1 or later here, skipping the rg comparison");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["a"],
+        &["-c", "a"],
+        &["--count-matches", "a"],
+        &["-l", "a"],
+        &["--files-without-match", "a"],
+        &["-q", "a"],
+        &["-B2", "a"],
+        &["-C3", "ab"],
+        &["-A1", "b"],
+        &["-m5", "a"],
+        &["-v", "b"],
+        &["-c", "-v", "a"],
+        &["--no-mmap", "a"],
+        &["-j1", "a"],
+        &["-B", "40000", "-c", "a"],
+        &["b"],
+        &["-l", "b"],
+        &["--files-without-match", "b"],
+        &["-E", "latin1", "a"],
+        &["-g", "l2_*", "a"],
+        &["-g", "s*", "a"],
+        &["-g", "u*", "a"],
+        &["-g", "u*", "-c", "a"],
+    ];
+    for args in cases {
+        let r = std::process::Command::new("rg")
+            .current_dir(d)
+            .args(["-n", "--no-heading", "--color=never", "--sort", "path"])
+            .args(*args)
+            .output()
+            .unwrap();
+        for index in [false, true] {
+            let mut a: Vec<&str> = args.to_vec();
+            if !index {
+                a.insert(0, "--no-index");
+            }
+            let (out, code) = bytes_out(&a, true);
+            assert!(
+                out == r.stdout,
+                "{a:?}: stdout diverged from rg ({} vs {} bytes)",
+                out.len(),
+                r.stdout.len()
+            );
+            assert_eq!(Some(code), r.status.code(), "{a:?}");
+        }
+    }
+    // The --stats counters both tools share.
+    for args in [
+        &["--stats", "-c", "a"][..],
+        &["--stats", "a"],
+        &["-E", "latin1", "-c", "--stats", "a"],
+    ] {
+        let counters = |out: &[u8]| -> Vec<String> {
+            String::from_utf8_lossy(out)
+                .lines()
+                .filter(|l| {
+                    l.ends_with(" matches")
+                        || l.ends_with(" matched lines")
+                        || l.ends_with(" files contained matches")
+                        || l.ends_with(" bytes searched")
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        let r = std::process::Command::new("rg")
+            .current_dir(d)
+            .args(["-n", "--no-heading", "--color=never", "--sort", "path"])
+            .args(args)
+            .output()
+            .unwrap();
+        let (out, _) = bytes_out(&[&["--no-index"][..], args].concat(), true);
+        assert_eq!(counters(&out), counters(&r.stdout), "{args:?}");
+        assert_eq!(counters(&out).len(), 4, "{args:?}");
+    }
+}
+
+/// --files-without-match reads a file on past its first match, as rg's
+/// summary printer does, so a NUL after that match still squashes the
+/// file: it is not listed, yet it counts as a file without a match, so
+/// `-q --files-without-match` exits 0 on it. `-l` stops at the first
+/// match and lists it. rg 15.0 and 15.1 or later agree here.
+#[test]
+fn files_without_match_reads_past_the_first_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut late = b"match here\n".to_vec();
+    late.extend_from_slice(&b"plain line of text\n".repeat(4000));
+    late.extend_from_slice(b"\0tail\n");
+    std::fs::write(d.join("late.bin"), &late).unwrap();
+    let mut clean = b"match here\n".to_vec();
+    clean.extend_from_slice(&b"plain line of text\n".repeat(4000));
+    std::fs::write(d.join("clean.txt"), &clean).unwrap();
+    std::fs::write(d.join("none.txt"), "plain\n").unwrap();
+    let cases: &[(&[&str], &str, i32)] = &[
+        (&["--files-without-match", "match"], "none.txt\n", 0),
+        (
+            &["--files-without-match", "-g", "!none.txt", "match"],
+            "",
+            0,
+        ),
+        (
+            &["-q", "--files-without-match", "-g", "!none.txt", "match"],
+            "",
+            0,
+        ),
+        (
+            &["-q", "--files-without-match", "-g", "clean.txt", "match"],
+            "",
+            1,
+        ),
+        (&["-l", "match"], "clean.txt\nlate.bin\n", 0),
+        (&["-c", "match"], "clean.txt:1\n", 0),
+    ];
+    for &(args, want, code) in cases {
+        for index in [false, true] {
+            let mut a: Vec<&str> = args.to_vec();
+            if !index {
+                a.insert(0, "--no-index");
+            }
+            assert_eq!(glep_out_sync(d, &a), (want.to_string(), code), "{a:?}");
+        }
+        if have_rg() {
+            assert_eq!(rg_out(d, args), (want.to_string(), code), "rg {args:?}");
+        }
     }
 }

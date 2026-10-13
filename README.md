@@ -70,7 +70,7 @@ glep status                     # index stats
 
 The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory. On a tree holding more than 64 MiB the first query does not wait for that build: it answers with a full scan, at rg's cost, and then builds the index in a detached low-priority process, so later queries use it; a smaller tree builds it inline. A query no trigram can narrow (a pattern shorter than three bytes, `.*`, `-v`, `--passthru`, `-c --include-zero`) gets nothing from an index, so it builds none: it searches the tree like `--no-index`, and the first query an index can narrow builds it. `GLEP_SYNC_BUILD=1` always builds inline, and `GLEP_BG_BUILD_MIN_BYTES` moves the threshold (`K`, `M` and `G` suffixes accepted). On Windows the build is always inline.
 
-Binary files are handled the way rg's default reader handles them, and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
+Binary files are handled the way rg's default reader handles them (rg 15.0's, see below), and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
 
 Known differences from rg:
 
@@ -82,6 +82,8 @@ Known differences from rg:
 - `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
 - glep never reads stdin, so a search with no path argument always searches the tree.
 - The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
+- A binary file is read as rg 15.0 reads it: in buffers of 64 KiB, each filled whole before it is searched, and a NUL ends the search before the buffer holding it is searched. rg 15.1 and later search after any read that ends a line, and their byte-order-mark check hands a file's first three bytes over in a read of their own, so on a binary file whose first line is one or two bytes long they print that line, and with a NUL past the first 64 KiB they can stop at another line than rg 15.0 and glep do.
+- Every file is read with a fresh 64 KiB buffer. rg keeps one buffer per search thread, and a line of 64 KiB or more grows it for every file that thread searches afterwards, so under `--sort path` (one thread, in path order) a file with a NUL past its first 64 KiB that sorts after such a line can stop earlier in rg, or print nothing. rg's output for that file then depends on which files it searched before it, and without `--sort` on which thread searched them.
 
 ## When to use it
 
