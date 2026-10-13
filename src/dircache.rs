@@ -45,6 +45,10 @@
 //! so a stale or even corrupt cache can only cost speed, never
 //! correctness. `GLEP_NO_DIRCACHE=1` disables the whole mechanism.
 
+// Built and unit-tested on every platform; only the macOS listing path
+// (cli.rs, walk_bulk.rs) uses it.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use crate::walk::FileMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

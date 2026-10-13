@@ -875,6 +875,7 @@ fn validate_sort(args: &Args) -> anyhow::Result<()> {
 /// Whether the current sort request keeps glep's natural order (path
 /// ascending, which `none` is free to use too) or a plain reversal of it.
 /// Only these can be served by the listing cache.
+#[cfg(target_os = "macos")]
 fn sort_is_path_order(args: &Args) -> bool {
     matches!(
         sort_request(args),

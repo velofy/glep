@@ -1078,6 +1078,7 @@ fn remaining_stack_flags_match_rg() {
     check_cases(pool.path(), "pool", cases);
 }
 
+#[cfg(unix)]
 fn have_cmd(cmd: &str) -> bool {
     std::process::Command::new(cmd)
         .arg("--version")

@@ -208,6 +208,7 @@ impl Index {
     /// Full FileMeta view of live entries (mtimes/sizes as of the last
     /// sweep), for cache building. `hidden` is reconstructed from
     /// FLAG_HIDDEN.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn live_file_metas(&self, include_hidden: bool) -> Vec<crate::walk::FileMeta> {
         self.manifest
             .live_entries()
@@ -362,6 +363,7 @@ impl Index {
     }
 
     /// See the `swept_full` field.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn swept_full(&self) -> bool {
         self.swept_full
     }

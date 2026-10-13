@@ -62,6 +62,7 @@ pub fn path_is_hidden(rel: &Path) -> bool {
 /// Bound on how many levels above the sweep root to look for ancestor
 /// `.gitignore` files when no `.git` directory brackets the search
 /// (mirrors the bulk walker's cap; see walk_bulk.rs for the rationale).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const ANCESTOR_GITIGNORE_CAP: usize = 10;
 
 /// Walk up from `start` (inclusive) looking for the nearest ancestor
@@ -334,6 +335,7 @@ impl Drop for Collector<'_> {
 /// for symmetry with the in-tree divergence trap) must send the sweep to
 /// the portable walker and must keep the listing cache out of play. A
 /// handful of stat calls; most roots have none.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn ancestors_have_dot_ignore(root: &Path) -> bool {
     let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut dir = canon.parent();
@@ -489,7 +491,8 @@ fn sweep_walker_scoped_unsorted(
 /// `stat()`-class metadata() call per file. This is the sole implementation
 /// on non-macOS platforms, and the fallback / correctness reference on
 /// macOS (see `sweep` above and the differential tests below).
-#[cfg(test)]
+// Only the macOS bulk-vs-walker differential tests call it.
+#[cfg(all(test, target_os = "macos"))]
 fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     // Sorted variant, the correctness reference for the bulk-path
     // differential tests below.
