@@ -408,7 +408,8 @@ pub struct Args {
     #[arg(long = "no-heading", overrides_with = "heading", hide = true)]
     pub no_heading: bool,
     /// Suppress all output; the exit code alone reports whether a match
-    /// exists (--json still emits the closing summary event, like rg)
+    /// exists. Like rg, --json still emits the closing summary event and
+    /// --stats still prints its block, both counted over every file.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
     /// Skip the freshness sweep if the last one ran within this many seconds

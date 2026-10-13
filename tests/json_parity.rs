@@ -254,3 +254,107 @@ fn json_events_match_rg_on_the_worker_pool() {
         }
     }
 }
+
+/// -q only shortens the search when nothing needs every file's counts:
+/// under --json or --stats rg searches every file and counts the way its
+/// quiet summary printer does (an inverted line counts as one match, a
+/// multi-line match counts every line it spans), so the summary event and
+/// the stats block carry rg's numbers on the small path and the pool.
+#[test]
+fn quiet_json_and_stats_count_every_file_like_rg() {
+    if !have_rg() {
+        eprintln!("json_parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    std::fs::write(
+        dir.path().join("multi.txt"),
+        "hello a\nnope\nhello hello\nzzz\n",
+    )
+    .unwrap();
+    let small = tempfile::tempdir().unwrap();
+    std::fs::write(
+        small.path().join("m.txt"),
+        "hello a\nnope\nhello hello\nzzz\n",
+    )
+    .unwrap();
+    std::fs::write(small.path().join("n.txt"), "x\ny\n").unwrap();
+    for i in 0..48 {
+        let p = dir.path().join(format!("pool/d{}/f{i:02}.txt", i % 3));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let body = if i % 2 == 0 {
+            format!("before {i}\nhello pool {i} hello\nafter {i}\n")
+        } else {
+            format!("Hello crlf {i}\r\nmiddle\r\nhello again {i}\r\n")
+        };
+        std::fs::write(&p, body).unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-v", "hello"],
+        &["-i", "HELLO"],
+        &["-U", "hello\\s+\\w+\\nnope"],
+        &["-c", "hello"],
+        &["-l", "hello"],
+        &["zz_totally_absent_zz"],
+    ];
+    let run = |prog: &str, d: &Path, args: &[&str]| {
+        let mut c = if prog == "glep" {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("glep"))
+        } else {
+            let mut c = std::process::Command::new("rg");
+            c.args(["--sort", "path", "--no-require-git"]);
+            c
+        };
+        let out = c.current_dir(d).args(args).output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), out.status.code())
+    };
+    for d in [dir.path(), small.path()] {
+        for case in cases {
+            // --json last: the search modes are last-wins, so a -c or -l
+            // in the case must not turn the JSON summary off.
+            let mut args = case.to_vec();
+            args.extend_from_slice(&["--json", "-q"]);
+            let (g, gc) = run("glep", d, &args);
+            let (r, rc) = run("rg", d, &args);
+            assert_eq!(gc, rc, "exit code diverged for {args:?}");
+            let (g, r) = (lines(&g), lines(&r));
+            assert_eq!(g.len(), 1, "-q prints only the summary: {args:?}");
+            assert_eq!(r.len(), 1, "sanity: rg printed {r:?} for {args:?}");
+            let (gs, rs) = (without_timing(g[0]), without_timing(r[0]));
+            for key in [
+                "matches",
+                "matched_lines",
+                "searches_with_match",
+                "bytes_printed",
+            ] {
+                assert_eq!(
+                    gs["data"]["stats"][key], rs["data"]["stats"][key],
+                    "summary {key} diverged for {args:?}"
+                );
+            }
+
+            let mut args = case.to_vec();
+            args.extend_from_slice(&["--stats", "-q"]);
+            let (g, gc) = run("glep", d, &args);
+            let (r, rc) = run("rg", d, &args);
+            assert_eq!(gc, rc, "exit code diverged for {args:?}");
+            // The counters rg and glep share: matches, matched lines, files
+            // with matches, bytes printed (searches and bytes searched count
+            // only the files glep opened after index narrowing).
+            let shared = |s: &str| -> Vec<String> {
+                s.lines()
+                    .filter(|l| {
+                        l.ends_with(" matches")
+                            || l.ends_with(" matched lines")
+                            || l.ends_with(" files contained matches")
+                            || l.ends_with(" bytes printed")
+                    })
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(shared(&g).len(), 4, "stats block missing: {g:?}");
+            assert_eq!(shared(&g), shared(&r), "stats diverged for {args:?}");
+        }
+    }
+}

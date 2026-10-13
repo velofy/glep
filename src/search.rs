@@ -145,6 +145,23 @@ impl SearchOpts {
         }
     }
 
+    /// rg's quit_after_match: -q ends the whole search at the first file
+    /// that settles the exit status, unless --json or --stats still need
+    /// every file's counts for the summary.
+    fn quit_after_match(&self) -> bool {
+        self.quiet && !self.json && !self.stats
+    }
+
+    /// Whether a finished file settles a -q search: a file with a match,
+    /// or, under --files-without-match, a searched file without one.
+    fn settles(&self, res: &FileResult) -> bool {
+        if self.files_without_match {
+            !res.matched && !res.failed
+        } else {
+            res.matched
+        }
+    }
+
     /// A summary record's terminator: the -0 path terminator when set,
     /// else the line terminator (rg's summary printer).
     fn push_record_end(&self, buf: &mut Vec<u8>) {
@@ -425,6 +442,9 @@ impl grep_searcher::Sink for FoundSink {
 
 struct CountSink<'a, M: Matcher> {
     matcher: &'a M,
+    /// Lines covered by the matches (a multi-line match counts every line
+    /// it spans), rg's `matched lines` statistic.
+    lines: u64,
     /// Run `find_iter` on each matched line to count real occurrences:
     /// needed by --count-matches, -U (a match may span lines), -o (rg -o
     /// -c counts occurrences), -v (each non-matching line counts once via
@@ -450,6 +470,7 @@ impl<'a, M: Matcher> CountSink<'a, M> {
         let count_occurrences = opts.count_matches || multi_line || opts.only_matching;
         CountSink {
             matcher,
+            lines: 0,
             occurrences_mode: count_occurrences || opts.stats,
             count: 0,
             occurrences: 0,
@@ -458,11 +479,14 @@ impl<'a, M: Matcher> CountSink<'a, M> {
         }
     }
 
-    /// -l/--files-without-match under --stats: real occurrence and line
-    /// counts instead of the early-exit sink.
+    /// -l/--files-without-match under --stats, and -q under --json or
+    /// --stats: real occurrence and line counts instead of the early-exit
+    /// sink, counted like rg's summary printer (an inverted line counts
+    /// as one match).
     fn for_stats(matcher: &'a M) -> CountSink<'a, M> {
         CountSink {
             matcher,
+            lines: 0,
             occurrences_mode: true,
             count: 0,
             occurrences: 0,
@@ -480,6 +504,7 @@ impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
         if self.occurrences_mode {
+            self.lines += m.lines().count() as u64;
             let mut n = 0u64;
             self.matcher
                 .find_iter(m.bytes(), |_| {
@@ -494,6 +519,7 @@ impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
             self.count += if self.count_occurrences { n } else { 1 };
         } else {
             self.count += 1;
+            self.lines += 1;
             self.occurrences += 1;
         }
         Ok(true)
@@ -969,6 +995,9 @@ fn file_stats(bytes_searched: u64, matched_lines: u64, matches: u64) -> grep_pri
 /// One finished file: its rendered output, whether it matched, and its
 /// stats when the mode tracks them.
 struct FileResult {
+    /// The search failed (reported as an error): the file neither
+    /// matched nor counts as a file without a match.
+    failed: bool,
     buf: Vec<u8>,
     matched: bool,
     /// A summary mode (-c, -l, --files-without-match) saw binary data
@@ -983,6 +1012,7 @@ struct FileResult {
 impl FileResult {
     fn empty() -> FileResult {
         FileResult {
+            failed: false,
             buf: Vec::new(),
             matched: false,
             squashed: false,
@@ -1092,24 +1122,16 @@ fn search_hay<M: Matcher>(
     let searcher = &mut state.searcher;
     if opts.quiet {
         // -q: nothing is written; the exit code carries the answer. Under
-        // --json rg still emits the closing summary, so each file runs
-        // through the JSON sink into a scratch buffer to harvest stats.
-        if opts.json {
-            let mut scratch = Vec::new();
-            let mut printer = grep_printer::JSONBuilder::new().build(&mut scratch);
-            let mut sink = printer.sink_with_path(matcher, display);
+        // --json or --stats rg still prints the summary, so it searches
+        // every file to the end and counts like its quiet summary printer
+        // (bytes_printed stays 0).
+        if opts.json || opts.stats {
+            let mut sink = CountSink::for_stats(matcher);
             let consumed = hay.search(searcher, matcher, &mut sink)?;
-            // -q printed nothing: bytes_printed stays 0, like rg's summary.
-            let s = sink.stats();
-            let mut stats = grep_printer::Stats::new();
-            stats.add_searches(s.searches());
-            stats.add_searches_with_match(s.searches_with_match());
-            stats.add_bytes_searched(s.bytes_searched());
-            stats.add_matched_lines(s.matched_lines());
-            stats.add_matches(s.matches());
             let res = FileResult {
-                matched: sink.has_match(),
-                stats: Some(stats),
+                matched: sink.count > 0 && !sink.binary_quit,
+                squashed: sink.binary_quit,
+                stats: Some(file_stats(consumed, sink.lines, sink.occurrences)),
                 ..FileResult::empty()
             };
             return Ok((res, consumed));
@@ -1117,7 +1139,8 @@ fn search_hay<M: Matcher>(
         let mut sink = FoundSink::default();
         let consumed = hay.search(searcher, matcher, &mut sink)?;
         let res = FileResult {
-            matched: sink.found,
+            matched: sink.found && !sink.binary_quit,
+            squashed: sink.binary_quit,
             ..FileResult::empty()
         };
         return Ok((res, consumed));
@@ -1128,7 +1151,7 @@ fn search_hay<M: Matcher>(
         let consumed = hay.search(searcher, matcher, &mut sink)?;
         let stats = opts
             .stats
-            .then(|| file_stats(consumed, sink.count, sink.occurrences));
+            .then(|| file_stats(consumed, sink.lines, sink.occurrences));
         if sink.binary_quit {
             // rg's summary printer squashes the file: no record at all,
             // even under --include-zero; its stats keep the counts.
@@ -1172,7 +1195,7 @@ fn search_hay<M: Matcher>(
             // whole file when it tracks stats).
             let mut sink = CountSink::for_stats(matcher);
             let consumed = hay.search(searcher, matcher, &mut sink)?;
-            let stats = file_stats(consumed, sink.count, sink.occurrences);
+            let stats = file_stats(consumed, sink.lines, sink.occurrences);
             (
                 sink.count > 0 && !sink.binary_quit,
                 sink.binary_quit,
@@ -1199,6 +1222,7 @@ fn search_hay<M: Matcher>(
             matched,
             squashed,
             stats,
+            failed: false,
         };
         return Ok((res, consumed));
     }
@@ -1248,7 +1272,10 @@ fn search_one_or_warn<M: Matcher>(
         Ok(r) => r,
         Err(e) => {
             crate::messages::error(format!("{}: {}", display_path(rel, opts).display(), e));
-            FileResult::empty()
+            FileResult {
+                failed: true,
+                ..FileResult::empty()
+            }
         }
     }
 }
@@ -1418,12 +1445,15 @@ impl Printer {
             matched,
             squashed,
             stats,
+            failed,
         } = res;
         if let Some(s) = &stats {
             merge_stats(&mut self.total_stats, s);
         }
         if let Some(m) = &mut self.file_states {
-            m[idx] = if matched {
+            m[idx] = if failed {
+                FAILED
+            } else if matched {
                 MATCHED
             } else if squashed {
                 SQUASHED
@@ -1516,6 +1546,8 @@ pub struct Universe {
 const NO_MATCH: u8 = 0;
 const MATCHED: u8 = 1;
 const SQUASHED: u8 = 2;
+/// The search failed with an error: neither listed nor counted.
+const FAILED: u8 = 3;
 
 /// Search `files` (relative paths, pre-sorted) under `root`. Prints results
 /// in input order for determinism. Returns true if anything matched (for
@@ -1600,10 +1632,10 @@ fn run_impl<M: Matcher + Sync>(
         let mut printer = Printer::new(opts, files.len(), files.len());
         for rel in files {
             let res = search_one_or_warn(&mut state, matcher, root, rel, opts);
-            let stop = opts.quiet && res.matched;
+            let stop = opts.quit_after_match() && opts.settles(&res);
             printer.emit(res, out)?;
             if stop {
-                // -q: the first match settles the exit code.
+                // -q: the first settling file decides the exit code.
                 break;
             }
         }
@@ -1728,7 +1760,7 @@ fn worker<M: Matcher + Sync>(
         } else {
             search_one_or_warn(state, matcher, root, &files[idx], opts)
         };
-        if opts.quiet && res.matched {
+        if opts.quit_after_match() && opts.settles(&res) {
             stop.store(true, Ordering::Relaxed);
             // No new claims: everything below the cursor is already
             // claimed and will be sent by its owner.
@@ -1795,14 +1827,20 @@ fn finish(
         let mut buf = Vec::new();
         for p in domain {
             match decided.get(p.as_path()) {
-                Some(&MATCHED) => {}
+                // Matched, or the search failed with an error.
+                Some(&MATCHED) | Some(&FAILED) => {}
                 // Squashed binary files: no match, but never listed.
                 Some(_) => found = true,
                 None if binary.is_some_and(|b| b.contains(p)) => found = true,
+                // -q prints nothing; files a -q stop left unsearched land
+                // here too, after a file without a match already settled
+                // the answer.
                 None => {
                     found = true;
-                    paths.write(&mut buf, &display_path(p, opts));
-                    opts.push_record_end(&mut buf);
+                    if !opts.quiet {
+                        paths.write(&mut buf, &display_path(p, opts));
+                        opts.push_record_end(&mut buf);
+                    }
                 }
             }
         }
@@ -1810,7 +1848,7 @@ fn finish(
     }
     if opts.json {
         write_summary(out, &mut printer.total_stats, start.elapsed())?;
-    } else if opts.stats && !opts.quiet {
+    } else if opts.stats {
         // rg's stats block: a blank line then fixed-order counters.
         // `bytes_printed` is whatever the printer tracked (standard mode);
         // count/-l modes report 0 there like rg's non-printer paths.
@@ -2026,7 +2064,9 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// --json -q through the parallel path: exactly one line, the summary.
+    /// --json -q through the parallel path: exactly one line, the summary,
+    /// and -q does not cut the search short: the counts cover every file,
+    /// exactly as without -q.
     #[test]
     fn parallel_quiet_json_emits_only_summary() {
         let (dir, files) = big_corpus(90);
@@ -2037,6 +2077,53 @@ mod tests {
         assert!(found);
         assert_eq!(out.lines().count(), 1);
         assert!(out.contains("\"type\":\"summary\""));
+        let quiet: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        o.quiet = false;
+        let (_, full) = run_str("needle", dir.path(), &files, &o);
+        let full: serde_json::Value = serde_json::from_str(full.lines().last().unwrap()).unwrap();
+        for key in ["matches", "matched_lines", "searches_with_match"] {
+            assert_eq!(
+                quiet["data"]["stats"][key], full["data"]["stats"][key],
+                "{key}"
+            );
+        }
+        assert_eq!(quiet["data"]["stats"]["matches"], 30);
+        // Every file was searched (rg counts searches the same way).
+        assert_eq!(quiet["data"]["stats"]["searches"], 90);
+        assert_eq!(quiet["data"]["stats"]["bytes_printed"], 0);
+    }
+
+    /// --stats -q prints the full stats block, like rg: -q stops early
+    /// only when no summary needs every file's counts.
+    #[test]
+    fn quiet_stats_block_counts_every_file() {
+        // 12 files take the on-thread small path, 99 the worker pool.
+        for n in [12usize, 99] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut files = Vec::new();
+            for i in 0..n {
+                let name = format!("f{:03}.txt", i);
+                let content = if i % 3 == 0 {
+                    format!("line one\nneedle here {}\nline three\n", i)
+                } else {
+                    format!("file {} has no matches\n", i)
+                };
+                std::fs::write(dir.path().join(&name), content).unwrap();
+                files.push(PathBuf::from(name));
+            }
+            let mut o = opts();
+            o.quiet = true;
+            o.stats = true;
+            let (found, out) = run_str("needle", dir.path(), &files, &o);
+            assert!(found);
+            let with = n.div_ceil(3);
+            assert!(
+                out.starts_with(&format!(
+                    "\n{with} matches\n{with} matched lines\n{with} files contained matches\n{n} files searched\n0 bytes printed\n"
+                )),
+                "{out}"
+            );
+        }
     }
 
     /// --heading through the parallel path: blank line between groups.

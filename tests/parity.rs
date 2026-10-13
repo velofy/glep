@@ -1003,6 +1003,17 @@ fn search_modes_are_last_wins_like_rg() {
         &["-l", "--count-matches", "hello"],
         &["--count-matches", "-l", "hello"],
         &["-q", "--debug", "hello"],
+        // -q --files-without-match: nothing printed; the answer is whether
+        // some searched file has no match.
+        &["-q", "--files-without-match", "hello"],
+        &["-q", "--files-without-match", "zz_absent_zz"],
+        &[
+            "--files-without-match",
+            "-q",
+            "hello",
+            "README.md",
+            "src/main.rs",
+        ],
     ];
     check_cases(corpus().path(), "small", cases);
     let pool = pool_corpus();
