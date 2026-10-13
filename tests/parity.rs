@@ -2825,9 +2825,11 @@ fn scoped_listings_from_the_sweep_match_rg() {
         );
         assert_eq!(g, r, "./src/");
         assert!(scoped);
-        // A subdirectory run finds the tree's root by its index: build it,
-        // and the scoped listings below leave it untouched.
-        let (_, code) = glep_out_sync(d, &["-c", "fn"]);
+        // A subdirectory run finds the tree's root by its index: build it
+        // (with a query trigrams narrow: one they cannot, like `-c fn`,
+        // builds no index), and the scoped listings below leave it
+        // untouched.
+        let (_, code) = glep_out_sync(d, &["-c", "fn f"]);
         assert_eq!(code, 0);
         let manifest = std::fs::read(d.join(".glep/manifest.bin")).unwrap();
         // From a subdirectory: the cwd scope, operands below it and one
@@ -3107,6 +3109,99 @@ fn first_queries_answer_from_the_sweep_like_rg() {
         assert!(!pidfile.exists(), "{label}: spawned under a held lock");
         drop(lock);
     }
+}
+
+/// Queries no trigram narrows (Plan::All): a single letter, a two-letter
+/// literal, -v, --files-without-match and -c --include-zero over every
+/// file, --passthru, and a class repeat.
+const PLAN_ALL_CASES: &[&[&str]] = &[
+    &["q"],
+    &["-c", "ab"],
+    &["-v", "-c", "a"],
+    &["--files-without-match", ".*"],
+    &["-c", "--include-zero", "x"],
+    &["--passthru", "a"],
+    &["-c", "[0-9]{2}"],
+];
+
+/// One search run: stdout, stderr and exit code.
+type Searched = (String, String, i32);
+
+fn searched(out: std::process::Output) -> Searched {
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `rg_out`'s run, stdin from the null device, with its stderr.
+fn rg_searched(dir: &Path, args: &[&str]) -> Searched {
+    let out = std::process::Command::new("rg")
+        .current_dir(dir)
+        .args([
+            "-n",
+            "--no-heading",
+            "--color=never",
+            "--sort",
+            "path",
+            "--no-require-git",
+        ])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    searched(out)
+}
+
+/// A query no trigram narrows gets nothing from an index, so on a tree
+/// with none yet it searches a live walk, as --no-index does, and builds
+/// nothing: no inline build on a small tree, no background build on one
+/// above GLEP_BG_BUILD_MIN_BYTES. It prints rg's bytes on the worker
+/// pool, binary and empty files included, and the first narrowed query
+/// builds the index as before.
+#[test]
+fn plan_all_queries_on_an_unindexed_tree_build_nothing() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = pool_corpus();
+    let d = dir.path();
+    std::fs::write(d.join("pool/q.txt"), "q ab 12 x a\n").unwrap();
+    std::fs::write(d.join("pool/empty.txt"), "").unwrap();
+    assert_eq!(search_path(d, &["q"]), "pool");
+    for args in PLAN_ALL_CASES {
+        let out = Command::cargo_bin("glep")
+            .unwrap()
+            .current_dir(d)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(searched(out), rg_searched(d, args), "{args:?}");
+        assert!(!d.join(".glep").exists(), "{args:?} built an index");
+    }
+    #[cfg(unix)]
+    {
+        let aux = tempfile::tempdir().unwrap();
+        let pidfile = aux.path().join("pid");
+        for args in PLAN_ALL_CASES {
+            let (g, gc, err) = deferred(d, args, &pidfile);
+            let (r, _, rc) = rg_searched(d, args);
+            assert_eq!((g, gc), (r, rc), "{args:?}");
+            assert!(
+                err.contains("live_walk") && !err.contains("first_sweep"),
+                "{args:?}: {err}"
+            );
+        }
+        assert!(!pidfile.exists(), "a Plan::All query spawned a build");
+        assert!(!d.join(".glep").exists());
+    }
+    assert_eq!(glep_out_sync(d, &["hello"]), rg_out(d, &["hello"]));
+    assert!(
+        d.join(".glep/manifest.bin").exists(),
+        "the first narrowed query built no index"
+    );
 }
 
 /// The first query on an unindexed tree spawns the build and returns

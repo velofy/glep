@@ -5,7 +5,9 @@
 //! rename, at any depth) and every in-place .gitignore edit must be
 //! reflected by the NEXT --files invocation, even when the cache path
 //! answers it. Each test compares glep's cached-path listing against an
-//! authoritative sweep (GLEP_NO_DIRCACHE=1 forces the full path).
+//! authoritative sweep (GLEP_NO_DIRCACHE=1 forces the full path), or
+//! against rg. The last tests do the same for content queries no trigram
+//! narrows, which search the files a cached listing lists.
 
 // The dir-mtime listing cache only exists on macOS (see src/dircache.rs).
 #![cfg(target_os = "macos")]
@@ -792,4 +794,343 @@ fn a_filtered_listing_saves_the_whole_tree() {
     assert!(cached);
     assert!(listed.contains("lib/new.c\n"), "{listed}");
     assert_eq!((listed, 0), rg_files(root, &[]));
+}
+
+// ---------------------------------------------------------------------
+// Content queries no trigram narrows (Plan::All) search the listing
+// cache's file set, without the index.
+// ---------------------------------------------------------------------
+
+/// Queries whose plans no trigram narrows: a single letter, a two-letter
+/// literal, -v, --files-without-match and -c --include-zero over every
+/// file, --passthru, and a class repeat.
+const PLAN_ALL: &[&[&str]] = &[
+    &["q"],
+    &["-c", "ab"],
+    &["-v", "-c", "a"],
+    &["--files-without-match", ".*"],
+    &["-c", "--include-zero", "x"],
+    &["--passthru", "a"],
+    &["-c", "[0-9]{2}"],
+];
+
+/// What a run printed and how it exited: (stdout, stderr, exit code).
+type Printed = (String, String, i32);
+
+fn printed(out: std::process::Output) -> Printed {
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// `glep ARGS` in `dir` with GLEP_TIMING (stdin, as for every run here,
+/// reads nothing): what it printed, its timing lines dropped, and the
+/// timing lines alone.
+fn glep_timed(dir: &Path, args: &[&str]) -> (Printed, String) {
+    let out = glep()
+        .args(args)
+        .current_dir(dir)
+        .env("GLEP_TIMING", "1")
+        .output()
+        .expect("glep run");
+    let (stdout, stderr, code) = printed(out);
+    let (timing, rest): (Vec<&str>, Vec<&str>) =
+        stderr.lines().partition(|l| l.starts_with("glep timing: "));
+    let lines = |v: Vec<&str>| -> String { v.iter().map(|l| format!("{l}\n")).collect() };
+    ((stdout, lines(rest), code), lines(timing))
+}
+
+/// `glep_timed`, and whether the listing cache served the files searched
+/// while the index stayed shut.
+fn glep_search(dir: &Path, args: &[&str]) -> (Printed, bool) {
+    let (got, timing) = glep_timed(dir, args);
+    let cached = timing.contains("glep timing: listing_cache_walk")
+        && !timing.contains("glep timing: index_open");
+    (got, cached)
+}
+
+/// `rg ARGS` in `dir` with glep's default output settings (line numbers,
+/// no headings, no color) and rg's path sort, stdin from the null device.
+fn rg_search(dir: &Path, args: &[&str]) -> Printed {
+    let out = std::process::Command::new("rg")
+        .current_dir(dir)
+        .args([
+            "-n",
+            "--no-heading",
+            "--color=never",
+            "--sort",
+            "path",
+            "--no-require-git",
+        ])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("rg run");
+    printed(out)
+}
+
+/// Every PLAN_ALL query, with `extra` after it, prints rg's stdout and
+/// stderr and exits like rg, its files served by the listing cache.
+/// Returns what `q` printed.
+fn assert_plan_all_like_rg(dir: &Path, extra: &[&str], what: &str) -> String {
+    let mut q = String::new();
+    for args in PLAN_ALL {
+        let args = [args, extra].concat();
+        let (got, cached) = glep_search(dir, &args);
+        assert!(cached, "{what} {args:?}: not served by the listing cache");
+        assert_eq!(got, rg_search(dir, &args), "{what} {args:?}");
+        if args[0] == "q" {
+            q = got.0;
+        }
+    }
+    q
+}
+
+/// Every regular file below `dir`, in path order.
+fn files_below(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for entry in fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                dirs.push(entry.path());
+            } else {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `big_fixture` with lines the PLAN_ALL queries tell apart in every
+/// file but the `.gitignore` files (letters, `ab`, two-digit numbers,
+/// empty lines and empty files), the same line in each of the hidden
+/// files and in both files a leaf `.gitignore` decides between, a binary
+/// file (a NUL in its first bytes), a file over the index's size cap and
+/// a UTF-16 one: 51 listed files, enough for the worker pool.
+fn search_fixture(p: &Path) {
+    big_fixture(p);
+    let bodies = [
+        "q ab 42\nplain line\n",
+        "",
+        "x marks the spot 7\nab\nzz 10\n",
+        "a\nb\nc\nd\n",
+        "quiet 99 x\n\nend of file\n",
+        "nothing to see\n123 456\nxq\n",
+    ];
+    for (i, file) in files_below(p).iter().enumerate() {
+        if file.file_name().is_some_and(|n| n != ".gitignore") {
+            fs::write(file, bodies[i % bodies.len()]).unwrap();
+        }
+    }
+    for hidden in [".env", ".github/workflows/ci.yml", "docs/.hidden.md"] {
+        fs::write(p.join(hidden), "q ab 12 x a hidden\n").unwrap();
+    }
+    // Both sides of the leaf `.gitignore` edit the tests make.
+    for uapi in ["include/uapi/notes.txt", "include/uapi/secret.txt"] {
+        fs::write(p.join(uapi), "q ab 12 x a uapi\n").unwrap();
+    }
+    fs::write(p.join("lib/blob.bin"), b"q ab 12 x a\x00binary\nq\n").unwrap();
+    // Files the index never reads for trigrams, so a narrowed query
+    // always searches them: one over the 1 MiB --max-filesize cap, and a
+    // UTF-16 one that rg transcodes.
+    let mut big = Vec::new();
+    for _ in 0..1100 {
+        big.extend_from_slice(b"q ab 12 x a ");
+        big.extend_from_slice(&[b'z'; 987]);
+        big.push(b'\n');
+    }
+    assert!(big.len() > 1 << 20);
+    fs::write(p.join("docs/big.txt"), big).unwrap();
+    let mut utf16 = vec![0xFF, 0xFE];
+    for b in "q ab 12 x a utf16\nzz\n".bytes() {
+        utf16.extend_from_slice(&[b, 0]);
+    }
+    fs::write(p.join("docs/utf16.txt"), utf16).unwrap();
+}
+
+/// `search_fixture`, indexed, with the listing cache built (the first
+/// listing builds it from the index's sweep, and the walk after it may
+/// still reorder what that build recorded).
+fn search_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    search_fixture(dir.path());
+    glep()
+        .arg("index")
+        .current_dir(dir.path())
+        .output()
+        .expect("index");
+    for _ in 0..2 {
+        glep_files(dir.path(), &[]);
+    }
+    assert!(dir.path().join(".glep/dirtree.bin").exists());
+    // blob.bin, big.txt and utf16.txt carry the index's skip flags.
+    let status = glep()
+        .arg("status")
+        .current_dir(dir.path())
+        .output()
+        .expect("status");
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status.contains("skipped (binary/oversized/utf16): 3\n"),
+        "{status}"
+    );
+    dir
+}
+
+/// Write `body` over `file` in place, then give its directory back the
+/// mtime it had, as `touch -r` from a copy of it would: the file set the
+/// cache recorded for the directory still holds, so a listing serves the
+/// directory from the cache.
+fn rewrite_keeping_dir_mtime(file: &Path, body: &[u8]) {
+    let dir = file.parent().unwrap();
+    let mtime = fs::metadata(dir).unwrap().modified().unwrap();
+    fs::write(file, body).unwrap();
+    fs::File::open(dir).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(fs::metadata(dir).unwrap().modified().unwrap(), mtime);
+}
+
+/// Each PLAN_ALL query prints rg's bytes over files the listing cache
+/// serves, after each change to the tree: a file added, deleted and
+/// renamed in a leaf, a text file turned binary and back in place with
+/// its directory's mtime kept (no content flag of the index decides
+/// anything), a file with a NUL past the searcher's first buffer, a leaf
+/// `.gitignore` edited in place with its size kept, and a hidden file
+/// added, with and without --hidden. The root `.gitignore` whitelists the
+/// hidden `.github/` directory throughout, and rg's filters, a reversed
+/// path sort and -j1 apply as they do to the index's files.
+#[test]
+fn plan_all_queries_search_the_cached_listing_like_rg() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let dir = search_tree();
+    let root = dir.path();
+    let q = assert_plan_all_like_rg(root, &[], "unchanged");
+    assert!(q.contains(".github/workflows/ci.yml:1:"), "{q}");
+    assert!(!q.contains(".env") && !q.contains("blob.bin"), "{q}");
+    let (_, timing) = glep_timed(root, &["q"]);
+    assert!(timing.contains("search path pool"), "{timing}");
+    for extra in [
+        &["-g", "*.h"][..],
+        &["-g", "!vendor"],
+        &["-t", "c"],
+        &["--max-depth", "2"],
+        &["--sortr", "path"],
+        &["--sort", "path"],
+        &["-j1"],
+    ] {
+        assert_plan_all_like_rg(root, extra, "filtered");
+    }
+    // glep's --max-filesize only caps what the index stores (README): no
+    // file is left out of a search for its size, through the cache either.
+    let (got, cached) = glep_search(root, &["--max-filesize", "4", "-c", "ab"]);
+    assert!(cached, "--max-filesize: not served by the listing cache");
+    assert_eq!(got, rg_search(root, &["-c", "ab"]));
+
+    let deep = root.join("src/core/deep");
+    fs::write(deep.join("added.c"), "q ab 12 x a added\n").unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a file added in a leaf");
+    assert!(q.contains("src/core/deep/added.c:1:"), "{q}");
+    fs::remove_file(deep.join("a.h")).unwrap();
+    assert_plan_all_like_rg(root, &[], "a file deleted in a leaf");
+    fs::rename(deep.join("added.c"), deep.join("renamed.c")).unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a file renamed in a leaf");
+    assert!(
+        q.contains("src/core/deep/renamed.c:1:") && !q.contains("added.c"),
+        "{q}"
+    );
+
+    let net = root.join("src/net/net.c");
+    let text = fs::read(&net).unwrap();
+    fs::write(&net, "q ab 12 x a net\n").unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a text file");
+    assert!(q.contains("src/net/net.c:1:"), "{q}");
+    // The walk lists src/net from the cache (no directory changed), and
+    // the search reads what the file holds now.
+    let clean = || glep_timed(root, &["q"]).1.contains("(dirty: false)");
+    rewrite_keeping_dir_mtime(&net, b"q ab\x00 12 x a now binary\n");
+    assert!(clean(), "src/net was listed live");
+    let q = assert_plan_all_like_rg(root, &[], "the text file turned binary");
+    assert!(!q.contains("src/net/net.c"), "{q}");
+    rewrite_keeping_dir_mtime(&net, &text);
+    assert!(clean(), "src/net was listed live");
+    assert_plan_all_like_rg(root, &[], "the binary file turned back");
+
+    let mut late = Vec::new();
+    for _ in 0..700 {
+        late.extend_from_slice(b"q ab 12 x a ");
+        late.extend_from_slice(&[b'y'; 88]);
+        late.push(b'\n');
+    }
+    late.extend_from_slice(b"nul\x00here\nq ab 12 x a late\n");
+    assert!(late.len() > 64 * 1024);
+    fs::write(root.join("include/asm/late.h"), &late).unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a NUL past the first buffer");
+    assert!(q.contains("include/asm/late.h:1:"), "{q}");
+
+    let uapi = root.join("include/uapi");
+    assert!(
+        q.contains("include/uapi/notes.txt:1:") && !q.contains("secret.txt"),
+        "{q}"
+    );
+    fs::write(uapi.join(".gitignore"), "notes.txt\n\n").unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a leaf .gitignore edited in place");
+    assert!(
+        q.contains("include/uapi/secret.txt:1:") && !q.contains("notes.txt"),
+        "{q}"
+    );
+
+    fs::write(root.join("src/core/.secret"), "q ab 12 x a secret\n").unwrap();
+    let q = assert_plan_all_like_rg(root, &[], "a hidden file added");
+    assert!(!q.contains(".secret") && !q.contains(".env"), "{q}");
+    let q = assert_plan_all_like_rg(root, &["--hidden"], "a hidden file added");
+    assert!(
+        q.contains("src/core/.secret:1:") && q.contains(".env:1:"),
+        "{q}"
+    );
+}
+
+/// A Plan::All query never opens the index, so it certifies nothing: the
+/// manifest stays byte for byte what it was, and the next narrowed query
+/// still sweeps and finds a file created just before. Within a --ttl the
+/// index answers a Plan::All query without a sweep, as before.
+#[test]
+fn plan_all_queries_leave_the_index_to_the_next_narrowed_query() {
+    if !have_rg() {
+        eprintln!("dircache: rg not installed, skipping");
+        return;
+    }
+    let dir = search_tree();
+    let root = dir.path();
+    let manifest = fs::read(root.join(".glep/manifest.bin")).unwrap();
+    fs::write(root.join("src/core/deep/fresh.c"), "the needle q ab 12\n").unwrap();
+    for args in PLAN_ALL {
+        let (got, cached) = glep_search(root, args);
+        assert!(cached, "{args:?}: not served by the listing cache");
+        assert_eq!(got, rg_search(root, args), "{args:?}");
+        assert_eq!(
+            fs::read(root.join(".glep/manifest.bin")).unwrap(),
+            manifest,
+            "{args:?} wrote the manifest"
+        );
+    }
+    let (got, timing) = glep_timed(root, &["-l", "needle"]);
+    assert!(timing.contains("sweep_walk"), "{timing}");
+    assert_eq!(got.0, "src/core/deep/fresh.c\n");
+    assert_eq!(got, rg_search(root, &["-l", "needle"]));
+    // --ttl is glep's own flag: rg answers the same query without it.
+    let (got, timing) = glep_timed(root, &["--ttl", "600", "-c", "ab"]);
+    assert!(
+        timing.contains("index_open")
+            && !timing.contains("sweep_walk")
+            && !timing.contains("listing_cache"),
+        "{timing}"
+    );
+    assert_eq!(got, rg_search(root, &["-c", "ab"]));
 }

@@ -1,9 +1,12 @@
-//! Directory-mtime pruning cache for file-set queries (`--files`).
+//! Directory-mtime pruning cache for file-set queries (`--files`, and
+//! content queries no trigram narrows).
 //!
-//! A content query needs every file's current (mtime, size) so the
-//! freshness diff can reindex what changed, that costs a full bulk sweep
-//! (~100ms on a kernel-scale tree) and is inherent. A *listing* query only
-//! needs the SET of files to be fresh, and that set only changes via
+//! A content query the index narrows needs every file's current (mtime,
+//! size) so the freshness diff can reindex what changed, that costs a full
+//! bulk sweep (~100ms on a kernel-scale tree) and is inherent. A *listing*
+//! query only needs the SET of files to be fresh, and so does a content
+//! query no trigram narrows (Plan::All), which searches every file of the
+//! set and reads each one's bytes as it is now. That set only changes via
 //! create/delete/rename, each of which bumps the mtime of the directory
 //! whose direct entries changed. Crucially, directory mtimes do NOT
 //! propagate upward (a file created in `a/b/c` bumps `a/b/c`'s mtime and
@@ -57,12 +60,14 @@
 //!
 //! The cache lives in `.glep/dirtree.bin`, is written atomically
 //! (tmp + rename), and is independent of the manifest's trigram postings:
-//! listing queries never touch, update, or write the manifest or
+//! queries it answers never touch, update, or write the manifest or
 //! `postings.bin`. When the cache is missing, stale, or the pruned walk
 //! finds too much churn (more than `RESCAN_BUDGET` live scans), listing
-//! falls back to the ordinary full sweep and rebuilds the cache from it,
-//! so a stale or even corrupt cache can only cost speed, never
-//! correctness. `GLEP_NO_DIRCACHE=1` disables the whole mechanism.
+//! falls back to the ordinary full sweep and rebuilds the cache from it
+//! (a content query falls back to the index path, which leaves the cache
+//! to the next listing), so a stale or even corrupt cache can only cost
+//! speed, never correctness. `GLEP_NO_DIRCACHE=1` disables the whole
+//! mechanism.
 
 // Built and unit-tested on every platform; only the macOS listing path
 // (cli.rs, walk_bulk.rs) uses it.

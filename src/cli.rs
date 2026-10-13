@@ -1756,6 +1756,60 @@ fn plan_case(args: &Args, pattern: &str, fixed: bool) -> plan::Case {
     }
 }
 
+/// A content query's resolved patterns and index plan (`plan_query`).
+struct Query {
+    /// The patterns as one (`resolve_pattern`), and whether the matcher
+    /// takes it as a literal.
+    pattern: String,
+    fixed: bool,
+    /// No -E names an encoding other than UTF-8.
+    utf8_only: bool,
+    case: plan::Case,
+    plan: plan::Plan,
+}
+
+/// Resolve the patterns and choose the index plan, from the flags alone:
+/// nothing here reads the index, so the plan is known before it opens.
+/// Several modes must bypass trigram narrowing (each is sound, just scans
+/// more):
+///  -v        : a file with zero literal occurrences still "matches" all lines
+///  --passthru: non-matching lines of searched files must still print
+///  -c --include-zero : every walked file emits `path:0`
+///  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
+///  -P patterns may use pcre2-only syntax (parse failure means Plan::All)
+///  --pre     : the searched stream is a subprocess's output, not the
+///              file's bytes, so index trigrams can't narrow it.
+///  --files-without-match needs no special plan: narrowed-out files
+///    are listed from the universe without being searched
+fn plan_query(args: &Args) -> anyhow::Result<Query> {
+    let (pattern, fixed) = resolve_pattern(args);
+    let utf8_only = match &args.encoding {
+        Some(label) => {
+            grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?
+                == grep_searcher::Encoding::new("utf-8").unwrap()
+        }
+        None => true,
+    };
+    let case = plan_case(args, &pattern, fixed);
+    let plan = if args.invert_match
+        || args.passthru
+        || (args.count && args.include_zero)
+        || !utf8_only
+        || args.pre.is_some()
+    {
+        plan::Plan::All
+    } else {
+        plan::build(&pattern, fixed, case)
+    };
+    Ok(Query {
+        pattern,
+        fixed,
+        utf8_only,
+        case,
+        plan,
+    })
+}
+
 /// rg's nothing-searched warning: with no path operand, a walk that
 /// yields no file at all (filters ate everything) is an error, exit 2.
 fn report_nothing_searched() {
@@ -1781,6 +1835,10 @@ fn report_nothing_searched() {
 /// subdirectory run) is cheaper through the index's scoped sweep, which
 /// walks only the operands: on a kernel-scale tree `--files` in `rust/`
 /// takes about 14 ms that way, while the cache walks the whole tree.
+///
+/// A content query no trigram narrows searches the cache's listing under
+/// the same conditions (see `search_cached_listing`): the files it
+/// searches, and the order it prints them in, are the listing's.
 #[cfg(target_os = "macos")]
 fn listing_cache_eligible(args: &Args) -> bool {
     sort_is_path_order(args) && args.paths.iter().all(|p| p.as_os_str().is_empty())
@@ -1861,6 +1919,91 @@ where
         );
     }
     Some(CachedListing { files, tree })
+}
+
+/// The listing cache's file set for a run whose every operand is the root
+/// (`listing_cache_eligible`), in path order, once per operand (rg lists
+/// a root named twice twice). rg's filters for the root (-g/--iglob,
+/// -t/-T, --ignore-file, --max-depth and the hidden rule, as
+/// `Filters::select` applies them) and `glob`, the --files glob, all apply
+/// inside the listing, before any path is copied: each rayon job filters
+/// with its own copy of the scope's filters, whose verdict caches are per
+/// copy. None on a cache miss.
+#[cfg(target_os = "macos")]
+fn cached_root_listing(
+    root: &Path,
+    cwd_rel: &Path,
+    scope: &mut Scope,
+    glob: Option<globset::GlobMatcher>,
+    timings: &mut Timings,
+) -> Option<CachedListing> {
+    scope.filters.begin_operand(Path::new(""));
+    let rescue = scope.filters.may_keep_hidden(Path::new(""));
+    let template = &scope.filters;
+    let keep = |flt: &mut filters::Filters, m: &crate::walk::FileMeta| -> bool {
+        (rescue || !m.hidden)
+            && glob
+                .as_ref()
+                .is_none_or(|g| g.is_match(&*search::display_rel(&m.path, cwd_rel)))
+            && flt.keep(&m.path, m.hidden)
+    };
+    let mut listing =
+        listing_via_cache(root, &root.join(".glep"), || template.fork(), keep, timings)?;
+    if scope.operands.len() > 1 {
+        let once = listing.files.clone();
+        for _ in 1..scope.operands.len() {
+            listing.files.extend_from_slice(&once);
+        }
+    }
+    Some(listing)
+}
+
+/// A root-wide content query whose plan no trigram narrows (Plan::All; see
+/// `run` for when it comes here), searched over the listing cache's file
+/// set. The index would hand back every file it holds, after the full
+/// freshness sweep that makes sure of them; the cache lists the same set
+/// (its listings are the index's, as --files compares them), filtered as
+/// the scope selects from the index's (`cached_root_listing`). glep's
+/// --max-filesize only caps what the index stores, so no file is left out
+/// for its size. Every listed file is searched, binary ones included, as
+/// `run_live` searches its walk: the searcher's binary detection decides
+/// what they print, and no content flag of the index is read that could
+/// be stale. Nothing here opens, sweeps or writes the index, so its
+/// manifest and sweep epoch stay as they were and the next narrowed query
+/// sweeps as before. None on a cache miss, before anything is printed.
+#[cfg(target_os = "macos")]
+fn search_cached_listing(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    query: &Query,
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<Option<i32>> {
+    let Some(CachedListing { mut files, tree }) =
+        cached_root_listing(root, cwd_rel, scope, None, timings)
+    else {
+        return Ok(None);
+    };
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    timings.stage("candidates");
+    // Nothing narrowed the selection, so an empty one searched nothing.
+    let nothing_searched = scope.implicit && files.is_empty();
+    if nothing_searched {
+        report_nothing_searched();
+    }
+    let mut opts = search_opts(args, cwd_rel);
+    opts.fixed = query.fixed;
+    let mut out = search::StdoutOut;
+    let found = search::run(&query.pattern, root, &files, None, &opts, &mut out)?;
+    timings.stage("search");
+    timings.finish();
+    // The process exits right after this returns: the file list and the
+    // loaded tree are left to the exit, as in the --files cache branch.
+    std::mem::forget(files);
+    std::mem::forget(tree);
+    Ok(Some(exit_code(args, had_error || nothing_searched, found)))
 }
 
 /// Debug builds only, for tests: when the environment variable `var`
@@ -2392,40 +2535,10 @@ pub fn run() -> anyhow::Result<i32> {
     // lives in the discovered index dir, so GLEP_INDEX_PATH shares it.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
-        // Every operand is the root (`listing_cache_eligible`), so rg's
-        // filters for it (-g/--iglob, -t/-T, --ignore-file, --max-depth
-        // and the hidden rule, as `Filters::select` applies them) and the
-        // --files glob all apply inside the listing, before any path is
-        // copied: each rayon job filters with its own copy of the scope's
-        // filters, whose verdict caches are per copy.
-        let glob_matcher = files_glob(&args)?;
-        let glob_cwd = cwd_rel.clone();
-        scope.filters.begin_operand(Path::new(""));
-        let rescue = scope.filters.may_keep_hidden(Path::new(""));
-        let template = &scope.filters;
-        let keep = |flt: &mut filters::Filters, m: &crate::walk::FileMeta| -> bool {
-            (rescue || !m.hidden)
-                && glob_matcher
-                    .as_ref()
-                    .is_none_or(|g| g.is_match(&*search::display_rel(&m.path, &glob_cwd)))
-                && flt.keep(&m.path, m.hidden)
-        };
-        if let Some(listing) = listing_via_cache(
-            &root,
-            &root.join(".glep"),
-            || template.fork(),
-            keep,
-            &mut timings,
-        ) {
+        let glob = files_glob(&args)?;
+        if let Some(listing) = cached_root_listing(&root, &cwd_rel, &mut scope, glob, &mut timings)
+        {
             let CachedListing { mut files, tree } = listing;
-            // The root named more than once lists every file once per
-            // operand, as in rg.
-            if scope.operands.len() > 1 {
-                let once = files.clone();
-                for _ in 1..scope.operands.len() {
-                    files.extend_from_slice(&once);
-                }
-            }
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
@@ -2459,6 +2572,45 @@ pub fn run() -> anyhow::Result<i32> {
                     &mut timings,
                     had_error,
                 );
+            }
+        }
+    }
+
+    // A content query resolves its patterns and chooses its index plan
+    // now, before the index opens: none of that reads the index. A plan no
+    // trigram narrows (Plan::All) gets nothing from the index but its file
+    // set, which a full freshness sweep has to refresh first. A root-wide
+    // one on macOS searches the listing cache's file set instead, which
+    // the cache's pruned walk lists for a fraction of that sweep (see
+    // `search_cached_listing`), unless --ttl is given: within its window
+    // the index answers without a sweep, faster still. On a cache miss the
+    // index answers as before. On a tree with no index yet the query
+    // searches a live walk, as --no-index does, and builds nothing: the
+    // first narrowed query builds the index.
+    let query = if args.files {
+        None
+    } else {
+        Some(plan_query(&args)?)
+    };
+    if let Some(q) = &query {
+        timings.stage("plan");
+        if q.plan == plan::Plan::All {
+            #[cfg(target_os = "macos")]
+            if listing_cache_eligible(&args) && args.ttl == 0 {
+                if let Some(code) = search_cached_listing(
+                    &root,
+                    &cwd_rel,
+                    &args,
+                    &mut scope,
+                    q,
+                    &mut timings,
+                    had_error,
+                )? {
+                    return Ok(code);
+                }
+            }
+            if !root.join(".glep/manifest.bin").exists() {
+                return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
             }
         }
     }
@@ -2598,38 +2750,18 @@ pub fn run() -> anyhow::Result<i32> {
         return Ok(exit_code(&args, had_error, !files.is_empty()));
     }
 
-    let (pattern, effective_fixed) = resolve_pattern(&args);
-
-    // Plan selection: several modes must bypass trigram narrowing
-    // (each is sound, just scans more):
-    //  -v        : a file with zero literal occurrences still "matches" all lines
-    //  --passthru: non-matching lines of searched files must still print
-    //  -c --include-zero : every walked file emits `path:0`
-    //  -E non-utf8: index trigrams index raw bytes; decoded matches can't narrow
-    //  -P patterns may use pcre2-only syntax (parse failure means Plan::All)
-    //  --pre     : the searched stream is a subprocess's output, not the
-    //              file's bytes, so index trigrams can't narrow it.
-    //  --files-without-match needs no special plan: narrowed-out files
-    //    are listed from the universe without being searched
-    let utf8_only = match &args.encoding {
-        Some(label) => {
-            grep_searcher::Encoding::new(label).map_err(|e| anyhow::anyhow!("{label}: {e}"))?
-                == grep_searcher::Encoding::new("utf-8").unwrap()
-        }
-        None => true,
+    // Every --files run returned above: this is the content query planned
+    // before the index opened.
+    let Some(Query {
+        pattern,
+        fixed: effective_fixed,
+        utf8_only,
+        case: plan_case,
+        plan: query_plan,
+    }) = query
+    else {
+        unreachable!("a content query is planned before the index opens");
     };
-    let plan_case = plan_case(&args, &pattern, effective_fixed);
-    let query_plan = if args.invert_match
-        || args.passthru
-        || (args.count && args.include_zero)
-        || !utf8_only
-        || args.pre.is_some()
-    {
-        crate::plan::Plan::All
-    } else {
-        plan::build(&pattern, effective_fixed, plan_case)
-    };
-    timings.stage("plan");
 
     // Binary-flagged files are candidates only when the mode can surface
     // them: -a/--binary, --null-data (NUL is a separator, not binary),
@@ -2853,6 +2985,66 @@ mod tests {
                 "{junk:?}"
             );
         }
+    }
+
+    /// `args` parsed as `run` parses them, patterns resolved.
+    fn parsed(args: &[&str]) -> Args {
+        use clap::FromArgMatches;
+        let matches = command()
+            .try_get_matches_from(std::iter::once("glep").chain(args.iter().copied()))
+            .unwrap();
+        let mut a = Args::from_arg_matches(&matches).unwrap();
+        resolve_flag_families(&mut a, &matches).unwrap();
+        a.pattern_set = pattern_list(&a).unwrap();
+        a
+    }
+
+    /// The plan comes from the flags and patterns alone, so `run` knows
+    /// it before the index opens: no trigram narrows a letter, a
+    /// two-letter literal, `.*`, `\w+` or `[0-9]{2}`, nor any pattern
+    /// under -v, --passthru, -c --include-zero, a non-UTF-8 -E or --pre,
+    /// nor an alternation with such an arm. A three-letter literal
+    /// narrows, also under -c, -l, --files-without-match, -i and -E
+    /// utf-8.
+    #[test]
+    fn plan_query_decides_from_the_flags_alone() {
+        for args in [
+            &["q"][..],
+            &["-c", "ab"],
+            &["-c", ".*"],
+            &["\\w+"],
+            &["-c", "[0-9]{2}"],
+            &["--files-without-match", ".*"],
+            &["-v", "-c", "hello"],
+            &["--passthru", "hello"],
+            &["-c", "--include-zero", "hello"],
+            &["-E", "utf-16le", "hello"],
+            &["--pre", "cat", "hello"],
+            &["-e", "hello", "-e", "q"],
+        ] {
+            let q = plan_query(&parsed(args)).unwrap();
+            assert_eq!(q.plan, plan::Plan::All, "{args:?}");
+        }
+        for args in [
+            &["hello"][..],
+            &["-c", "hello"],
+            &["-l", "hello"],
+            &["--files-without-match", "hello"],
+            &["-i", "HELLO"],
+            &["-E", "utf-8", "hello"],
+            &["-e", "hello", "-e", "world"],
+        ] {
+            let q = plan_query(&parsed(args)).unwrap();
+            assert!(matches!(q.plan, plan::Plan::Groups(_)), "{args:?}");
+        }
+        let q = plan_query(&parsed(&["-F", "a.b"])).unwrap();
+        assert!(q.fixed && q.utf8_only && q.pattern == "a.b");
+        assert_eq!(q.case, plan::Case::Sensitive);
+        let q = plan_query(&parsed(&["-F", "-i", "-e", "a.b", "-e", "c"])).unwrap();
+        assert!(!q.fixed, "a union of literals is a regex");
+        assert_eq!(q.case, plan::Case::Unicode);
+        let q = plan_query(&parsed(&["-E", "utf-16le", "x"])).unwrap();
+        assert!(!q.utf8_only);
     }
 
     #[test]
