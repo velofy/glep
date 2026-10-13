@@ -9,14 +9,51 @@ pub enum Plan {
     All,
 }
 
-fn trigrams_of(lit: &[u8]) -> Option<Vec<u32>> {
-    if lit.len() < 3 {
-        return None;
+/// How the matcher compares letters, which decides the trigrams of a
+/// required literal that the index can look up (`Index::postings_for`
+/// looks a trigram up as is, or, case-insensitively, as every ASCII case
+/// variant of it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Case {
+    /// Byte for byte: every trigram is looked up as is.
+    Sensitive,
+    /// ASCII case folding only (--no-unicode): the ASCII variants of an
+    /// all-ASCII trigram cover every match of it.
+    Ascii,
+    /// Unicode simple case folding, both engines' -i (and -S) in their
+    /// default Unicode mode. ASCII letters fold among themselves except
+    /// two: `k`/`K` also match KELVIN SIGN (U+212A) and `s`/`S` LONG S
+    /// (U+017F), multibyte characters no ASCII variant covers, so a
+    /// trigram holding one of them, or any non-ASCII byte, cannot be
+    /// looked up.
+    Unicode,
+}
+
+impl Case {
+    /// Whether lookups use the ASCII case variants of each trigram.
+    pub fn insensitive(self) -> bool {
+        self != Case::Sensitive
     }
-    let mut tris: Vec<u32> = lit.windows(3).map(trigram::pack).collect();
-    tris.sort_unstable();
-    tris.dedup();
-    Some(tris)
+
+    /// Whether every match of the literal bytes `t` contains one of the
+    /// index's lookups for them.
+    fn covers(self, t: &[u8]) -> bool {
+        match self {
+            Case::Sensitive => true,
+            Case::Ascii => t.is_ascii(),
+            Case::Unicode => t
+                .iter()
+                .all(|b| b.is_ascii() && !matches!(b, b'k' | b'K' | b's' | b'S')),
+        }
+    }
+}
+
+/// The trigrams of a required literal the index can look up under `case`.
+fn trigrams_of(lit: &[u8], case: Case) -> Vec<u32> {
+    lit.windows(3)
+        .filter(|w| case.covers(w))
+        .map(trigram::pack)
+        .collect()
 }
 
 /// A piece of a required-literal group. `Lit` carries a substring that
@@ -177,15 +214,14 @@ fn req(hir: &regex_syntax::hir::Hir) -> Dnf {
 }
 
 /// Turn a requirement group into trigrams; None when the group is
-/// vacuous (no literal ≥3 bytes), which must fail the whole plan to All
-/// because that alternative constrains nothing.
-fn group_trigrams(group: &[Piece]) -> Option<Vec<u32>> {
+/// vacuous (no literal holds a trigram the index can look up under
+/// `case`), which must fail the whole plan to All because that
+/// alternative constrains nothing.
+fn group_trigrams(group: &[Piece], case: Case) -> Option<Vec<u32>> {
     let mut tris = Vec::new();
     for p in group {
         if let Piece::Lit { s, .. } = p {
-            if let Some(t) = trigrams_of(s) {
-                tris.extend(t);
-            }
+            tris.extend(trigrams_of(s, case));
         }
     }
     if tris.is_empty() {
@@ -196,7 +232,11 @@ fn group_trigrams(group: &[Piece]) -> Option<Vec<u32>> {
     Some(tris)
 }
 
-pub fn build(pattern: &str, fixed: bool, case_insensitive: bool) -> Plan {
+/// The index plan for `pattern`. The required literals come from the
+/// pattern as written; under a case-insensitive `case` each literal
+/// character matches its case-fold partners too, so only the trigrams
+/// whose every match `case` covers are kept (see `Case`).
+pub fn build(pattern: &str, fixed: bool, case: Case) -> Plan {
     let dnf: Dnf = if fixed {
         lit(pattern.as_bytes().to_vec())
     } else {
@@ -207,25 +247,9 @@ pub fn build(pattern: &str, fixed: bool, case_insensitive: bool) -> Plan {
         req(&hir)
     };
 
-    // Literal bytes seen for the non-ASCII guard.
-    let literals: Vec<&[u8]> = dnf
-        .iter()
-        .flat_map(|g| g.iter())
-        .filter_map(|p| match p {
-            Piece::Lit { s, .. } => Some(&s[..]),
-            _ => None,
-        })
-        .collect();
-
-    // ASCII case variants cannot cover Unicode case folding; with -i and
-    // any non-ASCII literal byte, only a full scan is sound.
-    if case_insensitive && literals.iter().any(|l| l.iter().any(|&b| b >= 0x80)) {
-        return Plan::All;
-    }
-
     let mut groups = Vec::with_capacity(dnf.len());
     for g in &dnf {
-        match group_trigrams(g) {
+        match group_trigrams(g, case) {
             Some(t) => groups.push(t),
             None => return Plan::All,
         }
@@ -247,7 +271,7 @@ mod tests {
 
     #[test]
     fn fixed_string_is_single_and_group() {
-        match build("hello", true, false) {
+        match build("hello", true, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 1);
                 assert!(g[0].contains(&pack(b"hel")));
@@ -259,7 +283,7 @@ mod tests {
 
     #[test]
     fn literal_regex_extracts_trigrams() {
-        match build("fn main", false, false) {
+        match build("fn main", false, Case::Sensitive) {
             Plan::Groups(g) => assert!(g[0].contains(&pack(b"mai"))),
             Plan::All => panic!("expected groups"),
         }
@@ -267,7 +291,7 @@ mod tests {
 
     #[test]
     fn alternation_yields_or_groups() {
-        match build("foobar|bazqux", false, false) {
+        match build("foobar|bazqux", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 2);
                 assert!(g[0].contains(&pack(b"foo")) || g[1].contains(&pack(b"foo")));
@@ -278,20 +302,20 @@ mod tests {
 
     #[test]
     fn unnarrowing_patterns_are_all() {
-        assert!(matches!(build(".*", false, false), Plan::All));
-        assert!(matches!(build("a", false, false), Plan::All));
-        assert!(matches!(build("ab", true, false), Plan::All));
+        assert!(matches!(build(".*", false, Case::Sensitive), Plan::All));
+        assert!(matches!(build("a", false, Case::Sensitive), Plan::All));
+        assert!(matches!(build("ab", true, Case::Sensitive), Plan::All));
         // unparseable: fall back
-        assert!(matches!(build("[", false, false), Plan::All));
+        assert!(matches!(build("[", false, Case::Sensitive), Plan::All));
         // `x?yz`: yz is required but too short for trigrams, so vacuous.
-        assert!(matches!(build("x?yz", false, false), Plan::All));
+        assert!(matches!(build("x?yz", false, Case::Sensitive), Plan::All));
     }
 
     #[test]
     fn anything_arm_still_contributes_required_tail() {
         // `(foo|.*)bar`: every match ends in bar regardless of the arm, so
         // narrowing on `bar` is sound.
-        match build("(foo|.*)bar", false, false) {
+        match build("(foo|.*)bar", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert!(g.iter().any(|grp| grp.contains(&pack(b"bar"))));
             }
@@ -301,7 +325,7 @@ mod tests {
 
     #[test]
     fn prefix_of_wildcard_pattern_still_narrows() {
-        match build("needle.*", false, false) {
+        match build("needle.*", false, Case::Sensitive) {
             Plan::Groups(g) => assert!(g[0].contains(&pack(b"nee"))),
             Plan::All => panic!("expected groups"),
         }
@@ -310,7 +334,7 @@ mod tests {
     #[test]
     fn literal_after_unexpandable_part_still_narrows() {
         // `-foo` is required even though the digit run is too big to expand.
-        match build("[0-9][0-9][0-9]-foo", false, false) {
+        match build("[0-9][0-9][0-9]-foo", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 1);
                 assert!(g[0].contains(&pack(b"-fo")));
@@ -323,7 +347,7 @@ mod tests {
     fn literals_split_across_boundary_both_required() {
         // `abc\w+def`: every match contains abc AND def: one group, both lit
         // sets (stronger than keeping only the prefix).
-        match build("abc\\w+def", false, false) {
+        match build("abc\\w+def", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 1);
                 assert!(g[0].contains(&pack(b"abc")));
@@ -335,7 +359,7 @@ mod tests {
 
     #[test]
     fn alternation_inside_concat_fuses_variants() {
-        match build("a[bc]d", false, false) {
+        match build("a[bc]d", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert_eq!(g.len(), 2);
                 // fused full strings abd / acd
@@ -350,7 +374,7 @@ mod tests {
     fn repetition_min_fuses_left_not_right() {
         // x(ab)+y: "xab" is required but "aby" is not (the repetition may
         // repeat before y).
-        match build("x(ab)+y", false, false) {
+        match build("x(ab)+y", false, Case::Sensitive) {
             Plan::Groups(g) => {
                 assert!(g[0].contains(&pack(b"xab")));
                 assert!(!g[0].contains(&pack(b"aby")));
@@ -359,13 +383,82 @@ mod tests {
         }
     }
 
+    /// Under Unicode case folding a literal's ASCII trigrams still narrow
+    /// (an ASCII character other than k and s folds only to its ASCII
+    /// case partner); trigrams with a non-ASCII byte are dropped.
     #[test]
-    fn unicode_case_insensitive_falls_back_to_all() {
-        assert!(matches!(build("caf\u{e9}", false, true), Plan::All));
-        assert!(matches!(build("caf\u{e9}", true, true), Plan::All));
-        match build("caf\u{e9}", false, false) {
+    fn unicode_case_insensitive_keeps_only_ascii_trigrams() {
+        for fixed in [false, true] {
+            match build("caf\u{e9}", fixed, Case::Unicode) {
+                Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"caf")]]),
+                Plan::All => panic!("the ASCII trigram should still narrow"),
+            }
+        }
+        assert!(matches!(
+            build("\u{e9}t\u{e9}", false, Case::Unicode),
+            Plan::All
+        ));
+        match build("caf\u{e9}", false, Case::Sensitive) {
             Plan::Groups(_) => {}
             Plan::All => panic!("case-sensitive non-ASCII should still narrow"),
+        }
+    }
+
+    /// `k` and `s` also match KELVIN SIGN and LONG S under Unicode case
+    /// folding, which no ASCII case variant covers, so their trigrams
+    /// never narrow a case-insensitive Unicode search. ASCII-only folding
+    /// (--no-unicode) and case-sensitive searches keep them.
+    #[test]
+    fn unicode_case_insensitive_drops_k_and_s_trigrams() {
+        match build("kfree", false, Case::Unicode) {
+            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"fre"), pack(b"ree")]]),
+            Plan::All => panic!("expected groups"),
+        }
+        match build("KFREE", true, Case::Unicode) {
+            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"FRE"), pack(b"REE")]]),
+            Plan::All => panic!("expected groups"),
+        }
+        match build("mismatch", false, Case::Unicode) {
+            Plan::Groups(g) => assert_eq!(g, vec![vec![pack(b"atc"), pack(b"mat"), pack(b"tch")]]),
+            Plan::All => panic!("expected groups"),
+        }
+        // Every trigram holds a k or an s: nothing is left to narrow on.
+        assert!(matches!(build("kiss", false, Case::Unicode), Plan::All));
+        for case in [Case::Ascii, Case::Sensitive] {
+            match build("kfree", false, case) {
+                Plan::Groups(g) => assert!(g[0].contains(&pack(b"kfr"))),
+                Plan::All => panic!("expected groups"),
+            }
+        }
+    }
+
+    /// `Case::Unicode` matches the regex engine in use: under its simple
+    /// case folding the only non-ASCII characters equivalent to an ASCII
+    /// letter are KELVIN SIGN (k) and LONG S (s).
+    #[test]
+    fn only_k_and_s_have_non_ascii_fold_partners() {
+        use regex_syntax::hir::{Class, HirKind};
+        for c in (b'a'..=b'z').chain(b'A'..=b'Z') {
+            let hir = regex_syntax::ParserBuilder::new()
+                .case_insensitive(true)
+                .build()
+                .parse(&(c as char).to_string())
+                .unwrap();
+            let HirKind::Class(Class::Unicode(cls)) = hir.kind() else {
+                panic!("{}: not a class: {hir:?}", c as char);
+            };
+            let non_ascii: Vec<char> = cls
+                .iter()
+                .flat_map(|r| r.start()..=r.end())
+                .filter(|ch| !ch.is_ascii())
+                .collect();
+            let expect: &[char] = match c.to_ascii_lowercase() {
+                b'k' => &['\u{212A}'],
+                b's' => &['\u{17F}'],
+                _ => &[],
+            };
+            assert_eq!(non_ascii, expect, "{}", c as char);
+            assert_eq!(Case::Unicode.covers(&[c, b'x', b'y']), expect.is_empty());
         }
     }
 }

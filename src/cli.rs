@@ -1423,6 +1423,22 @@ fn run_live(
     Ok(exit_code(args, had_error || nothing_searched, found))
 }
 
+/// How the matcher will compare letters, for the index plan. -S always
+/// plans case-insensitively (a safe superset when the pattern's capitals
+/// make the search case-sensitive). Both engines fold with Unicode's
+/// tables unless --no-unicode, and even then a pattern can turn Unicode
+/// back on inline (`(?u)`, PCRE2's `(*UTF)`), so only a pattern without
+/// inline flags gets ASCII-only folding.
+fn plan_case(args: &Args, pattern: &str, fixed: bool) -> plan::Case {
+    if !(args.ignore_case || args.smart_case) {
+        plan::Case::Sensitive
+    } else if args.no_unicode && (fixed || !(pattern.contains("(?") || pattern.contains("(*"))) {
+        plan::Case::Ascii
+    } else {
+        plan::Case::Unicode
+    }
+}
+
 /// rg's nothing-searched warning: with no path operand, a walk that
 /// yields no file at all (filters ate everything) is an error, exit 2.
 fn report_nothing_searched() {
@@ -2146,7 +2162,7 @@ pub fn run() -> anyhow::Result<i32> {
         }
         None => true,
     };
-    let plan_ic = args.ignore_case || args.smart_case;
+    let plan_case = plan_case(&args, &pattern, effective_fixed);
     let query_plan = if args.invert_match
         || args.passthru
         || (args.count && args.include_zero)
@@ -2155,7 +2171,7 @@ pub fn run() -> anyhow::Result<i32> {
     {
         crate::plan::Plan::All
     } else {
-        plan::build(&pattern, effective_fixed, plan_ic)
+        plan::build(&pattern, effective_fixed, plan_case)
     };
     timings.stage("plan");
 
@@ -2167,8 +2183,12 @@ pub fn run() -> anyhow::Result<i32> {
     // they stay out.
     let search_binary =
         args.text || args.binary || args.null_data || !utf8_only || args.pre.is_some();
-    let (mut plain, mut hidden) =
-        idx.candidates_split(&query_plan, plan_ic, args.hidden, search_binary);
+    let (mut plain, mut hidden) = idx.candidates_split(
+        &query_plan,
+        plan_case.insensitive(),
+        args.hidden,
+        search_binary,
+    );
     if args.search_zip {
         let (zip_plain, zip_hidden) = idx.zip_candidates_split(args.hidden);
         merge_extra(&mut plain, zip_plain);

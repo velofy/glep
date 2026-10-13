@@ -938,6 +938,47 @@ fn matcher_config_matches_rg() {
     check_cases(pool.path(), "pool", cases);
 }
 
+/// Under Unicode case folding (rg's -i and -S), ASCII `k` and `s` also
+/// match KELVIN SIGN (U+212A) and LONG S (U+017F). The index narrows a
+/// case-insensitive search with the ASCII case variants of each trigram,
+/// which never cover those two, so kelvin.txt and longs.txt are found
+/// only when trigrams holding a k or an s do not narrow. Other ASCII
+/// trigrams still narrow, next to non-ASCII text too (cafe.txt).
+#[test]
+fn unicode_case_folding_matches_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("kelvin.txt"), "\u{212A}free here\n").unwrap();
+    std::fs::write(d.join("longs.txt"), "mi\u{17F}match long s\n").unwrap();
+    std::fs::write(d.join("plain.txt"), "plain kfree and mismatch\n").unwrap();
+    std::fs::write(d.join("cafe.txt"), "caf\u{e9} au lait\nCAF\u{c9} AU LAIT\n").unwrap();
+    std::fs::write(d.join("other.txt"), "nothing to see\n").unwrap();
+    let cases: &[&[&str]] = &[
+        &["-i", "kfree"],
+        &["-S", "kfree"],
+        &["-i", "-F", "KFREE"],
+        &["-i", "-w", "kfree"],
+        &["-i", "-l", "-e", "kfree", "-e", "zz_absent_zz"],
+        &["-i", "mismatch"],
+        &["-S", "-c", "mismatch"],
+        &["-S", "-l", "KFREE"],
+        &["-i", "-c", "caf\u{e9}"],
+        &["-i", "-F", "-c", "CAF\u{c9}"],
+        &["--no-unicode", "-i", "-l", "kfree"],
+        &["--no-unicode", "-i", "-l", "(?u)kfree"],
+        &["-l", "(?i)kfree"],
+    ];
+    check_cases(d, "fold", cases);
+    if rg_has_pcre2() {
+        let pcre2: &[&[&str]] = &[&["-P", "-i", "kfree"], &["-P", "-i", "-l", "mismatch"]];
+        check_cases(d, "fold pcre2", pcre2);
+    }
+}
+
 /// rg reports whether it was built with PCRE2: `rg --pcre2-version` exits
 /// 0 only then (`cargo install ripgrep` leaves it out unless
 /// `--features pcre2`).
