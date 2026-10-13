@@ -301,6 +301,13 @@ impl DirTree {
 /// such an `.ignore`/`.rgignore` with a zero mtime, and such a
 /// fingerprint source as unknown, which no later stat matches (see the
 /// module docs).
+/// How far before a sweep's start an mtime is still treated as possibly
+/// written during that sweep. Filesystem timestamps are coarser than the
+/// clock that stamps the sweep start: Linux uses a coarse kernel clock that
+/// can lag by a tick, and HFS+ and FAT store whole seconds (FAT rounds to
+/// two). Distrusting a little too much only costs a rescan next time.
+pub const RACY_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn build_from_listing(
     root: &Path,
     listing: &[FileMeta],
@@ -308,10 +315,15 @@ pub fn build_from_listing(
     sweep_started: std::time::SystemTime,
 ) -> DirTree {
     let started_ns = sweep_started
+        .checked_sub(RACY_SLACK)
+        .unwrap_or(std::time::UNIX_EPOCH)
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    // An mtime from the sweep's start on may postdate what the sweep
-    // read. Zero is no mtime at all (a missing source, or none reported).
+    // An mtime from shortly before the sweep's start on may postdate what
+    // the sweep read: file timestamps come from a coarse clock (a kernel
+    // tick behind the precise clock on Linux, whole seconds on HFS+ and
+    // FAT), so RACY_SLACK widens the window. Zero is no mtime at all (a
+    // missing source, or none reported).
     let racy = |mtime_ns: u128| mtime_ns != 0 && mtime_ns >= started_ns;
     for src in &mut fingerprint {
         if racy(src.mtime_ns) {
@@ -659,5 +671,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(cache_path(dir.path()), b"not a dirtree").unwrap();
         assert!(DirTree::load(dir.path()).is_none());
+    }
+
+    /// A filesystem clock that lags the sweep clock (Linux's coarse kernel
+    /// time, HFS+ whole seconds) can stamp a directory changed during the
+    /// sweep slightly before the sweep's start. The build must still
+    /// distrust it.
+    #[cfg(unix)]
+    #[test]
+    fn build_distrusts_mtimes_just_before_the_sweep_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::create_dir(p.join("lagged")).unwrap();
+        std::fs::create_dir(p.join("old")).unwrap();
+        std::fs::write(p.join("lagged/a.txt"), "x\n").unwrap();
+        std::fs::write(p.join("old/b.txt"), "x\n").unwrap();
+        let started = SystemTime::now();
+        set_mtime(&p.join("lagged"), started - Duration::from_millis(5));
+        set_mtime(&p.join("old"), started - Duration::from_secs(3600));
+        set_mtime(p, started - Duration::from_secs(3600));
+        let listing: Vec<FileMeta> = ["lagged/a.txt", "old/b.txt"]
+            .into_iter()
+            .map(meta)
+            .collect();
+        let tree = build_from_listing(p, &listing, Vec::new(), started);
+        let child = |name: &str| {
+            tree.root
+                .subdirs
+                .iter()
+                .find(|c| c.rel == std::path::Path::new(name))
+                .unwrap_or_else(|| panic!("no child {name}"))
+        };
+        assert_eq!(
+            child("lagged").mtime_ns,
+            0,
+            "a lagged mtime must be distrusted"
+        );
+        assert_ne!(child("old").mtime_ns, 0, "an old mtime stays trusted");
     }
 }

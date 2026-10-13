@@ -324,6 +324,37 @@ fn only_root_wide_listings_use_the_cache() {
     }
 }
 
+/// Set every file's and directory's mtime under `root` (and `root`'s own)
+/// an hour back, so nothing in a fresh fixture looks written during the
+/// sweep that builds the listing cache.
+fn age_tree(root: &Path) {
+    let hour_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
+    let mut stack = vec![root.to_path_buf()];
+    let mut dirs = Vec::new();
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let path = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(path);
+            } else {
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(hour_ago)
+                    .unwrap();
+            }
+        }
+        dirs.push(d);
+    }
+    // Directories last, deepest first, so setting a child's mtime cannot
+    // disturb a parent that was already aged.
+    for d in dirs.iter().rev() {
+        fs::File::open(d).unwrap().set_modified(hour_ago).unwrap();
+    }
+}
+
 /// Whether `--files` in `dir` was answered by the listing cache.
 fn uses_cache(dir: &Path) -> bool {
     let out = glep()
@@ -343,11 +374,19 @@ fn leaf_dot_ignore_edit_is_seen(name: &str) {
     let dir = tempfile::tempdir().unwrap();
     base_fixture(dir.path());
     fs::write(dir.path().join("z").join(name), "y.rs\n").unwrap();
+    // The cache distrusts any mtime from about two seconds before its
+    // sweep on (dircache::RACY_SLACK), so a fixture written just now would
+    // make the leaf look racy and be listed live. Age the fixture so the
+    // leaf is servable from the cache, as an untouched tree would be.
+    age_tree(dir.path());
     glep()
         .arg("index")
         .current_dir(dir.path())
         .output()
         .expect("index");
+    // Indexing just wrote under the root; wait out the racy window so the
+    // cache built by the next listing trusts what it saw.
+    std::thread::sleep(std::time::Duration::from_millis(2200));
     warm(dir.path());
     assert!(uses_cache(dir.path()), "{name}: cache not used");
     let before = cached_listing(dir.path(), &[]);
