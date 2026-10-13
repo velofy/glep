@@ -170,196 +170,231 @@ fn rg_out(dir: &Path, args: &[&str]) -> (String, i32) {
     )
 }
 
+/// The core rg parity cases, run over both corpora below.
+const BASE_CASES: &[&[&str]] = &[
+    &["hello"],
+    &["-i", "HELLO"],
+    &["-F", "hello world"],
+    &["foo|goodbye"],
+    &["^use "],
+    &["hel.o"],
+    &["a"], // falls back to All: still must match rg
+    &["-l", "hello"],
+    &["-C", "1", "answer"],
+    &["zz_no_match_zz"],
+    &["-i", "caf\u{e9}"],
+    &["-C", "1", "hello"],
+    &["-A", "1", "hello"],
+    &["-B", "1", "answer"],
+    &["-c", "hello"],
+    &["-c", "-i", "HELLO"],
+    &["-c", "-C", "1", "hello"],
+    &["-U", "goodbye\\nfoo"],
+    &["-U", "-c", "a.b\\nc.d"],
+    // Hidden files invisible by default in both tools.
+    &["hiddentoken"],
+    // --hidden reveals them. The corpus has no .git dir, so plain
+    // `rg --hidden` (the rg_out helper's flags, no special-casing)
+    // matches glep's semantics exactly here; the divergence noted in
+    // README (.git always excluded from glep, not from rg --hidden) is
+    // a deliberate one this corpus does not exercise.
+    &["--hidden", "hiddentoken"],
+    // --no-ignore: skipme.log (gitignored) and skipme2.txt (.ignore'd)
+    // both carry "hello", invisible by default (see the plain "hello"
+    // case above, which the corpus fixture comment confirms excludes
+    // them) and visible once ignore sources are bypassed. Still hidden
+    // by default: no dotfile in the corpus contains "hello", so this
+    // case alone wouldn't catch a hidden-gating regression, but the
+    // dedicated tests/cli.rs cases do.
+    &["--no-ignore", "hello"],
+    &["--no-ignore", "-l", "hello"],
+    // Binary files: default quit detection suppresses them entirely
+    // (even a match before the NUL); --binary reports the notice;
+    // -a prints raw bytes. -c/-l under --binary report real results.
+    &["binary"],
+    &["--binary", "binary"],
+    &["--binary", "-l", "binary"],
+    &["--binary", "-c", "binary"],
+    &["-a", "binary"],
+    &["-a", "-c", "binary"],
+    &["-a", "-l", "binary"],
+    &["match"],
+    &["--binary", "match"],
+    &["-a", "match"],
+    // Last-wins pair: -a --binary behaves as --binary.
+    &["-a", "--binary", "binary"],
+    &["--binary", "-a", "binary"],
+    // --files listing under --no-ignore: rg ignores -n/--no-heading/
+    // --color for --files (verified manually against real rg), and
+    // --sort path still applies, so the harness's fixed rg flag set
+    // composes cleanly with --files --no-ignore for both tools.
+    &["--no-ignore", "--files"],
+    // Whitelist rescue: whitelisted dotfiles are searched and listed;
+    // `nopetoken` is ignored (not merely hidden) so nothing shows it.
+    &["--files"],
+    &["keeptoken"],
+    &["wdirtoken"],
+    &["nopetoken"],
+    &["--hidden", "nopetoken"],
+    &["-l", "keeptoken"],
+    // Output plumbing: column/byte-offset/vimgrep/trim/null,
+    // path-separator, include-zero counts, depth limits, filename
+    // gating, and the single-file-operand heuristic.
+    &["--column", "hello"],
+    &["-b", "hello"],
+    &["--vimgrep", "aa"],
+    &["--vimgrep", "hello"],
+    &["--trim", "padded"],
+    &["--null", "hello"],
+    &["-0", "-l", "hello"],
+    &["--null", "--files"],
+    &["-c", "--include-zero", "hello"],
+    &["--include-zero", "-c", "zz_no_match_zz"],
+    &["-c", "--null", "hello"],
+    &["--path-separator", "%", "hello"],
+    &["--max-depth", "1", "hello"],
+    &["--max-depth", "0", "hello"],
+    &["-I", "hello"],
+    &["-j", "1", "hello"],
+    // Single-file operand: rg drops the path prefix by default.
+    &["hello", "README.md"],
+    &["-c", "hello", "README.md"],
+    &["-H", "hello", "README.md"],
+    // repeatable -e: union of patterns; positional still a path
+    &["-e", "hello", "-e", "answer", "-l"],
+    &["-e", "hello", "-l", "src"],
+    &["-F", "-e", "fn m", "-e", "answer", "-l"],
+    // -g gitignore-style negation & last-wins
+    &["-g", "!*.log", "-l", "hello"],
+    &["--iglob", "!*.log", "-l", "hello"],
+    &["-g", "*.rs", "-l", "hello"],
+    &["-g", "*.rs", "-g", "!*main*", "-l", "fn main"],
+    // --multiline-dotall + -U: . spans newlines
+    &["-U", "--multiline-dotall", "a.b\nc.d"],
+    // -T type exclusion
+    &["-T", "rust", "-l", "hello"],
+    // --count-matches counts occurrences (single-file operand keeps
+    // ordering identical between the tools)
+    &["--count-matches", "Xb"],
+    // --sort/--sortr on the small corpus
+    &["--sort", "modified", "-l", "hello"],
+    &["--sortr", "path", "-l", "hello"],
+    // --color always: single-file match keeps order identical;
+    // ANSI sequences compared literally
+    &["--color", "always", "fn main"],
+    // -u/-uu fold into --no-ignore/--hidden
+    &["-u", "-l", "hello"],
+    // --passthru: all lines of all searched files print
+    &["--passthru", "answer"],
+    // --no-unicode: \w narrows to ASCII
+    &["--no-unicode", "\\w+", "-l"],
+    // -w/-x: word and whole-line matching, plain and with -F. -xF
+    // exercises literal escaping inside the whole-line wrapper.
+    &["-w", "foo"],
+    &["-w", "-F", "foo.bar"],
+    &["-x", "foo"],
+    &["-x", "-F", "foo.bar"],
+    // -w/-x are a last-wins pair in rg: `-x -w` == `-w` alone, and
+    // `-w -x` == `-x` alone.
+    &["-x", "-w", "foo"],
+    &["-w", "-x", "foo"],
+    // -S: lowercase-only pattern resolves insensitive (case.txt's FOO
+    // and Foo lines must appear); a pattern with uppercase resolves
+    // sensitive; an inline (?i) beats the pattern's uppercase bytes and
+    // forces insensitive. The (?i) case is also a narrowing regression
+    // test: planning -S case-sensitively would drop files (README.md,
+    // case.txt) whose only "FOO" is lowercase.
+    &["-S", "foo"],
+    &["-S", "Foo"],
+    &["-S", "(?i)FOO"],
+    &["-S", "-F", "FOO"],
+    &["-i", "-S", "hello"],
+    // -v: inversion disables trigram narrowing (a file with zero
+    // occurrences still matches every line); util.rs, unicode.txt and
+    // friends carry no "foo"/"hello" literal, so this catches the
+    // unsound-narrowing regression.
+    &["-v", "foo"],
+    &["-v", "hello"],
+    &["-v", "-c", "foo"],
+    &["-v", "-l", "foo"],
+    &["-x", "-v", "foo"],
+    &["-U", "-v", "hello"],
+    // -m: per-file cap on matched lines; Some(0) prints nothing and
+    // exits 1; interacts with context (overflow matches arrive as
+    // after-context) and -l/-c.
+    &["-m", "1", "foo"],
+    &["-m", "0", "foo"],
+    &["-m", "1", "-l", "foo"],
+    &["-c", "-m", "1", "foo"],
+    &["-m", "1", "-A", "2", "match"],
+    // -o: print each match on its own line; under -c it counts matches
+    // not matched lines; under -v it prints whole non-matching lines.
+    &["-o", "foo"],
+    &["-o", "-c", "foo"],
+    &["-o", "-v", "hello"],
+    &["-o", "-m", "1", "foo"],
+    // -n is a no-op alias for the default; -N drops the number but
+    // keeps the path prefix.
+    &["-n", "hello"],
+    &["-N", "hello"],
+    // --heading: path on its own line, blank line between file groups;
+    // with context, intra-file gaps still get `--` (gap.txt).
+    &["--heading", "hello"],
+    &["--heading", "-C", "1", "foo"],
+    // -M: over-long lines are replaced by an omission note; 0 = no cap.
+    &["-M", "5", "a+"],
+    &["-M", "0", "a+"],
+    // -q: no output at all; only the exit code answers.
+    &["-q", "hello"],
+    &["-q", "zz_no_match_zz"],
+];
+
 #[test]
 fn parity_with_ripgrep() {
     if !have_rg() {
         eprintln!("parity: rg not installed, skipping");
         return;
     }
-    let dir = corpus();
-    let patterns: &[&[&str]] = &[
-        &["hello"],
-        &["-i", "HELLO"],
-        &["-F", "hello world"],
-        &["foo|goodbye"],
-        &["^use "],
-        &["hel.o"],
-        &["a"], // falls back to All: still must match rg
-        &["-l", "hello"],
-        &["-C", "1", "answer"],
-        &["zz_no_match_zz"],
-        &["-i", "caf\u{e9}"],
-        &["-C", "1", "hello"],
-        &["-A", "1", "hello"],
-        &["-B", "1", "answer"],
-        &["-c", "hello"],
-        &["-c", "-i", "HELLO"],
-        &["-c", "-C", "1", "hello"],
-        &["-U", "goodbye\\nfoo"],
-        &["-U", "-c", "a.b\\nc.d"],
-        // Hidden files invisible by default in both tools.
-        &["hiddentoken"],
-        // --hidden reveals them. The corpus has no .git dir, so plain
-        // `rg --hidden` (the rg_out helper's flags, no special-casing)
-        // matches glep's semantics exactly here; the divergence noted in
-        // README (.git always excluded from glep, not from rg --hidden) is
-        // a deliberate one this corpus does not exercise.
-        &["--hidden", "hiddentoken"],
-        // --no-ignore: skipme.log (gitignored) and skipme2.txt (.ignore'd)
-        // both carry "hello", invisible by default (see the plain "hello"
-        // case above, which the corpus fixture comment confirms excludes
-        // them) and visible once ignore sources are bypassed. Still hidden
-        // by default: no dotfile in the corpus contains "hello", so this
-        // case alone wouldn't catch a hidden-gating regression, but the
-        // dedicated tests/cli.rs cases do.
-        &["--no-ignore", "hello"],
-        &["--no-ignore", "-l", "hello"],
-        // Binary files: default quit detection suppresses them entirely
-        // (even a match before the NUL); --binary reports the notice;
-        // -a prints raw bytes. -c/-l under --binary report real results.
-        &["binary"],
-        &["--binary", "binary"],
-        &["--binary", "-l", "binary"],
-        &["--binary", "-c", "binary"],
-        &["-a", "binary"],
-        &["-a", "-c", "binary"],
-        &["-a", "-l", "binary"],
-        &["match"],
-        &["--binary", "match"],
-        &["-a", "match"],
-        // Last-wins pair: -a --binary behaves as --binary.
-        &["-a", "--binary", "binary"],
-        &["--binary", "-a", "binary"],
-        // --files listing under --no-ignore: rg ignores -n/--no-heading/
-        // --color for --files (verified manually against real rg), and
-        // --sort path still applies, so the harness's fixed rg flag set
-        // composes cleanly with --files --no-ignore for both tools.
-        &["--no-ignore", "--files"],
-        // Whitelist rescue: whitelisted dotfiles are searched and listed;
-        // `nopetoken` is ignored (not merely hidden) so nothing shows it.
-        &["--files"],
-        &["keeptoken"],
-        &["wdirtoken"],
-        &["nopetoken"],
-        &["--hidden", "nopetoken"],
-        &["-l", "keeptoken"],
-        // Output plumbing: column/byte-offset/vimgrep/trim/null,
-        // path-separator, include-zero counts, depth limits, filename
-        // gating, and the single-file-operand heuristic.
-        &["--column", "hello"],
-        &["-b", "hello"],
-        &["--vimgrep", "aa"],
-        &["--vimgrep", "hello"],
-        &["--trim", "padded"],
-        &["--null", "hello"],
-        &["-0", "-l", "hello"],
-        &["--null", "--files"],
-        &["-c", "--include-zero", "hello"],
-        &["--include-zero", "-c", "zz_no_match_zz"],
-        &["-c", "--null", "hello"],
-        &["--path-separator", "%", "hello"],
-        &["--max-depth", "1", "hello"],
-        &["--max-depth", "0", "hello"],
-        &["-I", "hello"],
-        &["-j", "1", "hello"],
-        // Single-file operand: rg drops the path prefix by default.
-        &["hello", "README.md"],
-        &["-c", "hello", "README.md"],
-        &["-H", "hello", "README.md"],
-        // repeatable -e: union of patterns; positional still a path
-        &["-e", "hello", "-e", "answer", "-l"],
-        &["-e", "hello", "-l", "src"],
-        &["-F", "-e", "fn m", "-e", "answer", "-l"],
-        // -g gitignore-style negation & last-wins
-        &["-g", "!*.log", "-l", "hello"],
-        &["--iglob", "!*.log", "-l", "hello"],
-        &["-g", "*.rs", "-l", "hello"],
-        &["-g", "*.rs", "-g", "!*main*", "-l", "fn main"],
-        // --multiline-dotall + -U: . spans newlines
-        &["-U", "--multiline-dotall", "a.b\nc.d"],
-        // -T type exclusion
-        &["-T", "rust", "-l", "hello"],
-        // --count-matches counts occurrences (single-file operand keeps
-        // ordering identical between the tools)
-        &["--count-matches", "Xb"],
-        // --sort/--sortr on the small corpus
-        &["--sort", "modified", "-l", "hello"],
-        &["--sortr", "path", "-l", "hello"],
-        // --color always: single-file match keeps order identical;
-        // ANSI sequences compared literally
-        &["--color", "always", "fn main"],
-        // -u/-uu fold into --no-ignore/--hidden
-        &["-u", "-l", "hello"],
-        // --passthru: all lines of all searched files print
-        &["--passthru", "answer"],
-        // --no-unicode: \w narrows to ASCII
-        &["--no-unicode", "\\w+", "-l"],
-        // -w/-x: word and whole-line matching, plain and with -F. -xF
-        // exercises literal escaping inside the whole-line wrapper.
-        &["-w", "foo"],
-        &["-w", "-F", "foo.bar"],
-        &["-x", "foo"],
-        &["-x", "-F", "foo.bar"],
-        // -w/-x are a last-wins pair in rg: `-x -w` == `-w` alone, and
-        // `-w -x` == `-x` alone.
-        &["-x", "-w", "foo"],
-        &["-w", "-x", "foo"],
-        // -S: lowercase-only pattern resolves insensitive (case.txt's FOO
-        // and Foo lines must appear); a pattern with uppercase resolves
-        // sensitive; an inline (?i) beats the pattern's uppercase bytes and
-        // forces insensitive. The (?i) case is also a narrowing regression
-        // test: planning -S case-sensitively would drop files (README.md,
-        // case.txt) whose only "FOO" is lowercase.
-        &["-S", "foo"],
-        &["-S", "Foo"],
-        &["-S", "(?i)FOO"],
-        &["-S", "-F", "FOO"],
-        &["-i", "-S", "hello"],
-        // -v: inversion disables trigram narrowing (a file with zero
-        // occurrences still matches every line); util.rs, unicode.txt and
-        // friends carry no "foo"/"hello" literal, so this catches the
-        // unsound-narrowing regression.
-        &["-v", "foo"],
-        &["-v", "hello"],
-        &["-v", "-c", "foo"],
-        &["-v", "-l", "foo"],
-        &["-x", "-v", "foo"],
-        &["-U", "-v", "hello"],
-        // -m: per-file cap on matched lines; Some(0) prints nothing and
-        // exits 1; interacts with context (overflow matches arrive as
-        // after-context) and -l/-c.
-        &["-m", "1", "foo"],
-        &["-m", "0", "foo"],
-        &["-m", "1", "-l", "foo"],
-        &["-c", "-m", "1", "foo"],
-        &["-m", "1", "-A", "2", "match"],
-        // -o: print each match on its own line; under -c it counts matches
-        // not matched lines; under -v it prints whole non-matching lines.
-        &["-o", "foo"],
-        &["-o", "-c", "foo"],
-        &["-o", "-v", "hello"],
-        &["-o", "-m", "1", "foo"],
-        // -n is a no-op alias for the default; -N drops the number but
-        // keeps the path prefix.
-        &["-n", "hello"],
-        &["-N", "hello"],
-        // --heading: path on its own line, blank line between file groups;
-        // with context, intra-file gaps still get `--` (gap.txt).
-        &["--heading", "hello"],
-        &["--heading", "-C", "1", "foo"],
-        // -M: over-long lines are replaced by an omission note; 0 = no cap.
-        &["-M", "5", "a+"],
-        &["-M", "0", "a+"],
-        // -q: no output at all; only the exit code answers.
-        &["-q", "hello"],
-        &["-q", "zz_no_match_zz"],
-    ];
-    for args in patterns {
-        let (g, gc) = glep_out(dir.path(), args);
-        let (r, rc) = rg_out(dir.path(), args);
-        assert_eq!(g, r, "stdout diverged for {:?}", args);
-        assert_eq!(gc, rc, "exit code diverged for {:?}", args);
+    check_cases(corpus().path(), "small", BASE_CASES);
+}
+
+/// The same cases over `pool_corpus()`, where the common needles hit
+/// more files than search.rs's SMALL_WORKLOAD, so those searches run
+/// through the worker pool and the in-order printer thread.
+#[test]
+fn parity_with_ripgrep_on_the_worker_pool() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
     }
+    let dir = pool_corpus();
+    for args in [
+        &["hello"][..],
+        &["-i", "HELLO"],
+        &["foo"],
+        &["-c", "hello"],
+        &["-l", "foo"],
+    ] {
+        assert_eq!(search_path(dir.path(), args), "pool", "{args:?}");
+    }
+    check_cases(dir.path(), "pool", BASE_CASES);
+}
+
+/// Which search path glep took ("small" or "pool"), from GLEP_TIMING.
+fn search_path(dir: &Path, args: &[&str]) -> String {
+    let out = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(dir)
+        .env("GLEP_TIMING", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    err.lines()
+        .find_map(|l| l.strip_prefix("glep timing: search path "))
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or("none")
+        .to_string()
 }
 
 /// Stamp every regular file under `dir` (except the index) with the same
@@ -455,19 +490,28 @@ fn sort_by_timestamp_ties_follow_rg_walk_order() {
     check("partially tied");
 }
 
-/// `corpus()` plus enough extra files that every search takes the
-/// worker-pool path (more than search.rs's SMALL_WORKLOAD files survive
-/// filtering), with a mix of matching and non-matching files spread over
-/// several directories.
+/// search.rs's SMALL_WORKLOAD: searches over more candidate files than
+/// this run through the worker pool instead of the calling thread.
+const SMALL_WORKLOAD: usize = 32;
+
+/// `corpus()` plus 48 files spread over several directories, every one
+/// of them carrying `hello` and `foo` (and a mix of `match`, `answer`,
+/// `aa`, `use` and CRLF line endings), so searches for the common
+/// needles keep more than SMALL_WORKLOAD candidates after index
+/// narrowing and take the worker-pool path.
+const POOL_FILES: usize = 48;
+const _: () = assert!(POOL_FILES > SMALL_WORKLOAD);
+
 fn pool_corpus() -> tempfile::TempDir {
     let dir = corpus();
-    for i in 0..48 {
+    for i in 0..POOL_FILES {
         let p = dir.path().join(format!("pool/d{}/f{i:02}.txt", i % 4));
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        let body = match i % 3 {
-            0 => format!("before {i}\nhello pool {i}\nafter {i}\n"),
-            1 => format!("foo {i} and foo again\nplain {i}\n"),
-            _ => format!("nothing {i}\n"),
+        let body = match i % 4 {
+            0 => format!("before {i}\nhello pool {i} foo\nafter {i}\n"),
+            1 => format!("foo {i} and foo again\nhello again\nmatch {i} answer\n"),
+            2 => format!("say hello\naa bb aa {i}\nfoo bar baz\nuse x;\n"),
+            _ => format!("Hello Foo {i}\r\nhello crlf\r\nfoo\r\nmatch {i}\r\n"),
         };
         std::fs::write(&p, body).unwrap();
     }
@@ -589,7 +633,9 @@ fn colored_and_hyperlinked_paths_match_rg() {
         &["--hyperlink-format", "{bogus}", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
-    check_cases(pool_corpus().path(), "pool", cases);
+    let pool = pool_corpus();
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
 }
 
 /// --hostname-bin names a PROGRAM whose trimmed stdout becomes {host};
@@ -727,7 +773,9 @@ fn terminators_and_separators_match_rg() {
         &["--path-separator", "ab", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
-    check_cases(pool_corpus().path(), "pool", cases);
+    let pool = pool_corpus();
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
 }
 
 /// The matcher is configured knob for knob like rg's: \n is the line
@@ -816,7 +864,9 @@ fn matcher_config_matches_rg() {
         &["-E", "bogus", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
-    check_cases(pool_corpus().path(), "pool", cases);
+    let pool = pool_corpus();
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
 }
 
 /// Binary files the way rg's default reader sees them. `nul20k.txt` has
@@ -863,7 +913,7 @@ fn binary_corpus(pool: bool) -> tempfile::TempDir {
             let body = if i % 2 == 0 {
                 format!("hello pool {i}\n")
             } else {
-                format!("quiet pool {i}\n")
+                format!("quiet pool {i}\nhello late {i}\n")
             };
             std::fs::write(d.join(format!("p{i:02}.txt")), body).unwrap();
         }
@@ -917,7 +967,9 @@ fn binary_files_match_rg() {
         &["--no-encoding", "-c", "hello"],
     ];
     check_cases(binary_corpus(false).path(), "small", cases);
-    check_cases(binary_corpus(true).path(), "pool", cases);
+    let pool = binary_corpus(true);
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
 }
 
 /// rg's search modes (-l, --files-without-match, -c, --count-matches,
@@ -946,5 +998,335 @@ fn search_modes_are_last_wins_like_rg() {
         &["-q", "--debug", "hello"],
     ];
     check_cases(corpus().path(), "small", cases);
-    check_cases(pool_corpus().path(), "pool", cases);
+    let pool = pool_corpus();
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
+}
+
+/// Every remaining flag of the merged stack that reaches the search hot
+/// path or the file set, against rg on both corpora.
+#[test]
+fn remaining_stack_flags_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let extra = tempfile::tempdir().unwrap();
+    let ignore_file = extra.path().join("extra.ignore");
+    std::fs::write(&ignore_file, "src/\n*.md\n").unwrap();
+    let ignore_file = ignore_file.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        &["--line-buffered", "hello"],
+        &["--no-config", "hello"],
+        &["-uu", "-l", "hello"],
+        &["-uuu", "-l", "binary"],
+        &["-uuu", "-c", "binary"],
+        &["-M", "10", "--max-columns-preview", "a+"],
+        &["-M", "10", "--max-columns-preview", "-o", "a+"],
+        &["--stop-on-nonmatch", "foo"],
+        &["--stop-on-nonmatch", "-c", "a"],
+        &["-U", "--stop-on-nonmatch", "foo"],
+        &["--stop-on-nonmatch", "-U", "foo"],
+        &["--no-messages", "hello"],
+        &["--no-messages", "hello", "no_such_path"],
+        &["hello", "no_such_path"],
+        &["-c", "hello", "no_such_path", "src"],
+        &["--files-without-match", "hello", "no_such_path"],
+        &["-c", "--include-zero", "hello", "no_such_path"],
+        &["-r", "X", "hello"],
+        &["-r", "$0!", "hello"],
+        &["-o", "-r", "[$1]", "h(el)lo"],
+        &["-r", "", "hello"],
+        &["-r", "${1}x", "(hel)lo"],
+        &["-c", "-r", "X", "hello"],
+        &["--mmap", "hello"],
+        &["--no-mmap", "-c", "hello"],
+        &["--mmap", "--no-mmap", "hello"],
+        &["-p", "hello"],
+        &["-p", "-c", "hello"],
+        &["--iglob", "*.MD", "-l", "hello"],
+        &["-g", "*.MD", "-l", "hello"],
+        &["--glob-case-insensitive", "-g", "*.MD", "-l", "hello"],
+        &["-g", "*.md", "--iglob", "!*.MD", "-l", "hello"],
+        &["--iglob", "!*.MD", "-g", "*.md", "-l", "hello"],
+        &["-t", "rust", "hello"],
+        &["-T", "rust", "-c", "hello"],
+        &["--type-add", "web:*.{html,md}", "-t", "web", "hello"],
+        &["--type-clear", "rust", "-t", "rust", "hello"],
+        &["--ignore-file", ignore_file, "-l", "hello"],
+        &["--require-git", "-l", "hello"],
+        &["--no-ignore-vcs", "-l", "hello"],
+        &["--no-ignore-dot", "-l", "hello"],
+        &["--no-ignore-parent", "-l", "hello"],
+        &["--no-ignore-exclude", "-l", "hello"],
+        &["--no-ignore-global", "-l", "hello"],
+        &["--one-file-system", "-l", "hello"],
+        &["-E", "latin1", "-c", "caf"],
+        &["hello", "src", "README.md"],
+        &["hello", "src/deep", "src"],
+        &["hello", "README.md", "src"],
+        &["hello", "src/main.rs", "src"],
+        &["-l", "hello", "src", "README.md", "crlf.txt"],
+        &["--sortr", "path", "hello", "src", "README.md"],
+        &["-d", "0", "hello", "src", "README.md"],
+        &["-d", "1", "-l", "hello", "src", "src/deep"],
+        &["-c", "hello", "src", "crlf.txt"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    let pool = pool_corpus();
+    assert_eq!(search_path(pool.path(), &["hello"]), "pool");
+    check_cases(pool.path(), "pool", cases);
+}
+
+fn have_cmd(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// -L, -z and --pre need symlinks, a gzip binary (rg decompresses -z
+/// input through it) and `cat`: Unix only.
+#[cfg(unix)]
+#[test]
+fn unix_only_flags_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("real")).unwrap();
+    std::fs::write(d.join("real/inner.txt"), "linktok hello inner\n").unwrap();
+    std::os::unix::fs::symlink("real", d.join("linkdir")).unwrap();
+    std::os::unix::fs::symlink("README.md", d.join("linkfile.md")).unwrap();
+    let mut cases: Vec<&[&str]> = vec![
+        &["linktok"],
+        &["-L", "linktok"],
+        &["-L", "-l", "hello"],
+        &["-L", "-c", "hello"],
+        &["-L", "--files"],
+        &["--pre", "cat", "-c", "hello"],
+        &["--pre", "cat", "--pre-glob", "*.md", "hello"],
+        &["--pre-glob", "*.rs", "--pre", "cat", "-l", "hello"],
+    ];
+    if have_cmd("gzip") {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"zipneedle hello packed\nsecond\n").unwrap();
+        std::fs::write(d.join("pack.txt.gz"), enc.finish().unwrap()).unwrap();
+        cases.extend_from_slice(&[
+            &["-z", "zipneedle"],
+            &["-z", "-l", "hello"],
+            &["-z", "-c", "hello"],
+            &["zipneedle"],
+        ]);
+    }
+    check_cases(d, "unix", &cases);
+}
+
+/// Running from a subdirectory of the indexed tree: rg's cwd-relative
+/// paths, `..` operands included.
+#[test]
+fn subdirectory_runs_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    // Index at the root first, so the subdirectory run discovers it.
+    let (_, code) = glep_out(dir.path(), &["-c", "hello"]);
+    assert_eq!(code, 0);
+    let sub = dir.path().join("src");
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-l", "hello"],
+        &["-c", "--include-zero", "hello"],
+        &["fn"],
+        &["hello", "../README.md"],
+        &["-l", "hello", "deep", "main.rs"],
+        &["--files"],
+        &["--files-without-match", "hello"],
+    ];
+    check_cases(&sub, "subdir", cases);
+}
+
+/// Warm the listing cache (macOS: `.glep/dirtree.bin`) so a later
+/// `--files` could be answered from it.
+fn warm_listing_cache(dir: &Path) {
+    for _ in 0..2 {
+        let (_, code) = glep_out(dir, &["--files"]);
+        assert_eq!(code, 0);
+    }
+    #[cfg(target_os = "macos")]
+    assert!(dir.join(".glep/dirtree.bin").exists(), "cache must be warm");
+}
+
+/// Timestamp sorts need live metadata and rg's walk order, so they must
+/// bypass a warm listing cache.
+#[test]
+fn listing_cache_bypass_timestamp_sorts() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    stamp_all(dir.path(), t0);
+    for (k, name) in ["words.txt", "src/main.rs", "README.md"].iter().enumerate() {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(name))
+            .unwrap();
+        f.set_modified(t0 + std::time::Duration::from_secs(10 * (k as u64 + 1)))
+            .unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["--sort", "modified", "--files"],
+        &["--sortr", "modified", "--files"],
+        &["--sortr", "path", "--files"],
+    ];
+    check_cases(dir.path(), "cache", cases);
+}
+
+/// --no-ignore and the -u ladder list ignored (and hidden) files: a warm
+/// cache, which holds only the indexed set, must not answer them.
+#[test]
+fn listing_cache_bypass_no_ignore_family() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let cases: &[&[&str]] = &[
+        &["--no-ignore", "--files"],
+        &["-u", "--files"],
+        &["-u", "-l", "hello"],
+    ];
+    check_cases(dir.path(), "cache", cases);
+    // -uu/-uuu add hidden files; rg would also list the index's own
+    // `.glep/` files there, which glep never lists (like `.git`).
+    for flag in ["-uu", "-uuu"] {
+        let (g, code) = glep_out(dir.path(), &[flag, "--files"]);
+        assert_eq!(code, 0);
+        assert!(g.contains(".hidden.txt") && g.contains("skipme.log"), "{g}");
+        assert!(!g.contains(".glep"), "{g}");
+    }
+}
+
+/// The per-source toggles each re-admit files one ignore source hides.
+#[test]
+fn listing_cache_bypass_ignore_toggles() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let cases: &[&[&str]] = &[
+        &["--no-ignore-vcs", "--files"],
+        &["--no-ignore-dot", "--files"],
+        &["--no-ignore-exclude", "--files"],
+        &["--no-ignore-global", "--files"],
+        &["--no-ignore-parent", "--files"],
+    ];
+    check_cases(dir.path(), "cache", cases);
+}
+
+/// -L lists files behind symlinked directories, which never enter the
+/// index or the cache.
+#[cfg(unix)]
+#[test]
+fn listing_cache_bypass_follow() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    std::fs::create_dir_all(dir.path().join("real")).unwrap();
+    std::fs::write(dir.path().join("real/inner.txt"), "x\n").unwrap();
+    std::os::unix::fs::symlink("real", dir.path().join("linkdir")).unwrap();
+    warm_listing_cache(dir.path());
+    check_cases(dir.path(), "cache", &[&["-L", "--files"], &["--files"]]);
+}
+
+/// --one-file-system and --require-git (outside a repo: git rules go
+/// inert) take live scans of their own.
+#[test]
+fn listing_cache_bypass_one_fs_and_require_git() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let cases: &[&[&str]] = &[
+        &["--one-file-system", "--files"],
+        &["--require-git", "--files"],
+    ];
+    check_cases(dir.path(), "cache", cases);
+}
+
+/// --no-index lists through a live walk: the same set as the cached
+/// listing, never served from the cache or the index.
+#[test]
+fn listing_cache_bypass_no_index() {
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let (cached, _) = glep_out(dir.path(), &["--files"]);
+    let (live, code) = glep_out(dir.path(), &["--no-index", "--files"]);
+    assert_eq!(code, 0);
+    assert_eq!(live, cached);
+    std::fs::write(dir.path().join("brand_new.txt"), "x\n").unwrap();
+    let (live, _) = glep_out(dir.path(), &["--no-index", "--files"]);
+    assert!(live.contains("brand_new.txt"), "{live}");
+}
+
+/// An `.ignore` above the tree sits outside the cache's fingerprint, so
+/// its presence must bypass the cache; rg honors it as a parent rule.
+#[test]
+fn listing_cache_bypass_ancestor_dot_ignore() {
+    if !have_rg() {
+        return;
+    }
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("tree");
+    std::fs::create_dir_all(inner.join("sub")).unwrap();
+    std::fs::write(inner.join("keep.txt"), "hello keep\n").unwrap();
+    std::fs::write(inner.join("sub/drop.txt"), "hello drop\n").unwrap();
+    std::fs::write(inner.join("sub/keep2.txt"), "hello keep2\n").unwrap();
+    warm_listing_cache(&inner);
+    std::fs::write(outer.path().join(".ignore"), "drop.txt\n").unwrap();
+    let cases: &[&[&str]] = &[
+        &["--files"],
+        &["-l", "hello"],
+        &["--no-ignore-parent", "--files"],
+    ];
+    check_cases(&inner, "cache", cases);
+}
+
+/// Filters applied after a listing (globs, types, depth, hidden, extra
+/// ignore files) give the same answer whether or not the cache served it.
+#[test]
+fn listing_cache_filters_match_rg() {
+    if !have_rg() {
+        return;
+    }
+    let dir = corpus();
+    warm_listing_cache(dir.path());
+    let extra = tempfile::tempdir().unwrap();
+    let ignore_file = extra.path().join("x.ignore");
+    std::fs::write(&ignore_file, "*.md\n").unwrap();
+    let ignore_file = ignore_file.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        &["-g", "*.rs", "--files"],
+        &["-g", "!*.txt", "--files"],
+        &["--iglob", "*.MD", "--files"],
+        &["-t", "rust", "--files"],
+        &["-T", "rust", "--files"],
+        &["--max-depth", "1", "--files"],
+        &["--hidden", "--files"],
+        &["--ignore-file", ignore_file, "--files"],
+        &["--color", "always", "--files"],
+        &["-0", "--files"],
+    ];
+    check_cases(dir.path(), "cache", cases);
 }
