@@ -14,7 +14,7 @@
 
 Documentation: **https://velofy.co/glep/**
 
-ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced in CI by a differential harness of about 400 rg-vs-glep cases that runs on both the single-thread and the worker-pool search paths. No daemon.
 
 ## Install
 
@@ -70,9 +70,18 @@ glep status                     # index stats
 
 The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory.
 
-With an explicit path argument, `bytes_printed` in the JSON summary can differ from rg's (rg prints `./`-prefixed paths; glep prints them bare).
+Binary files are handled the way rg's default reader handles them, and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
 
-Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`).
+Known differences from rg:
+
+- Paths under an operand print relative to the cwd: `glep pat ./src` prints `src/x` where rg prints `./src/x` (likewise for `..` operands), so `bytes_printed` in the JSON summary can differ too.
+- `--files` takes a glob in the pattern slot, where rg takes paths.
+- `.git` and `.glep` are never listed or searched, even under `-uu`.
+- `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`); pass `--require-git` for rg's default.
+- `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
+- glep never reads stdin, so a search with no path argument always searches the tree.
+- The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
+- `-r` cannot be combined with `--json` (rg 15 adds replacement text to its JSON matches).
 
 ## When to use it
 
@@ -89,7 +98,7 @@ Stick with rg / fd for:
 - One-off searches in a tree you will never search again.
 - Small repos where rg already answers in under about 50 ms.
 - Ephemeral CI runners where the index never persists between runs.
-- rg features glep lacks: replacements, PCRE2, compressed files.
+- rg features glep lacks: searching stdin, and `-z` for compressed formats other than gzip.
 - Corpora dominated by binaries or files over the 1 MB cap (live-scanned anyway).
 
 ## Numbers
