@@ -1285,3 +1285,81 @@ fn subdirectory_run_uses_the_ancestor_index() {
         .stdout(p("../notes.txt\n"));
     assert!(!sub.join(".glep").exists());
 }
+
+/// A reader that goes away early (`glep ... | head -1`) ends the run
+/// quietly, as in rg: no "Broken pipe" message, and the exit status the
+/// results so far decide (0 after a match, 1 when nothing matched even
+/// though --passthru or -c --include-zero printed lines). The big file
+/// sorts first, so pool workers race ahead of the printer and wait on its
+/// window while it is blocked on the full pipe: when the pipe closes they
+/// must be released, not left waiting forever.
+#[test]
+fn closed_pipe_ends_the_run_quietly() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let mut big = String::new();
+    for i in 0..120_000 {
+        big.push_str(&format!("needle line {i} in the big file\n"));
+    }
+    std::fs::write(dir.path().join("a_big.txt"), big).unwrap();
+    // Long names, so every listing and summary mode prints more than a
+    // pipe buffer holds.
+    let deep = dir
+        .path()
+        .join("z")
+        .join("d".repeat(60))
+        .join("e".repeat(40));
+    std::fs::create_dir_all(&deep).unwrap();
+    for i in 0..600 {
+        let name = format!("f{i:03}_{}.txt", "x".repeat(40));
+        std::fs::write(deep.join(name), format!("needle small {i}\n")).unwrap();
+    }
+    glep(dir.path()).arg("index").assert().success();
+    let bin = assert_cmd::cargo::cargo_bin("glep");
+    let cases: &[(&[&str], i32)] = &[
+        (&["needle"], 0),
+        (&["--files"], 0),
+        (&["-l", "needle"], 0),
+        (&["-c", "needle"], 0),
+        (&["--json", "needle"], 0),
+        (&["--line-buffered", "needle"], 0),
+        (&["-j", "1", "needle"], 0),
+        (&["--passthru", "zz_absent_zz"], 1),
+        (&["-c", "--include-zero", "zz_absent_zz"], 1),
+    ];
+    for &(args, code) in cases {
+        let mut child = std::process::Command::new(&bin)
+            .current_dir(dir.path())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Read the first line, then close the pipe.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        while stdout.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {}
+        drop(stdout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("glep {args:?} hung after its reader closed the pipe");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(err.is_empty(), "{args:?}: {err}");
+        assert_eq!(status.code(), Some(code), "{args:?}");
+    }
+}

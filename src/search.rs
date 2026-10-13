@@ -1302,6 +1302,17 @@ struct WindowState {
     lock: Mutex<()>,
 }
 
+impl WindowState {
+    /// Let every worker through for good: the printer is gone (the reader
+    /// closed the pipe, or a write failed), so the print cursor will never
+    /// move again and a worker waiting on it would wait forever.
+    fn release(&self) {
+        self.next.store(usize::MAX / 2, Ordering::Release);
+        let _guard = self.lock.lock().unwrap();
+        self.room.notify_all();
+    }
+}
+
 /// Flush the coalescing buffer once it passes this size.
 const PRINT_BATCH: usize = 256 * 1024;
 
@@ -1333,6 +1344,10 @@ struct Printer {
     /// output (ordering is the printer's own; nothing else interleaves
     /// stdout).
     out_buf: Vec<u8>,
+    /// The reader went away (EPIPE, as in `glep pat | head -1`). Like rg,
+    /// that is a graceful end, not an error: nothing more is written, the
+    /// search stops, and the results seen so far decide the exit status.
+    closed: bool,
 }
 
 impl Printer {
@@ -1370,6 +1385,7 @@ impl Printer {
             } else {
                 0
             }),
+            closed: false,
         }
     }
 
@@ -1379,27 +1395,60 @@ impl Printer {
         window.room.notify_all();
     }
 
+    /// Write `bytes` unless the reader is gone; a closed pipe marks the
+    /// printer `closed` instead of failing (see the field).
+    fn put(&mut self, bytes: &[u8], out: &mut (dyn std::io::Write + Send)) -> std::io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let res = out.write_all(bytes);
+        self.closed_on_broken_pipe(res)
+    }
+
+    fn flush_out(&mut self, out: &mut (dyn std::io::Write + Send)) -> std::io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let res = out.flush();
+        self.closed_on_broken_pipe(res)
+    }
+
+    fn closed_on_broken_pipe(&mut self, res: std::io::Result<()>) -> std::io::Result<()> {
+        match res {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.closed = true;
+                self.out_buf = Vec::new();
+                Ok(())
+            }
+            r => r,
+        }
+    }
+
     fn write_bytes(
         &mut self,
         bytes: &[u8],
         out: &mut (dyn std::io::Write + Send),
     ) -> std::io::Result<()> {
         if self.line_buffered {
-            out.write_all(bytes)?;
-            return out.flush();
+            self.put(bytes, out)?;
+            return self.flush_out(out);
         }
         self.out_buf.extend_from_slice(bytes);
         if self.out_buf.len() >= PRINT_BATCH {
-            out.write_all(&self.out_buf)?;
-            self.out_buf.clear();
+            self.flush_batch(out)?;
         }
         Ok(())
     }
 
     fn flush_batch(&mut self, out: &mut (dyn std::io::Write + Send)) -> std::io::Result<()> {
         if !self.out_buf.is_empty() {
-            out.write_all(&self.out_buf)?;
-            self.out_buf.clear();
+            let mut batch = std::mem::take(&mut self.out_buf);
+            self.put(&batch, out)?;
+            if !self.closed {
+                // Keep the buffer's capacity for the next batch.
+                batch.clear();
+                self.out_buf = batch;
+            }
         }
         Ok(())
     }
@@ -1469,13 +1518,14 @@ impl Printer {
         // Write any produced output, not just matches: --passthru emits
         // every line including non-matching ones, and --include-zero -c
         // emits `path:0` lines for searched files.
-        if buf.is_empty() {
+        if buf.is_empty() || self.closed {
             return Ok(());
         }
         if self.printed_any {
             if let Some(sep) = &self.file_separator {
                 if self.line_buffered {
-                    out.write_all(sep)?;
+                    let sep = sep.clone();
+                    self.put(&sep, out)?;
                 } else {
                     // Coalesced with the file's own bytes just below.
                     self.out_buf.extend_from_slice(sep);
@@ -1489,7 +1539,7 @@ impl Printer {
 }
 
 fn write_summary(
-    out: &mut (dyn std::io::Write + Send),
+    out: &mut Vec<u8>,
     total_stats: &mut grep_printer::Stats,
     elapsed: Duration,
 ) -> anyhow::Result<()> {
@@ -1509,7 +1559,8 @@ fn write_summary(
             stats: total_stats.clone(),
         },
     };
-    writeln!(out, "{}", serde_json::to_string(&event)?)?;
+    out.extend_from_slice(serde_json::to_string(&event)?.as_bytes());
+    out.push(b'\n');
     Ok(())
 }
 
@@ -1636,8 +1687,9 @@ fn run_impl<M: Matcher + Sync>(
             let res = search_one_or_warn(&mut state, matcher, root, rel, opts);
             let stop = opts.quit_after_match() && opts.settles(&res);
             printer.emit(res, out)?;
-            if stop {
-                // -q: the first settling file decides the exit code.
+            if stop || printer.closed {
+                // -q: the first settling file decides the exit code; a
+                // closed pipe ends the search.
                 break;
             }
         }
@@ -1692,9 +1744,18 @@ fn run_pool<M: Matcher + Sync>(
         let printer_out = &mut *out;
         let mut printer = Printer::new(opts, ring_cap, files.len());
         let printer_window = &window_state;
+        let printer_stop = &stop;
         let printer_handle = scope.spawn(move || -> anyhow::Result<Printer> {
-            run_printer(rx, &mut printer, printer_out, printer_window)?;
-            Ok(printer)
+            let res = run_printer(rx, &mut printer, printer_out, printer_window);
+            if res.is_err() || printer.closed {
+                // Output is over (a closed pipe, or a failed write): the
+                // workers stop searching, and any worker waiting for the
+                // print cursor is let through. The channel closed with
+                // `rx`, so their sends fail and they return.
+                printer_stop.store(true, Ordering::Relaxed);
+                printer_window.release();
+            }
+            res.map(|()| printer)
         });
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -1785,6 +1846,10 @@ fn run_printer(
 ) -> anyhow::Result<()> {
     while let Ok(d) = rx.recv() {
         printer.stash_then_drain(d, out)?;
+        if printer.closed {
+            // The reader is gone: nothing more can be printed.
+            return Ok(());
+        }
         printer.advance_window(window);
     }
     printer.drain(out)?;
@@ -1846,19 +1911,20 @@ fn finish(
                 }
             }
         }
-        out.write_all(&buf)?;
+        printer.put(&buf, out)?;
     }
     if opts.json {
-        write_summary(out, &mut printer.total_stats, start.elapsed())?;
+        let mut buf = Vec::new();
+        write_summary(&mut buf, &mut printer.total_stats, start.elapsed())?;
+        printer.put(&buf, out)?;
     } else if opts.stats {
         // rg's stats block: a blank line then fixed-order counters.
         // `bytes_printed` is whatever the printer tracked (standard mode);
         // count/-l modes report 0 there like rg's non-printer paths.
         let elapsed = start.elapsed();
         let s = &printer.total_stats;
-        writeln!(
-            out,
-            "\n{} matches\n{} matched lines\n{} files contained matches\n{} files searched\n{} bytes printed\n{} bytes searched\n{:.6} seconds spent searching\n{:.6} seconds total",
+        let block = format!(
+            "\n{} matches\n{} matched lines\n{} files contained matches\n{} files searched\n{} bytes printed\n{} bytes searched\n{:.6} seconds spent searching\n{:.6} seconds total\n",
             s.matches(),
             s.matched_lines(),
             s.searches_with_match(),
@@ -1867,9 +1933,10 @@ fn finish(
             s.bytes_searched(),
             elapsed.as_secs_f64(),
             elapsed.as_secs_f64()
-        )?;
+        );
+        printer.put(block.as_bytes(), out)?;
     }
-    out.flush()?;
+    printer.flush_out(out)?;
     Ok(found)
 }
 

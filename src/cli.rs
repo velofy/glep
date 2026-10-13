@@ -1250,9 +1250,12 @@ fn print_paths(files: &[PathBuf], cwd_rel: &Path, args: &Args) -> anyhow::Result
         buf.push(term);
     }
     let mut out = search::StdoutOut;
-    out.write_all(&buf)?;
-    out.flush()?;
-    Ok(())
+    match out.write_all(&buf).and_then(|()| out.flush()) {
+        // A reader that went away (`glep --files | head -1`) ends the
+        // listing, not the run: rg's graceful termination.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        res => Ok(res?),
+    }
 }
 
 /// -a/--binary/--null-data: the searcher's binary-detection mode.
@@ -1821,7 +1824,7 @@ pub fn run() -> anyhow::Result<i32> {
         for d in defs {
             buf.push_str(&format!("{}: {}\n", d.name(), d.globs().join(", ")));
         }
-        print!("{buf}");
+        std::io::stdout().write_all(buf.as_bytes())?;
         return Ok(0);
     }
     if args.pcre2_version {
@@ -1831,7 +1834,13 @@ pub fn run() -> anyhow::Result<i32> {
             ""
         };
         let (maj, min) = grep_pcre2::version();
-        println!("PCRE2 {}.{:02} is available{}", maj, min, jit);
+        writeln!(
+            std::io::stdout(),
+            "PCRE2 {}.{:02} is available{}",
+            maj,
+            min,
+            jit
+        )?;
         return Ok(0);
     }
 
@@ -1979,9 +1988,11 @@ pub fn run() -> anyhow::Result<i32> {
                         e.flags & (FLAG_SKIP_BINARY | FLAG_SKIP_TOO_LARGE | FLAG_TRANSCODE) != 0
                     })
                     .count();
-                println!("files: {live}");
-                println!("skipped (binary/oversized/utf16): {skipped}");
-                println!("last sweep epoch: {}", idx.manifest.last_sweep_epoch);
+                let report = format!(
+                    "files: {live}\nskipped (binary/oversized/utf16): {skipped}\nlast sweep epoch: {}\n",
+                    idx.manifest.last_sweep_epoch
+                );
+                std::io::stdout().write_all(report.as_bytes())?;
                 return Ok(0);
             }
             _ => {}
