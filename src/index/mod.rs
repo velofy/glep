@@ -794,6 +794,14 @@ impl Index {
         }
 
         if self.read_only {
+            // Nothing is written, but this query must not see what the
+            // sweep found gone: a deleted file's entry and a changed
+            // file's old one die in memory, as the hidden flips above
+            // change there. Changed files come back as `fresh` paths,
+            // which the caller searches live.
+            for &id in dead_ids.iter().chain(&changed_old_ids) {
+                self.manifest.entries[id as usize].flags |= manifest::FLAG_DEAD;
+            }
             if let Some(t) = &mut timings {
                 t.stage("index_write");
             }
@@ -1399,22 +1407,67 @@ mod tests {
         assert!(Index::open_or_build(dir.path(), 1_048_576).is_ok());
     }
 
+    /// Under another glep's lock an update writes nothing, yet the query
+    /// running it must not see what the sweep found gone: a deleted file
+    /// leaves the live set and the candidates, and a changed file's old
+    /// entry (with its old postings) dies too, its path coming back as a
+    /// fresh one for a live search.
     #[test]
     fn read_only_update_writes_nothing_and_returns_fresh_paths() {
         let dir = corpus();
         let _writer = Index::build(dir.path(), 1_048_576).unwrap(); // holds the lock
         let mut reader = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         assert!(reader.read_only);
+        let id_of = |idx: &Index, p: &str| {
+            idx.manifest
+                .entries
+                .iter()
+                .find(|e| e.path == Path::new(p))
+                .unwrap()
+                .id
+        };
+        let (old_a, old_b) = (id_of(&reader, "a.txt"), id_of(&reader, "b.txt"));
         std::fs::write(dir.path().join("hot.txt"), "hotneedle").unwrap();
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello there, longer now").unwrap();
         let manifest_before = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
-        let extra = reader.update(1_048_576, 0).unwrap();
-        assert_eq!(extra, vec![std::path::PathBuf::from("hot.txt")]);
+        let mut extra = reader.update(1_048_576, 0).unwrap();
+        extra.sort();
+        assert_eq!(
+            extra,
+            vec![PathBuf::from("a.txt"), PathBuf::from("hot.txt")]
+        );
         let manifest_after = std::fs::read(dir.path().join(".glep/manifest.bin")).unwrap();
         assert_eq!(
             manifest_before, manifest_after,
             "read-only update must not write"
         );
         assert!(!dir.path().join(".glep/delta.bin").exists());
+        // The deleted file and the changed file's stale entry are gone
+        // from this query's view; the untouched files stay.
+        assert!(!reader.is_live(old_a) && !reader.is_live(old_b));
+        assert_eq!(
+            reader.live_files(true),
+            vec![PathBuf::from("big.txt"), PathBuf::from("bin.dat")]
+        );
+        let plan = crate::plan::build("world", true, Case::Sensitive);
+        assert!(
+            reader
+                .candidates(&plan, Case::Sensitive, true, false)
+                .is_empty(),
+            "no live entry still holds `world`"
+        );
+        assert!(!reader.has_files_under(Path::new("b.txt")));
+        // A second read-only pass over the same tree finds the same.
+        let mut again = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(again.read_only);
+        let mut extra = again.update(1_048_576, 0).unwrap();
+        extra.sort();
+        assert_eq!(
+            extra,
+            vec![PathBuf::from("a.txt"), PathBuf::from("hot.txt")]
+        );
+        assert_eq!(again.live_files(true), reader.live_files(true));
     }
 
     #[test]
