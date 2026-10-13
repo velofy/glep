@@ -1017,6 +1017,8 @@ fn remaining_stack_flags_match_rg() {
     let ignore_file = ignore_file.to_str().unwrap();
     let cases: &[&[&str]] = &[
         &["--line-buffered", "hello"],
+        &["-j", "2", "hello"],
+        &["-j", "1", "-c", "foo"],
         &["--no-config", "hello"],
         &["-uu", "-l", "hello"],
         &["-uuu", "-l", "binary"],

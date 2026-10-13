@@ -1186,3 +1186,34 @@ fn short_s_is_case_sensitive() {
         .assert()
         .success();
 }
+
+/// glep never reads stdin (rg searches a piped stdin when given no path,
+/// which is what made an earlier probe with an open pipe look hung): a
+/// search with an open, silent stdin pipe must still finish.
+#[test]
+fn open_stdin_pipe_never_blocks_a_search() {
+    let dir = corpus();
+    let bin = assert_cmd::cargo::cargo_bin("glep");
+    for args in [&["hello"][..], &["--crlf", "-c", "hello"], &["--files"]] {
+        let mut child = std::process::Command::new(&bin)
+            .current_dir(dir.path())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("glep {args:?} blocked with an open stdin pipe");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(status.success(), "{args:?}: {status}");
+    }
+}
