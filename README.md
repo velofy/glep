@@ -14,7 +14,7 @@
 
 Documentation: **https://velofy.co/glep/**
 
-ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced by a 24-case differential harness in CI. No daemon.
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced in CI by a differential harness of about 400 rg-vs-glep cases that runs on both the single-thread and the worker-pool search paths. No daemon.
 
 ## Install
 
@@ -41,7 +41,7 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 - **Self-healing:** every query runs a parallel mtime sweep and reindexes only what changed. No watcher, no background process.
 - **Sound fallback:** patterns the index cannot narrow fall back to a full parallel scan. Never a wrong answer; worst case is ripgrep speed.
 - **ripgrep-compatible:** built on ripgrep's crates (`ignore`, `grep-searcher`, `regex-syntax`). Text output is byte-compatible with `rg`; `--json` emits rg's event stream including the closing summary event.
-- **Familiar flags:** `-i -F -l -c -U -e -g -t -C -A -B --json --hidden --no-ignore`.
+- **Familiar flags:** ripgrep's own spellings, including `-i -S -F -w -x -v -l -c -o -q -U -e -f -g -t -T -C -A -B -m -M -n -N -a -z -P -E -L -u -0 -j -H -I -b` and `--json --stats --heading --column --vimgrep --trim --sort --sortr --count-matches --files-without-match --passthru --null-data --hidden --no-ignore --no-ignore-vcs --ignore-file --type-add --color --hyperlink-format`. Flags that change which files exist for a query (`--no-ignore`, `-L`, `--one-file-system` and friends) run as live scans that never touch the index.
 - **Agent integrations:** a Claude Code skill and PreToolUse hook (`claude/install.sh`) and a Cursor hook (`cursor/install.sh`) that route built-in Grep/Glob calls through glep.
 
 ## Interface
@@ -52,10 +52,14 @@ glep --files '**/*.py'          # glob listing (Glob replacement)
 glep --json 'pattern'           # machine-readable output (includes rg's summary event)
 glep -c 'pattern'               # per-file match counts (rg -c)
 glep -l -i -F -U ...            # files-with-matches, case-insensitive, fixed, multiline
+glep -w -x -S -v 'pattern'      # word, whole-line, smart-case, invert match
+glep -o -m 5 -M 120 -N ...      # only-matching, max count, max columns, no line numbers
+glep --heading -q 'pattern'     # grouped headings, or quiet exit-code-only
 glep -A 2 -B 1 'pattern'        # context, or -C n for both sides
 glep -g '*.rs' -t rust ...      # glob and type filters
 glep --hidden 'TODO'            # include dotfiles (.git is always excluded)
 glep --no-ignore ...            # search ignored files too (live scan, index untouched)
+glep --no-index ...             # live walk + scan; never opens or writes the index
 glep --ttl 5 ...                # skip the freshness sweep within a read burst
 glep --max-filesize 2000000 ... # raise the 1MB index cap
 glep index                      # explicit (re)build; lazy on first query
@@ -64,9 +68,20 @@ glep status                     # index stats
 
 `--no-ignore` always pays a full scan: it bypasses the index entirely, so gitignored trees never enter it. It costs the same as `rg --no-ignore`, every time.
 
-With an explicit path argument, `bytes_printed` in the JSON summary can differ from rg's (rg prints `./`-prefixed paths; glep prints them bare).
+The index lives in `.glep/`. glep finds it automatically: the nearest ancestor directory containing `.glep/` is the search root (run from a subdirectory and the search is scoped to it, with output paths relative to your cwd, the same convention as `rg`). `GLEP_INDEX_PATH` points directly at an index directory when you need an explicit override. With no index anywhere, glep builds one in the current directory.
 
-Other known differences from rg: files with a NUL byte in the first 8 KB (including UTF-16 text) are treated as binary and never searched, and `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`). The index lives in `.glep/` in the directory you run glep from, so run it from the project root.
+Binary files are handled the way rg's default reader handles them, and UTF-16 files with a byte-order mark are transcoded and searched, as in rg.
+
+Known differences from rg:
+
+- Paths under an operand print relative to the cwd: `glep pat ./src` prints `src/x` where rg prints `./src/x` (likewise for `..` operands), so `bytes_printed` in the JSON summary can differ too. A file operand prints the same way, with native separators: on Windows a typed `src/main.rs` prints as `src\main.rs`, where rg keeps the spelling typed.
+- `--files` takes a glob in the pattern slot, where rg takes paths. Like `-g`, it matches the path relative to the cwd.
+- A positive `-g`/`--iglob` glob does not bring back files or directories that ignore rules exclude. In rg, glob overrides outrank `.gitignore`, `.ignore` and `.rgignore`, so `rg -g '*.log'` also searches gitignored logs and `rg -g '*'` descends into every ignored directory; glep filters the indexed file set, which never holds ignored files. Add `--no-ignore` to search ignored files too. A glob or `-t` type does rescue a hidden file, as in rg.
+- `.git` and `.glep` are never listed or searched, even under `-uu`.
+- `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`); pass `--require-git` for rg's default.
+- `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
+- glep never reads stdin, so a search with no path argument always searches the tree.
+- The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
 
 ## When to use it
 
@@ -83,7 +98,7 @@ Stick with rg / fd for:
 - One-off searches in a tree you will never search again.
 - Small repos where rg already answers in under about 50 ms.
 - Ephemeral CI runners where the index never persists between runs.
-- rg features glep lacks: replacements, PCRE2, compressed files.
+- rg features glep lacks: searching stdin, and `-z` for compressed formats other than gzip.
 - Corpora dominated by binaries or files over the 1 MB cap (live-scanned anyway).
 
 ## Numbers
@@ -120,7 +135,7 @@ Design spec: [docs/superpowers/specs/2026-07-14-glep-design.md](https://github.c
 Issues and pull requests are welcome at https://github.com/velofy/glep. CI runs on Linux, macOS, and Windows:
 
 ```bash
-cargo test --all                                  # parity tests need rg on PATH
+cargo test --all                                  # parity tests need rg on PATH (-P cases: cargo install ripgrep --features pcre2)
 cargo build
 PATH="$PWD/target/debug:$PATH" claude/hooks/test_hook.sh
 PATH="$PWD/target/debug:$PATH" cursor/hooks/test_hook.sh

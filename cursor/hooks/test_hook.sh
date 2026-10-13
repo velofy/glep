@@ -113,4 +113,17 @@ if echo "$OUT" | grep -qF "| head"; then
   echo "FAIL: malformed head_limit should not emit a head pipe: $OUT"; exit 1
 fi
 
+# 14. A pattern that starts with a dash goes through -e, and glep takes the
+#     next word as -e's value like rg does: the shown command must search,
+#     not fail with a usage error.
+OUT=$(run_hook '{"hook_event_name":"preToolUse","tool_name":"Grep","tool_input":{"pattern":"-> Result"},"cwd":"'"$TMPN"'"}')
+echo "$OUT" | grep -qF "glep -e '-> Result'" || { echo "FAIL: bad dash-pattern command: $OUT"; exit 1; }
+CMD=$(echo "$OUT" | python3 -c 'import json, sys; print(json.load(sys.stdin)["agent_message"].split("instead: ", 1)[1])')
+printf 'fn x() -> Result<()>\nplain\n' > "$TMP/dash.txt"
+set +e
+GOT=$(cd "$TMP" && eval "$CMD" 2>&1)
+RC=$?
+set -e
+[ "$RC" -eq 0 ] && [ "$GOT" = "dash.txt:1:fn x() -> Result<()>" ] || { echo "FAIL: dash-pattern command rc=$RC: $GOT"; exit 1; }
+
 echo "hook tests: OK"

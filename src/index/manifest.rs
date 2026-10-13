@@ -12,6 +12,14 @@ pub const FLAG_DEAD: u8 = 4;
 /// next sweep after upgrade and picks up the flag through the normal
 /// add-new-file path, no format bump required.
 pub const FLAG_HIDDEN: u8 = 8;
+/// UTF-16 BOM file: NUL-heavy raw bytes, but the searcher transcodes it
+/// on scan (rg's default BOM sniffing), so it is never indexed (raw bytes
+/// cannot narrow decoded text) and always a live-scan candidate.
+pub const FLAG_TRANSCODE: u8 = 16;
+/// Indexed text whose first NUL byte sits past the searcher's first
+/// 64 KB buffer. rg's reader still detects it (binary quit), so such a
+/// file is never listed by --files-without-match, searched or not.
+pub const FLAG_NUL_LATE: u8 = 32;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {

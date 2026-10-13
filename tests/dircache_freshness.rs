@@ -256,3 +256,148 @@ fn hidden_flag_over_cache_matches_authoritative() {
     assert!(!cached_listing(dir.path(), &[]).contains(".env"));
     assert!(cached_listing(dir.path(), &["--hidden"]).contains(".env"));
 }
+
+/// Operands the index cannot serve (here an ignored directory) are walked
+/// live: the listing is the same whether the cache or the authoritative
+/// path answers, and the --files glob applies to the walked files too.
+#[test]
+fn unserved_operands_list_the_same_through_the_cache() {
+    let dir = setup(|p| {
+        base_fixture(p);
+        fs::write(p.join(".gitignore"), "build/\n").unwrap();
+        fs::create_dir_all(p.join("build/deep")).unwrap();
+        fs::write(p.join("build/out.txt"), "x").unwrap();
+        fs::write(p.join("build/deep/x.rs"), "x").unwrap();
+    });
+    for args in [
+        &["*.txt", "build"][..],
+        &["**", "build", "z"],
+        &["*.rs", "build", "a"],
+    ] {
+        let cached = cached_listing(dir.path(), args);
+        assert_eq!(cached, listing(dir.path(), args), "{args:?}");
+        assert!(cached.contains("build/"), "{args:?}: {cached}");
+    }
+}
+
+/// The cache's pruned walk always covers the whole tree, so only a
+/// root-wide listing takes it. A listing scoped to a path operand or to a
+/// subdirectory cwd goes through the index's scoped sweep, which walks
+/// just that subtree (on a kernel-scale tree `--files` in a small
+/// subdirectory took 64 ms through the cache and takes 14 ms this way).
+/// Either way the answer is the authoritative one.
+#[test]
+fn only_root_wide_listings_use_the_cache() {
+    let dir = setup(base_fixture);
+    let uses_cache = |cwd: &Path, args: &[&str]| -> bool {
+        let out = glep()
+            .arg("--files")
+            .args(args)
+            .current_dir(cwd)
+            .env("GLEP_TIMING", "1")
+            .output()
+            .expect("glep run");
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).contains("listing_cache")
+    };
+    let root = dir.path();
+    let sub = dir.path().join("a");
+    assert!(uses_cache(root, &[]));
+    assert!(uses_cache(root, &["**/*.txt"]));
+    assert!(uses_cache(root, &["**", "."]));
+    assert!(uses_cache(&sub, &["**", ".."]));
+    assert!(!uses_cache(root, &["**", "a"]));
+    assert!(!uses_cache(root, &["**/*.txt", "a/b", "z"]));
+    assert!(!uses_cache(&sub, &[]));
+    assert!(!uses_cache(&sub, &["**/*.txt", "b"]));
+    for (cwd, args) in [
+        (sub.as_path(), &[][..]),
+        (sub.as_path(), &["**/*.txt", "b"]),
+        (sub.as_path(), &["**", ".."]),
+        (root, &["**", "a"]),
+        (root, &["**/*.txt", "a/b", "z"]),
+    ] {
+        assert_eq!(cached_listing(cwd, args), listing(cwd, args), "{args:?}");
+    }
+}
+
+/// Whether `--files` in `dir` was answered by the listing cache.
+fn uses_cache(dir: &Path) -> bool {
+    let out = glep()
+        .arg("--files")
+        .current_dir(dir)
+        .env("GLEP_TIMING", "1")
+        .output()
+        .expect("glep run");
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stderr).contains("listing_cache")
+}
+
+/// A leaf directory's own `.ignore` or `.rgignore` keeps the cache in
+/// use (the leaf is served from it), and an in-place edit of that file,
+/// which changes no directory mtime, is still seen by the next listing.
+fn leaf_dot_ignore_edit_is_seen(name: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    base_fixture(dir.path());
+    fs::write(dir.path().join("z").join(name), "y.rs\n").unwrap();
+    glep()
+        .arg("index")
+        .current_dir(dir.path())
+        .output()
+        .expect("index");
+    warm(dir.path());
+    assert!(uses_cache(dir.path()), "{name}: cache not used");
+    let before = cached_listing(dir.path(), &[]);
+    assert!(!before.contains("y.rs"), "{name}: {before}");
+    assert_eq!(before, listing(dir.path(), &[]));
+    fs::write(dir.path().join("z").join(name), "none.txt\n").unwrap();
+    let cached = cached_listing(dir.path(), &[]);
+    assert!(
+        cached.contains("z/y.rs"),
+        "{name}: in-place edit missed by cache: {cached}"
+    );
+    assert_eq!(cached, listing(dir.path(), &[]));
+}
+
+#[test]
+fn rgignore_edit_in_leaf_dir_flips_verdict() {
+    leaf_dot_ignore_edit_is_seen(".rgignore");
+}
+
+#[test]
+fn dot_ignore_edit_in_leaf_dir_flips_verdict() {
+    leaf_dot_ignore_edit_is_seen(".ignore");
+}
+
+/// An empty `.gitignore` in a leaf is still re-stat'ed: filling it in
+/// place must flip the verdicts it now carries.
+#[test]
+fn empty_gitignore_in_leaf_filled_in_place_is_seen() {
+    let dir = setup(|p| {
+        base_fixture(p);
+        fs::write(p.join("z/.gitignore"), "").unwrap();
+    });
+    assert!(cached_listing(dir.path(), &[]).contains("z/y.rs"));
+    fs::write(dir.path().join("z/.gitignore"), "y.rs\n").unwrap();
+    let cached = cached_listing(dir.path(), &[]);
+    assert!(
+        !cached.contains("y.rs"),
+        "in-place edit of an empty .gitignore missed by cache: {cached}"
+    );
+    assert_eq!(cached, listing(dir.path(), &[]));
+}
+
+/// A cache written by an older glep (another schema) is never served:
+/// the listing is rebuilt from a full sweep instead.
+#[test]
+fn older_cache_schema_is_rebuilt() {
+    let dir = setup(base_fixture);
+    let cache = dir.path().join(".glep/dirtree.bin");
+    let mut bytes = fs::read(&cache).unwrap();
+    // bincode writes the schema first, as a little-endian u32.
+    bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+    fs::write(&cache, &bytes).unwrap();
+    assert!(!uses_cache(dir.path()), "an old-schema cache was served");
+    assert!(uses_cache(dir.path()), "the cache was not rebuilt");
+    assert_eq!(cached_listing(dir.path(), &[]), listing(dir.path(), &[]));
+}

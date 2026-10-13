@@ -21,20 +21,23 @@
 //!      delete or rename inside L, including adding or removing a
 //!      subdirectory, which would make L non-leaf, bumps L's mtime.
 //!      In-place content edits never change the file set.
-//!   2. L's own `.gitignore` (mtime, size) is re-statted and matches the
-//!      cached values (only stat'ed when L recorded one): in-place
-//!      .gitignore edits flip verdicts without touching any mtime.
+//!   2. L's own `.gitignore`, `.ignore` and `.rgignore` (mtime, size) are
+//!      re-statted and match the cached values (only stat'ed when L
+//!      recorded one): in-place edits of an ignore file flip verdicts
+//!      without touching any mtime.
 //!   3. Every ancestor P on the path from the sweep root down was itself
 //!      scanned live this run, and each one's own `.gitignore` (mtime,
 //!      size) matched its cached node's recorded values
 //!      (`chain_stable`): the cached listing was filtered by exactly
 //!      those matchers.
 //!   4. Ignore sources ABOVE the sweep root (global excludes,
-//!      `.git/info/exclude`, ancestor `.gitignore` files) are captured as
-//!      a (path, mtime, size) fingerprint at cache time and re-statted on
-//!      every use; any difference discards the whole cache. (`.ignore` /
-//!      `.rgignore` never coexist with a cache: their presence anywhere
-//!      makes the bulk walker itself fall back to the portable walker.)
+//!      `.git/info/exclude`, ancestor `.gitignore`, `.ignore` and
+//!      `.rgignore` files) are captured as a (path, mtime, size)
+//!      fingerprint at cache time and re-statted on every use; any
+//!      difference discards the whole cache. (An in-tree `.ignore` /
+//!      `.rgignore` is only ever served from a pruned leaf: in a directory
+//!      the walk lists live, its presence makes the listing fall back to
+//!      the portable walker.)
 //!
 //! The cache lives in `.glep/dirtree.bin`, is written atomically
 //! (tmp + rename), and is independent of the manifest's trigram postings:
@@ -45,12 +48,19 @@
 //! so a stale or even corrupt cache can only cost speed, never
 //! correctness. `GLEP_NO_DIRCACHE=1` disables the whole mechanism.
 
+// Built and unit-tested on every platform; only the macOS listing path
+// (cli.rs, walk_bulk.rs) uses it.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use crate::walk::FileMeta;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: u32 = 1;
+/// Bumped whenever a cached listing could differ from what the current
+/// walker would list (2: `.rgignore` files are honored, and leaves record
+/// their own `.ignore`/`.rgignore`), so an older cache is rebuilt once.
+pub const SCHEMA: u32 = 2;
 
 /// Give up on the pruned walk and fall back to the full sweep once this
 /// many directories have had to be re-scanned live. The pruned path's
@@ -82,6 +92,11 @@ pub struct DirNode {
     pub gitignore_size: u64,
     /// Any `.gitignore` at or below this node (including itself).
     pub has_ignore_subtree: bool,
+    /// This directory's own `.ignore` and `.rgignore` (file name, mtime,
+    /// size), recorded when the cache is built from a full sweep. Only a
+    /// pruned leaf can hold any (a directory listed live with one falls
+    /// back to the walker), and the prune re-stats each one.
+    pub dot_ignores: Vec<IgnoreSrc>,
     /// Immediate files that survived ignore filtering at cache time,
     /// hidden included (each carries its own `hidden` flag).
     pub files: Vec<FileMeta>,
@@ -96,6 +111,23 @@ pub struct DirTree {
     /// resolved at cache time (see module docs, precondition 4).
     pub fingerprint: Vec<IgnoreSrc>,
     pub root: DirNode,
+}
+
+/// Whether the file at `p` still has the recorded (mtime, size); false
+/// when it cannot be stat'ed.
+pub fn unchanged(p: &Path, mtime_ns: u128, size: u64) -> bool {
+    match std::fs::metadata(p) {
+        Ok(md) => {
+            let m = md
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            m == mtime_ns && md.len() == size
+        }
+        Err(_) => false,
+    }
 }
 
 fn stat_src(p: PathBuf) -> IgnoreSrc {
@@ -124,10 +156,11 @@ fn stat_src(p: PathBuf) -> IgnoreSrc {
 /// Fingerprint every ignore source above (and including git plumbing for)
 /// `root`: the global excludes file (resolved exactly like the `ignore`
 /// crate resolves it, via `gitconfig_excludes_path`), `.git/info/exclude`
-/// of the enclosing repo, and every ancestor `.gitignore` up to the git
-/// root (bounded by the same cap the bulk walker uses). Mirrors
-/// `walk_bulk::build_ancestor_stack`'s discovery so the two never
-/// disagree about what "above the root" means.
+/// of the enclosing repo, every ancestor `.gitignore` up to the git root
+/// (bounded by the same cap the bulk walker uses), and every ancestor
+/// `.ignore` and `.rgignore`. Mirrors `walk_bulk::build_ancestor_stack` and
+/// `build_ancestor_dot_ignores` so they never disagree about what "above
+/// the root" means.
 pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
     let mut v = Vec::new();
     if let Some(p) = ignore::gitignore::gitconfig_excludes_path() {
@@ -161,6 +194,17 @@ pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
             v.push(stat_src(gi));
         }
     }
+    // Every `.ignore` and `.rgignore` above the root, all the way up, like
+    // the bulk walker's `build_ancestor_dot_ignores`: creating, editing or
+    // deleting one changes the fingerprint and discards the cache.
+    for dir in canon.ancestors().skip(1) {
+        for name in [".ignore", crate::walk::RGIGNORE] {
+            let f = dir.join(name);
+            if f.is_file() {
+                v.push(stat_src(f));
+            }
+        }
+    }
     v
 }
 
@@ -177,6 +221,7 @@ impl DirNode {
             gitignore_mtime_ns: 0,
             gitignore_size: 0,
             has_ignore_subtree: false,
+            dot_ignores: Vec::new(),
             files: Vec::new(),
             subdirs: Vec::new(),
         }
@@ -247,7 +292,21 @@ pub fn build_from_listing(
             None => PathBuf::new(),
         };
         ensure_dir(&parent, &mut dirs);
-        dirs.get_mut(&parent).unwrap().0.files.push(meta.clone());
+        let node = &mut dirs.get_mut(&parent).unwrap().0;
+        // The directory's own `.ignore`/`.rgignore`, with the sweep's
+        // (mtime, size): a pruned leaf re-stats them.
+        if let Some(name) = meta
+            .path
+            .file_name()
+            .filter(|n| *n == ".ignore" || *n == crate::walk::RGIGNORE)
+        {
+            node.dot_ignores.push(IgnoreSrc {
+                path: PathBuf::from(name),
+                mtime_ns: meta.mtime_ns,
+                size: meta.size,
+            });
+        }
+        node.files.push(meta.clone());
     }
 
     // stat each dir + probe .gitignore
@@ -314,15 +373,7 @@ pub fn build_from_listing(
     let root_node = dirs
         .remove(&PathBuf::new())
         .map(|(n, _)| n)
-        .unwrap_or(DirNode {
-            rel: PathBuf::new(),
-            mtime_ns: 0,
-            gitignore_mtime_ns: 0,
-            gitignore_size: 0,
-            has_ignore_subtree: false,
-            files: Vec::new(),
-            subdirs: Vec::new(),
-        });
+        .unwrap_or_else(|| DirNode::default_for(Path::new("")));
     DirTree {
         schema: SCHEMA,
         fingerprint,
