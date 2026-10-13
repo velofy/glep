@@ -1017,13 +1017,12 @@ impl Scope {
             filters::OperandKind::File => true,
             filters::OperandKind::Walked(files) => !files.is_empty(),
             filters::OperandKind::Dir => {
-                let base = op.path.components().count();
                 let prefix = op.path.clone();
+                let all = prefix.as_os_str().is_empty();
                 let filters = &mut self.filters;
+                filters.begin_operand(&prefix);
                 let mut live = live;
-                live.any(|(f, hidden)| {
-                    (base == 0 || f.starts_with(&prefix)) && filters.keep(f, base, hidden)
-                })
+                live.any(|(f, hidden)| (all || f.starts_with(&prefix)) && filters.keep(f, hidden))
             }
         }
     }

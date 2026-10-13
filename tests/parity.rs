@@ -1484,6 +1484,10 @@ fn subdirectory_runs_match_rg() {
         &["-l", "-g", "!/main.rs", "fn|answer"],
         &["-l", "-g", "!deep", "answer|hello"],
         &["--files", "-g", "deep/*"],
+        // Under a `..` operand rg matches globs against `../...` paths.
+        &["-c", "hello", "..", "-g", "!../src"],
+        &["-c", "hello", "..", "-g", "!src"],
+        &["-c", "hello", "..", "-g", "../*.md"],
         // The cwd scope is still rg's implicit path: when filters leave
         // nothing to search, rg warns and exits 2.
         &["-g", "*.zz", "hello"],

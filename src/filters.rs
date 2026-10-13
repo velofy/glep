@@ -129,7 +129,13 @@ pub struct Filters {
     dirs: HashMap<(PathBuf, bool), bool>,
     /// The last file's parent and verdict: sorted input makes runs of
     /// files in one directory the common case.
-    last_parent: Option<(PathBuf, usize, bool, bool)>,
+    last_parent: Option<(PathBuf, bool, bool)>,
+    /// The operand being filtered (see `begin_operand`): root-relative,
+    /// its component count, and whether it lies outside the cwd (then the
+    /// paths rg matches start with the operand as typed, `..` and all).
+    op: PathBuf,
+    op_base: usize,
+    op_outside_cwd: bool,
 }
 
 impl Filters {
@@ -163,7 +169,35 @@ impl Filters {
             tree_rules: WhitelistChecker::new(),
             dirs: HashMap::new(),
             last_parent: None,
+            op: PathBuf::new(),
+            op_base: 0,
+            op_outside_cwd: !cwd_rel.as_os_str().is_empty(),
         })
+    }
+
+    /// Filter the files of this operand (root-relative) from now on. rg
+    /// matches globs and --ignore-file rules against the paths its walk
+    /// yields: the operand as typed (cwd-relative), then the path below
+    /// it. Directory verdicts depend on that, so they reset per operand.
+    pub fn begin_operand(&mut self, op: &Path) {
+        if self.op != op {
+            self.op = op.to_path_buf();
+            self.op_base = op.components().count();
+            self.op_outside_cwd = !op.starts_with(&self.cwd_rel);
+            self.dirs.clear();
+            self.last_parent = None;
+        }
+    }
+
+    /// The path rg's walk of the current operand yields for `l`.
+    fn walked_path<'a>(&self, l: &'a Path) -> std::borrow::Cow<'a, Path> {
+        if !self.op_outside_cwd {
+            // Under the cwd the walk path is just the cwd-relative path.
+            return display_rel(l, &self.cwd_rel);
+        }
+        let mut p = display_rel(&self.op, &self.cwd_rel).into_owned();
+        p.extend(l.components().skip(self.op_base));
+        std::borrow::Cow::Owned(p)
     }
 
     /// The override matcher, for walkers that apply it themselves.
@@ -176,36 +210,34 @@ impl Filters {
         self.types.as_ref()
     }
 
-    /// Whether rg would yield `f` (root-relative) when walking the operand
-    /// whose path has `base` components. `hidden` is the sweep's flag:
-    /// some dot-named component of `f` is not whitelisted by ignore rules.
-    pub fn keep(&mut self, f: &Path, base: usize, hidden: bool) -> bool {
+    /// Whether rg would yield `f` (root-relative, under the operand set by
+    /// `begin_operand`) when walking that operand. `hidden` is the sweep's
+    /// flag: some dot-named component of `f` is not whitelisted by ignore
+    /// rules.
+    pub fn keep(&mut self, f: &Path, hidden: bool) -> bool {
         let hidden_check = hidden && !self.show_hidden;
         let rules = self.overrides.is_some() || !self.explicit.is_empty() || self.types.is_some();
         if self.max_depth.is_none() && !rules && !hidden_check {
             return true;
         }
-        let depth = f.components().count().saturating_sub(base);
+        let depth = f.components().count().saturating_sub(self.op_base);
         if self.max_depth.is_some_and(|d| depth > d) {
             return false;
         }
         if !rules && !hidden_check {
             return true;
         }
-        if (self.prune_dirs || hidden_check)
-            && depth > 1
-            && !self.dirs_ok(f, base, depth, hidden_check)
-        {
+        if (self.prune_dirs || hidden_check) && depth > 1 && !self.dirs_ok(f, depth, hidden_check) {
             return false;
         }
         self.level_ok(f, false, hidden_check)
     }
 
     /// Every directory strictly between the operand and `f` survives.
-    fn dirs_ok(&mut self, f: &Path, base: usize, depth: usize, hidden_check: bool) -> bool {
+    fn dirs_ok(&mut self, f: &Path, depth: usize, hidden_check: bool) -> bool {
         let parent = f.parent().unwrap_or(Path::new(""));
-        if let Some((p, b, h, ok)) = &self.last_parent {
-            if *b == base && *h == hidden_check && p == parent {
+        if let Some((p, h, ok)) = &self.last_parent {
+            if *h == hidden_check && p == parent {
                 return *ok;
             }
         }
@@ -227,14 +259,14 @@ impl Filters {
                 break;
             }
         }
-        self.last_parent = Some((parent.to_path_buf(), base, hidden_check, ok));
+        self.last_parent = Some((parent.to_path_buf(), hidden_check, ok));
         ok
     }
 
     /// rg's verdict for one level (a directory below the operand, or the
     /// file itself), with the steps described in the module docs.
     fn level_ok(&mut self, l: &Path, is_dir: bool, hidden_check: bool) -> bool {
-        let shown = display_rel(l, &self.cwd_rel);
+        let shown = self.walked_path(l);
         if let Some(ov) = &self.overrides {
             match ov.matched(&*shown, is_dir) {
                 Match::Ignore(_) => return false,
@@ -337,12 +369,13 @@ impl Filters {
                 OperandKind::Walked(files) => return files.clone(),
                 OperandKind::Dir => {}
             }
-            let base = op.path.components().count();
+            self.begin_operand(&op.path);
             let p = &op.path;
-            plain.retain(|f| (base == 0 || f.starts_with(p)) && self.keep(f, base, false));
+            let all = p.as_os_str().is_empty();
+            plain.retain(|f| (all || f.starts_with(p)) && self.keep(f, false));
             let hidden: Vec<PathBuf> = hidden
                 .into_iter()
-                .filter(|f| (base == 0 || f.starts_with(p)) && self.keep(f, base, true))
+                .filter(|f| (all || f.starts_with(p)) && self.keep(f, true))
                 .collect();
             return merge_sorted(plain, hidden);
         }
@@ -352,17 +385,18 @@ impl Filters {
                 OperandKind::File => out.push(op.path.clone()),
                 OperandKind::Walked(files) => out.extend(files.iter().cloned()),
                 OperandKind::Dir => {
-                    let base = op.path.components().count();
+                    self.begin_operand(&op.path);
                     let p = &op.path;
+                    let all = p.as_os_str().is_empty();
                     let mut mine = Vec::new();
                     for f in &plain {
-                        if (base == 0 || f.starts_with(p)) && self.keep(f, base, false) {
+                        if (all || f.starts_with(p)) && self.keep(f, false) {
                             mine.push(f.clone());
                         }
                     }
                     let mut mine_hidden = Vec::new();
                     for f in &hidden {
-                        if (base == 0 || f.starts_with(p)) && self.keep(f, base, true) {
+                        if (all || f.starts_with(p)) && self.keep(f, true) {
                             mine_hidden.push(f.clone());
                         }
                     }
@@ -396,11 +430,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let globs = vec!["!vendor".to_string()];
         let mut f = Filters::new(&spec(&globs), dir.path(), Path::new("")).unwrap();
-        assert!(!f.keep(Path::new("vendor/x/a.txt"), 0, false));
-        assert!(f.keep(Path::new("src/vendor.txt"), 0, false));
-        assert!(f.keep(Path::new("src/b.txt"), 0, false));
+        f.begin_operand(Path::new(""));
+        assert!(!f.keep(Path::new("vendor/x/a.txt"), false));
+        assert!(f.keep(Path::new("src/vendor.txt"), false));
+        assert!(f.keep(Path::new("src/b.txt"), false));
         // The operand itself is never checked.
-        assert!(f.keep(Path::new("vendor/x/a.txt"), 1, false));
+        f.begin_operand(Path::new("vendor"));
+        assert!(f.keep(Path::new("vendor/x/a.txt"), false));
+    }
+
+    #[test]
+    fn globs_see_an_operand_above_the_cwd_as_typed() {
+        // From `src`, the operand `..` yields `../src/b.txt`, which rg
+        // matches against `!../src` (and `!src`, at any depth).
+        let dir = tempfile::tempdir().unwrap();
+        for g in ["!../src", "!src"] {
+            let globs = vec![g.to_string()];
+            let mut f = Filters::new(&spec(&globs), dir.path(), Path::new("src")).unwrap();
+            f.begin_operand(Path::new(""));
+            assert!(!f.keep(Path::new("src/b.txt"), false), "{g}");
+            assert!(f.keep(Path::new("README.md"), false), "{g}");
+        }
     }
 
     #[test]
@@ -408,8 +458,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let globs = vec!["deep/**".to_string()];
         let mut f = Filters::new(&spec(&globs), dir.path(), Path::new("src")).unwrap();
-        assert!(f.keep(Path::new("src/deep/util.rs"), 1, false));
-        assert!(!f.keep(Path::new("src/main.rs"), 1, false));
+        f.begin_operand(Path::new("src"));
+        assert!(f.keep(Path::new("src/deep/util.rs"), false));
+        assert!(!f.keep(Path::new("src/main.rs"), false));
     }
 
     #[test]
