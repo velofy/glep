@@ -9,9 +9,9 @@
 //! 1. -g/--iglob overrides: a matching `!glob` skips the entry (a skipped
 //!    directory prunes its whole subtree), a matching glob keeps it; when
 //!    positive globs exist, a file matching none of them is skipped.
-//! 2. Ignore rules (.gitignore, .ignore, excludes, global, and last the
-//!    --ignore-file rules): ignored entries are skipped; a whitelist
-//!    (`!rule`) marks the entry whitelisted.
+//! 2. Ignore rules (.rgignore, .ignore, .gitignore, excludes, global,
+//!    and last the --ignore-file rules): ignored entries are skipped; a
+//!    whitelist (`!rule`) marks the entry whitelisted.
 //! 3. -t/-T types (files only): a negated type skips, a selected type
 //!    whitelists, and with any selection an unmatched file is skipped.
 //! 4. Hidden: a dot-named entry is skipped unless --hidden or something

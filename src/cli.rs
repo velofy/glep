@@ -159,9 +159,9 @@ pub struct Args {
     /// must not enter the index, so this never touches .glep.
     #[arg(long)]
     pub one_file_system: bool,
-    /// Don't respect .ignore files (rg --no-ignore-dot). Files excluded
-    /// only by .ignore aren't in the index, so this is a live-scan escape
-    /// hatch.
+    /// Don't respect .ignore and .rgignore files (rg --no-ignore-dot).
+    /// Files excluded only by them aren't in the index, so this is a
+    /// live-scan escape hatch.
     #[arg(long)]
     pub no_ignore_dot: bool,
     /// Don't respect VCS ignore rules: .gitignore, .git/info/exclude and
@@ -1137,6 +1137,9 @@ fn walk_positions(
         .follow_links(args.follow)
         .same_file_system(args.one_file_system)
         .filter_entry(|e| e.file_name() != ".git" && e.file_name() != ".glep");
+    if respect && !args.no_ignore_dot {
+        walk::add_rgignore(&mut wb);
+    }
     let mut pos = std::collections::HashMap::new();
     for ent in wb.build().flatten() {
         if ent.file_type().is_some_and(|t| t.is_dir()) {

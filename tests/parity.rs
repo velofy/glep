@@ -2200,3 +2200,73 @@ fn no_ignore_vcs_drops_exclude_and_global_like_rg() {
     ];
     check_cases_home(&repo, home.path(), "repo sorted", sorted);
 }
+
+/// rg reads `.rgignore` wherever it reads `.ignore` (in the tree and in
+/// the directories above it, never under --no-ignore-dot), and its rules
+/// outrank every other ignore file at any depth: a `!` rule there brings
+/// back what `.ignore` or `.gitignore` excludes and rescues dotfiles.
+#[test]
+fn rgignore_files_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let outer = tempfile::tempdir().unwrap();
+    let d = outer.path().join("tree");
+    for (p, body) in [
+        (
+            ".rgignore",
+            "pad.txt\n*.rgx\n!.env\n!x.txt\n!y.txt\n!.hd/\n!a.txt\n",
+        ),
+        (".ignore", "x.txt\n"),
+        (".gitignore", "y.txt\nz.txt\n"),
+        ("sub/.ignore", "a.txt\n"),
+        ("sub/.rgignore", "mm.txt\n"),
+        ("leaf/.rgignore", "q.txt\n"),
+        ("pad.txt", "hello pad\n"),
+        ("f.rgx", "hello rgx\n"),
+        (".env", "hello env\n"),
+        ("x.txt", "hello x\n"),
+        ("y.txt", "hello y\n"),
+        ("z.txt", "hello z\n"),
+        ("main.txt", "hello main\n"),
+        ("sub/a.txt", "hello a\n"),
+        ("sub/mm.txt", "aa hello mm\n"),
+        ("sub/other.txt", "aa hello other\n"),
+        (".hd/h.txt", "hello hd\n"),
+        (".hd2/h.txt", "hello hd2\n"),
+        ("leaf/q.txt", "hello q\n"),
+        ("leaf/r.txt", "hello r\n"),
+    ] {
+        let p = d.join(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["hello"],
+        &["-l", "hello"],
+        &["-l", "aa"],
+        &["--files"],
+        &["--hidden", "--files"],
+        &["-c", "hello", "sub"],
+        &["--no-ignore-dot", "-l", "hello"],
+        &["--no-ignore-vcs", "-l", "hello"],
+        &["--no-ignore-parent", "-l", "aa", "sub"],
+        &["--files-without-match", "zz_absent_zz"],
+        &["-g", "!sub", "-l", "hello"],
+        &["--sort", "modified", "--files"],
+    ];
+    check_cases(&d, "tree", cases);
+    check_cases(&d.join("sub"), "tree sub", cases);
+    // A .rgignore above the root applies through the parent directories,
+    // as rg's walker reads it.
+    std::fs::write(outer.path().join(".rgignore"), "main.txt\nr.txt\n").unwrap();
+    check_cases(&d, "ancestor", cases);
+    // In-place edits of a leaf's .rgignore change no directory mtime; a
+    // warm listing cache must still see them.
+    warm_listing_cache(&d);
+    std::fs::write(d.join("leaf/.rgignore"), "r.txt\n").unwrap();
+    check_cases(&d, "leaf edit", cases);
+    std::fs::write(outer.path().join(".rgignore"), "z.txt\n").unwrap();
+    check_cases(&d, "ancestor edit", cases);
+}
