@@ -1544,8 +1544,29 @@ fn subdirectory_runs_match_rg() {
         &["-l", "hello", &up],
         &["-c", "hello", &up, "main.rs"],
         &["-l", "hello", abs],
+        // --path-separator rewrites every separator byte, the root's
+        // included, as rg's printers do.
+        &["--path-separator", "%", "-l", "hello", abs],
+        &["--path-separator", "/", "-c", "hello", abs],
+        &["--path-separator", "%", "--count-matches", "hello", abs],
+        &[
+            "--path-separator",
+            "%",
+            "--files-without-match",
+            "zz_absent_zz",
+            abs,
+        ],
+        &["--path-separator", "%", "-c", "hello", &up],
+        &["--path-separator", "%", "hello", abs],
     ];
     check_cases(&sub, "subdir outside", away);
+    // The --files listing too (glep's pattern slot is a glob, rg's
+    // positionals are paths).
+    for sep in ["%", "/"] {
+        let glep = glep_out(&sub, &["--path-separator", sep, "--files", "**", abs]);
+        let rg = rg_out(&sub, &["--path-separator", sep, "--files", abs]);
+        assert_eq!(glep, rg, "--path-separator {sep} --files {abs}");
+    }
 }
 
 /// Directory operands the index holds no file under are walked live with

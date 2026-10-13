@@ -963,21 +963,21 @@ impl PathStyle {
     }
 }
 
-/// Write `rel` honoring --path-separator (components rejoined by the
-/// custom byte).
+/// Write `rel` honoring --path-separator the way rg's printers do: every
+/// `/` byte (and `\` on Windows) becomes the custom byte. Rejoining the
+/// path's components instead printed an absolute path's root as a
+/// segment of its own (`//x`, `/%x`, and `C:/\/x` on Windows).
 fn write_path(out: &mut Vec<u8>, rel: &Path, sep: Option<u8>) {
+    let bytes = rel.as_os_str().as_encoded_bytes();
     match sep {
-        None => out.extend_from_slice(rel.as_os_str().as_encoded_bytes()),
-        Some(sep) => {
-            let mut first = true;
-            for c in rel.components() {
-                if !first {
-                    out.push(sep);
-                }
-                first = false;
-                out.extend_from_slice(c.as_os_str().as_encoded_bytes());
+        None => out.extend_from_slice(bytes),
+        Some(sep) => out.extend(bytes.iter().map(|&b| {
+            if b == b'/' || (cfg!(windows) && b == b'\\') {
+                sep
+            } else {
+                b
             }
-        }
+        })),
     }
 }
 
@@ -2270,5 +2270,24 @@ mod tests {
             out, rg.stdout,
             "glep parallel -C1 output must match rg --sort path -C1"
         );
+    }
+
+    /// --path-separator maps separator bytes like rg's PrinterPath, so an
+    /// absolute path keeps a single leading separator.
+    #[test]
+    fn path_separator_maps_bytes_like_rg() {
+        let render = |p: &str, sep: u8| {
+            let mut out = Vec::new();
+            write_path(&mut out, Path::new(p), Some(sep));
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(render("/abs/dir/x.txt", b'%'), "%abs%dir%x.txt");
+        assert_eq!(render("/abs/dir/x.txt", b'/'), "/abs/dir/x.txt");
+        assert_eq!(render("rel/x.txt", b'%'), "rel%x.txt");
+        assert_eq!(render("../up/x.txt", b'%'), "..%up%x.txt");
+        if cfg!(windows) {
+            assert_eq!(render(r"C:\abs\x.txt", b'/'), "C:/abs/x.txt");
+            assert_eq!(render(r"src\x.txt", b'%'), "src%x.txt");
+        }
     }
 }
