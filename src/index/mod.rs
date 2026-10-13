@@ -270,8 +270,20 @@ impl Index {
     /// path-sorted: rg may still show a hidden-flagged file (below a
     /// hidden operand, or whitelisted by -g/-t), so the query layer
     /// decides per file. With `include_hidden` every file is plain.
-    pub fn live_files_split(&self, include_hidden: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let ids: Vec<u32> = self.manifest.live_entries().map(|e| e.id).collect();
+    /// `under` keeps only the files below one of those directories (None
+    /// keeps every file), so a scoped listing never clones and sorts the
+    /// whole tree's paths.
+    pub fn live_files_split(
+        &self,
+        include_hidden: bool,
+        under: Option<&[PathBuf]>,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let ids: Vec<u32> = self
+            .manifest
+            .live_entries()
+            .filter(|e| under.is_none_or(|dirs| dirs.iter().any(|d| e.path.starts_with(d))))
+            .map(|e| e.id)
+            .collect();
         self.split_hidden(ids, include_hidden)
     }
 

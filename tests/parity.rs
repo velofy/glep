@@ -1870,6 +1870,65 @@ fn listing_cache_with_ancestor_dot_ignore() {
     }
 }
 
+/// Scoped listings (path operands, a subdirectory cwd) come from the
+/// index's scoped sweep even when the listing cache is warm, and list
+/// what rg lists, filters and hidden operands included. The
+/// --files-without-match universe is scoped the same way. glep's --files
+/// takes a glob where rg takes paths, hence the paired argument lists.
+#[test]
+fn scoped_listings_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    let d = dir.path();
+    warm_listing_cache(d);
+    let deep = format!("src{}deep", std::path::MAIN_SEPARATOR);
+    let pairs: &[(&[&str], &[&str])] = &[
+        (&["--files", "**", "src"], &["--files", "src"]),
+        (
+            &["--files", "**", "src", "dotkit"],
+            &["--files", "src", "dotkit"],
+        ),
+        (&["--files", "**", &deep, "src"], &["--files", &deep, "src"]),
+        (
+            &["--hidden", "--files", "**", "dotkit", ".github"],
+            &["--hidden", "--files", "dotkit", ".github"],
+        ),
+        (
+            &["-g", "*.rs", "--files", "**", "src"],
+            &["-g", "*.rs", "--files", "src"],
+        ),
+    ];
+    for (glep_args, rg_args) in pairs {
+        assert_eq!(glep_out(d, glep_args), rg_out(d, rg_args), "{glep_args:?}");
+    }
+    let cases: &[&[&str]] = &[
+        &["--files-without-match", "hello", "src", "dotkit"],
+        &[
+            "--files-without-match",
+            "-g",
+            "*.txt",
+            "hello",
+            "dotkit",
+            "src",
+        ],
+    ];
+    check_cases(d, "scoped", cases);
+    let sub = d.join("src");
+    assert_eq!(glep_out(&sub, &["--files"]), rg_out(&sub, &["--files"]));
+    assert_eq!(
+        glep_out(&sub, &["--files", "**", "deep"]),
+        rg_out(&sub, &["--files", "deep"])
+    );
+    let in_sub: &[&[&str]] = &[
+        &["--files-without-match", "hello"],
+        &["--files-without-match", "zz_absent_zz", "deep"],
+    ];
+    check_cases(&sub, "scoped subdir", in_sub);
+}
+
 /// Filters applied after a listing (globs, types, depth, hidden, extra
 /// ignore files) give the same answer whether or not the cache served it.
 #[test]

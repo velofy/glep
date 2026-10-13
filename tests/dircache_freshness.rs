@@ -279,3 +279,44 @@ fn unserved_operands_list_the_same_through_the_cache() {
         assert!(cached.contains("build/"), "{args:?}: {cached}");
     }
 }
+
+/// The cache's pruned walk always covers the whole tree, so only a
+/// root-wide listing takes it. A listing scoped to a path operand or to a
+/// subdirectory cwd goes through the index's scoped sweep, which walks
+/// just that subtree (on a kernel-scale tree `--files` in a small
+/// subdirectory took 75 ms through the cache and takes 14 ms this way).
+/// Either way the answer is the authoritative one.
+#[test]
+fn only_root_wide_listings_use_the_cache() {
+    let dir = setup(base_fixture);
+    let uses_cache = |cwd: &Path, args: &[&str]| -> bool {
+        let out = glep()
+            .arg("--files")
+            .args(args)
+            .current_dir(cwd)
+            .env("GLEP_TIMING", "1")
+            .output()
+            .expect("glep run");
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).contains("listing_cache")
+    };
+    let root = dir.path();
+    let sub = dir.path().join("a");
+    assert!(uses_cache(root, &[]));
+    assert!(uses_cache(root, &["**/*.txt"]));
+    assert!(uses_cache(root, &["**", "."]));
+    assert!(uses_cache(&sub, &["**", ".."]));
+    assert!(!uses_cache(root, &["**", "a"]));
+    assert!(!uses_cache(root, &["**/*.txt", "a/b", "z"]));
+    assert!(!uses_cache(&sub, &[]));
+    assert!(!uses_cache(&sub, &["**/*.txt", "b"]));
+    for (cwd, args) in [
+        (sub.as_path(), &[][..]),
+        (sub.as_path(), &["**/*.txt", "b"]),
+        (sub.as_path(), &["**", ".."]),
+        (root, &["**", "a"]),
+        (root, &["**/*.txt", "a/b", "z"]),
+    ] {
+        assert_eq!(cached_listing(cwd, args), listing(cwd, args), "{args:?}");
+    }
+}

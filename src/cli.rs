@@ -984,26 +984,20 @@ impl Scope {
         }
     }
 
-    /// The directory operands below the root: the ones the index might
-    /// not serve.
-    #[cfg(target_os = "macos")]
-    fn dir_operands(&self) -> Vec<PathBuf> {
-        self.operands
-            .iter()
-            .filter(|op| {
-                matches!(op.kind, filters::OperandKind::Dir) && !op.path.as_os_str().is_empty()
-            })
-            .map(|op| op.path.clone())
-            .collect()
-    }
-
-    /// Whether some operand was walked live (its files bypass the
-    /// index-side filtering).
-    #[cfg(target_os = "macos")]
-    fn has_walked(&self) -> bool {
-        self.operands
-            .iter()
-            .any(|op| matches!(op.kind, filters::OperandKind::Walked(_)))
+    /// The paths of the directory operands the index serves, when every
+    /// one lies below the root: only files under them can be selected.
+    /// None when one of them is the root itself (every file can be).
+    fn dir_prefixes(&self) -> Option<Vec<PathBuf>> {
+        let mut dirs = Vec::new();
+        for op in &self.operands {
+            if matches!(op.kind, filters::OperandKind::Dir) {
+                if op.path.as_os_str().is_empty() {
+                    return None;
+                }
+                dirs.push(op.path.clone());
+            }
+        }
+        Some(dirs)
     }
 
     /// Whether the implicit scope's walk would search at least one file
@@ -1447,19 +1441,25 @@ fn report_nothing_searched() {
     );
 }
 
-/// True when no flag changes what the listing cache would list or the
+/// True when the listing cache is the fast way to answer: a root-wide
+/// listing whose flags change neither what the cache would list nor the
 /// order it is printed in. Every flag that changes listing SEMANTICS
 /// (--no-ignore and -u/-uu/-uuu, the --no-ignore-* toggles, -L,
 /// --one-file-system, --require-git outside a repo, --no-index) takes a
 /// live-scan escape hatch before the cache is ever consulted; the
 /// remaining filters (-g, -t/-T/--type-add/--type-clear, --ignore-file,
-/// --max-depth, path operands, --hidden, the glob slot) are pure
-/// functions of the path applied identically after either listing.
-/// Timestamp sorts need a live walk order and live metadata, so they
-/// bypass the cache.
+/// --max-depth, --hidden, the glob slot) are pure functions of the path
+/// applied identically after either listing. Timestamp sorts need a live
+/// walk order and live metadata, so they bypass the cache.
+///
+/// The cache's pruned walk always covers the whole tree, so a scoped
+/// listing (a path operand below the root, or the cwd scope of a
+/// subdirectory run) is cheaper through the index's scoped sweep, which
+/// walks only the operands: on a kernel-scale tree `--files` in `rust/`
+/// takes about 9 ms that way against 75 ms through the cache.
 #[cfg(target_os = "macos")]
 fn listing_cache_eligible(args: &Args) -> bool {
-    sort_is_path_order(args)
+    sort_is_path_order(args) && args.paths.iter().all(|p| p.as_os_str().is_empty())
 }
 
 /// macOS-only fast listing via the dir-mtime cache (see dircache.rs):
@@ -1475,7 +1475,6 @@ fn listing_via_cache<F>(
     root: &Path,
     index_dir: &Path,
     keep: F,
-    probe: &[PathBuf],
     timings: &mut Timings,
 ) -> Option<CachedListing>
 where
@@ -1507,13 +1506,7 @@ where
         };
         let _ = updated.save(index_dir);
     }
-    // Whether the full listing holds a file under each probed operand,
-    // before `keep` narrows it.
     use rayon::prelude::*;
-    let present: Vec<bool> = probe
-        .iter()
-        .map(|op| outcome.files.par_iter().any(|m| m.path.starts_with(op)))
-        .collect();
     // Parallel filter: 86k globset matches on a kernel-scale tree cost
     // ~15ms serial, ~2ms across the pool. Only the kept paths are cloned,
     // split by the sweep's hidden flag like the index's live_files_split.
@@ -1537,21 +1530,15 @@ where
             t1.elapsed().as_secs_f64() * 1000.0
         );
     }
-    Some(CachedListing {
-        plain,
-        hidden,
-        present,
-    })
+    Some(CachedListing { plain, hidden })
 }
 
 /// A listing served by the dir-mtime cache: the kept paths split by the
-/// hidden flag (unsorted), and for each probed operand whether the full
-/// listing held any file under it.
+/// hidden flag (unsorted).
 #[cfg(target_os = "macos")]
 struct CachedListing {
     plain: Vec<PathBuf>,
     hidden: Vec<PathBuf>,
-    present: Vec<bool>,
 }
 
 /// Every --type-add, --type-clear, -t and -T in command-line order (rg
@@ -2037,17 +2024,17 @@ pub fn run() -> anyhow::Result<i32> {
         return run_live(&root, &cwd_rel, &args, &mut scope, &mut timings, had_error);
     }
 
-    // Dir-mtime cached listing (macOS only), consulted BEFORE even
-    // opening the index: this path needs no manifest, no postings, no
-    // freshness sweep, just the cache and the pruned walk. The index
-    // opens below only on cache miss. The cache lives in the discovered
-    // index dir, so subdirectory runs and GLEP_INDEX_PATH share it; the
-    // cwd scope and every other filter apply after the listing.
+    // Dir-mtime cached listing (macOS only) for root-wide listings,
+    // consulted BEFORE even opening the index: this path needs no
+    // manifest, no postings, no freshness sweep, just the cache and the
+    // pruned walk. The index opens below only on cache miss, and serves
+    // every scoped listing (see `listing_cache_eligible`). The cache
+    // lives in the discovered index dir, so GLEP_INDEX_PATH shares it;
+    // every filter applies after the listing.
     #[cfg(target_os = "macos")]
     if args.files && listing_cache_eligible(&args) {
         // The --files glob applies inside the listing (only its matches
-        // are cloned and sorted); the operands get their presence probe
-        // on the full listing first.
+        // are cloned and sorted).
         let glob_matcher = files_glob(&args)?;
         let glob_cwd = cwd_rel.clone();
         let keep = move |m: &crate::walk::FileMeta| -> bool {
@@ -2056,30 +2043,19 @@ pub fn run() -> anyhow::Result<i32> {
                 None => true,
             }
         };
-        let probe = scope.dir_operands();
-        if let Some(listing) =
-            listing_via_cache(&root, &root.join(".glep"), keep, &probe, &mut timings)
-        {
+        if let Some(listing) = listing_via_cache(&root, &root.join(".glep"), keep, &mut timings) {
             use rayon::prelude::*;
             let CachedListing {
                 mut plain,
                 mut hidden,
-                present,
             } = listing;
             if args.hidden {
                 plain.append(&mut hidden);
             }
-            scope.walk_unserved(&args, &cwd_rel, |op| {
-                probe.iter().zip(&present).any(|(p, &has)| has && p == op)
-            });
             // Path order: the scope groups operands from it.
             plain.par_sort();
             hidden.sort();
             let mut files = scope.select(plain, hidden);
-            if scope.has_walked() {
-                // Walked operands come back whole.
-                retain_glob(&mut files, files_glob(&args)?.as_ref(), &cwd_rel);
-            }
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
@@ -2105,10 +2081,11 @@ pub fn run() -> anyhow::Result<i32> {
     let (extra_plain, extra_hidden) = split_extra(&root, &extra, args.hidden);
     scope.walk_unserved(&args, &cwd_rel, |op| idx.has_files_under(op));
     timings.stage("operands");
-    // Every live file (the --files listing, the --files-without-match
-    // universe), split by the hidden flag.
+    // Every live file the scope can select (the --files listing, the
+    // --files-without-match universe), split by the hidden flag.
+    let scope_dirs = scope.dir_prefixes();
     let live_split = || {
-        let (mut plain, mut hidden) = idx.live_files_split(args.hidden);
+        let (mut plain, mut hidden) = idx.live_files_split(args.hidden, scope_dirs.as_deref());
         merge_extra(&mut plain, extra_plain.clone());
         merge_extra(&mut hidden, extra_hidden.clone());
         (plain, hidden)
