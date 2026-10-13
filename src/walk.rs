@@ -1236,30 +1236,39 @@ mod tests {
         /// truncated to whole seconds), every file would look changed the
         /// first time a query switched sweep paths, forcing a full reindex.
         /// Build with one path, update with the other, both directions:
-        /// zero files should ever look reindexed.
+        /// zero files should ever look reindexed. The fixture is aged out
+        /// of the racy window (whose files every sweep reads again), and
+        /// an unchanged generation rules out a compaction, which would
+        /// hide a reindex of every file by dropping the delta.
         #[test]
         fn mtime_resolution_survives_switching_sweep_paths_zero_reindex() {
             use crate::index::Index;
 
             // Case 1: build via the walker path, update via the bulk path.
             let dir = build_fixture();
+            crate::index::age_files(dir.path());
             std::env::set_var("GLEP_NO_BULK_SWEEP", "1");
             let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
             std::env::remove_var("GLEP_NO_BULK_SWEEP");
+            let generation = idx.manifest.generation;
             idx.update(1_048_576, 0).unwrap();
             assert!(
-                !dir.path().join(".glep/delta.bin").exists(),
+                !dir.path().join(".glep/delta.bin").exists()
+                    && idx.manifest.generation == generation,
                 "walker-built index saw files as changed after switching to the bulk sweep"
             );
 
             // Case 2: build via the bulk path, update via the walker path.
             let dir2 = build_fixture();
+            crate::index::age_files(dir2.path());
             let mut idx2 = Index::build(dir2.path(), 1_048_576).unwrap();
+            let generation = idx2.manifest.generation;
             std::env::set_var("GLEP_NO_BULK_SWEEP", "1");
             idx2.update(1_048_576, 0).unwrap();
             std::env::remove_var("GLEP_NO_BULK_SWEEP");
             assert!(
-                !dir2.path().join(".glep/delta.bin").exists(),
+                !dir2.path().join(".glep/delta.bin").exists()
+                    && idx2.manifest.generation == generation,
                 "bulk-built index saw files as changed after switching to the walker sweep"
             );
         }

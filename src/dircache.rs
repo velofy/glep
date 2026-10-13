@@ -286,6 +286,15 @@ impl DirTree {
     }
 }
 
+/// How far before a sweep's start an mtime is still treated as possibly
+/// written during that sweep. Filesystem timestamps are coarser than the
+/// clock that stamps the sweep start: Linux uses a coarse kernel clock that
+/// can lag by a tick, and HFS+ and FAT store whole seconds (FAT rounds to
+/// two). Distrusting a little too much only costs a rescan next time. The
+/// index's racy entries (`FLAG_RACY`) take the same slack around the read
+/// of a file's content; there, distrusting too much costs a second read.
+pub const RACY_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Build a DirTree from a flat, already-filtered listing (the full-sweep
 /// fallback path). Directories are grouped by parent path; each unique
 /// directory is stat'ed once for its mtime, probed once for a
@@ -301,13 +310,6 @@ impl DirTree {
 /// such an `.ignore`/`.rgignore` with a zero mtime, and such a
 /// fingerprint source as unknown, which no later stat matches (see the
 /// module docs).
-/// How far before a sweep's start an mtime is still treated as possibly
-/// written during that sweep. Filesystem timestamps are coarser than the
-/// clock that stamps the sweep start: Linux uses a coarse kernel clock that
-/// can lag by a tick, and HFS+ and FAT store whole seconds (FAT rounds to
-/// two). Distrusting a little too much only costs a rescan next time.
-pub const RACY_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
-
 pub fn build_from_listing(
     root: &Path,
     listing: &[FileMeta],

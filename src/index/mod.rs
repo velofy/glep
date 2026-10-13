@@ -7,8 +7,8 @@ use crate::trigram;
 use crate::walk::{self, FileMeta};
 use fs2::FileExt;
 use manifest::{
-    Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_NUL_LATE, FLAG_SKIP_BINARY, FLAG_SKIP_TOO_LARGE,
-    FLAG_TRANSCODE,
+    Manifest, FLAG_DEAD, FLAG_HIDDEN, FLAG_NUL_LATE, FLAG_RACY, FLAG_SKIP_BINARY,
+    FLAG_SKIP_TOO_LARGE, FLAG_TRANSCODE,
 };
 use postings::Postings;
 use std::collections::BTreeMap;
@@ -176,6 +176,84 @@ fn index_file(
     flags
 }
 
+/// The racy-mtime window around one clock reading (git's "racy git").
+/// The freshness sweep takes a file whose (mtime, size) matches its entry
+/// as unchanged, which holds only when every write after the entry's
+/// content was read moved the mtime. The filesystem stamps writes from a
+/// clock coarser than the one read here (a kernel tick behind on Linux,
+/// whole seconds on HFS+, two on FAT), so a file written within
+/// `RACY_SLACK` of that read may be rewritten in the same tick, at the
+/// same size, with its stat unchanged. Its entry carries `FLAG_RACY`
+/// until a sweep re-reads it from outside the window.
+#[derive(Clone, Copy)]
+struct RacyWindow {
+    /// The reading minus the slack: content read after the reading from
+    /// a file with an mtime at or after this is racy.
+    floor_ns: u128,
+    /// The reading plus the slack: no write made before the reading
+    /// carries a later mtime.
+    horizon_ns: u128,
+}
+
+impl RacyWindow {
+    /// The window of the clock as it reads now. A sweep takes it after
+    /// its last stat and before it reads any file's content.
+    fn now() -> RacyWindow {
+        RacyWindow::at(std::time::SystemTime::now())
+    }
+
+    fn at(t: std::time::SystemTime) -> RacyWindow {
+        let ns = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        };
+        let slack = crate::dircache::RACY_SLACK;
+        RacyWindow {
+            floor_ns: t.checked_sub(slack).map_or(0, ns),
+            horizon_ns: ns(t) + slack.as_nanos(),
+        }
+    }
+
+    /// Whether content read after the reading, from a file with
+    /// `mtime_ns`, is racy: a later write may land on that same mtime.
+    /// An mtime past the reading is racy too.
+    fn racy(&self, mtime_ns: u128) -> bool {
+        mtime_ns >= self.floor_ns
+    }
+
+    /// Whether a racy entry whose stat still matches must be re-read: a
+    /// write since its content was read may carry its mtime. No write so
+    /// far carries one beyond the horizon (a clock that was set back, an
+    /// archive's future dates), so such an entry keeps its flag, at no
+    /// cost, until the clock comes within the slack of its mtime.
+    fn due(&self, mtime_ns: u128) -> bool {
+        mtime_ns <= self.horizon_ns
+    }
+}
+
+/// Index `meta`'s content under `id` (see `index_file`), reading it after
+/// `window`'s reading, and return the entry's flags: `index_file`'s, the
+/// sweep's hidden flag, and `FLAG_RACY` when the content read is racy.
+/// Oversized and unreadable files are never racy: no content of theirs
+/// was recorded, and every query scans them.
+fn entry_flags(
+    root: &Path,
+    meta: &FileMeta,
+    id: u32,
+    max_filesize: u64,
+    map: &mut BTreeMap<u32, Vec<u32>>,
+    window: &RacyWindow,
+) -> u8 {
+    let mut flags = index_file(root, meta, id, max_filesize, map);
+    if meta.hidden {
+        flags |= FLAG_HIDDEN;
+    }
+    if flags & FLAG_SKIP_TOO_LARGE == 0 && window.racy(meta.mtime_ns) {
+        flags |= FLAG_RACY;
+    }
+    flags
+}
+
 impl Index {
     fn acquire_lock(dir: &Path) -> (Option<std::fs::File>, bool) {
         let lock_path = dir.join("lock");
@@ -279,6 +357,8 @@ impl Index {
             }
             None => walk::sweep(root)?,
         };
+        // Every file is read below, after this reading.
+        let window = RacyWindow::now();
         let mut man = Manifest::default();
         let mut map: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (n, meta) in metas.iter().enumerate() {
@@ -286,11 +366,8 @@ impl Index {
                 eprintln!("glep: indexed {n} files...");
             }
             let id = man.add(meta);
-            let mut flags = index_file(root, meta, id, max_filesize, &mut map);
-            if meta.hidden {
-                flags |= FLAG_HIDDEN;
-            }
-            man.entries[id as usize].flags = flags;
+            man.entries[id as usize].flags =
+                entry_flags(root, meta, id, max_filesize, &mut map, &window);
         }
         man.last_sweep_epoch = now_epoch();
         man.generation = generation;
@@ -733,6 +810,8 @@ impl Index {
             Some(s) => walk::sweep_scoped_unsorted(&self.root, s)?,
             None => walk::sweep_unsorted(&self.root)?,
         };
+        // After the sweep's last stat, before any file is read below.
+        let window = RacyWindow::now();
         if let Some(s) = scope {
             self.scope_presence = s
                 .iter()
@@ -755,7 +834,9 @@ impl Index {
         //   2. dead = live entries never marked seen.
         // Unchanged files touch nothing but an atomic store; fresh and
         // changed ids come out of phase 1 per shard. Every path is hashed
-        // exactly once, as bytes (see `PathKey`).
+        // exactly once, as bytes (see `PathKey`). A racy entry's matching
+        // stat proves nothing, so one that is due counts as changed: its
+        // file is read again, as of now (see `RacyWindow`).
         let n_shards = rayon::current_num_threads().max(1).next_power_of_two();
         let shard_mask = n_shards - 1;
         // Phase 0a: key every live in-scope entry, in parallel.
@@ -816,7 +897,10 @@ impl Index {
                         match shard_maps[key.shard(shard_mask)].get(&key) {
                             Some(e) => {
                                 seen[e.id as usize].store(1, std::sync::atomic::Ordering::Relaxed);
-                                if e.mtime_ns != meta.mtime_ns || e.size != meta.size {
+                                if e.mtime_ns != meta.mtime_ns
+                                    || e.size != meta.size
+                                    || (e.flags & FLAG_RACY != 0 && window.due(e.mtime_ns))
+                                {
                                     my_fresh.push(meta.clone());
                                     my_changed.push(e.id);
                                 } else if (e.flags & FLAG_HIDDEN != 0) != meta.hidden {
@@ -862,10 +946,10 @@ impl Index {
 
         if self.read_only {
             // Nothing is written, but this query must not see what the
-            // sweep found gone: a deleted file's entry and a changed
-            // file's old one die in memory, as the hidden flips above
-            // change there. Changed files come back as `fresh` paths,
-            // which the caller searches live.
+            // sweep found gone: a deleted file's entry and a changed (or
+            // due racy) file's old one die in memory, as the hidden flips
+            // above change there. Changed files come back as `fresh`
+            // paths, which the caller searches live.
             for &id in dead_ids.iter().chain(&changed_old_ids) {
                 self.manifest.entries[id as usize].flags |= manifest::FLAG_DEAD;
             }
@@ -908,11 +992,8 @@ impl Index {
         }
         for meta in &fresh {
             let id = self.manifest.add(meta);
-            let mut flags = index_file(&self.root, meta, id, max_filesize, &mut map);
-            if meta.hidden {
-                flags |= FLAG_HIDDEN;
-            }
-            self.manifest.entries[id as usize].flags = flags;
+            self.manifest.entries[id as usize].flags =
+                entry_flags(&self.root, meta, id, max_filesize, &mut map, &window);
         }
         for ids in map.values_mut() {
             ids.sort_unstable();
@@ -954,16 +1035,44 @@ impl Index {
     }
 }
 
+/// Set the mtime of every file under `root` (the index dir aside) an hour
+/// back, as an untouched tree's would be. A fixture written just now is
+/// racy (see `RacyWindow`): the first sweep after its index is built
+/// reads every file of it again.
+#[cfg(test)]
+pub(crate) fn age_files(root: &Path) {
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let e = e.unwrap();
+            let kind = e.file_type().unwrap();
+            if kind.is_dir() && e.file_name() != ".glep" {
+                stack.push(e.path());
+            } else if kind.is_file() {
+                std::fs::File::options()
+                    .write(true)
+                    .open(e.path())
+                    .unwrap()
+                    .set_modified(hour_ago)
+                    .unwrap();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Four files written an hour ago (see `age_files`).
     fn corpus() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
         std::fs::write(dir.path().join("b.txt"), "goodbye world").unwrap();
         std::fs::write(dir.path().join("bin.dat"), b"\x00\x01binary").unwrap();
         std::fs::write(dir.path().join("big.txt"), "x".repeat(100)).unwrap();
+        age_files(dir.path());
         dir
     }
 
@@ -1019,6 +1128,7 @@ mod tests {
         late.extend(std::iter::repeat_n(b'y', 70_000));
         late.extend_from_slice(b"\n\x00\n");
         std::fs::write(dir.path().join("late.txt"), &late).unwrap();
+        age_files(dir.path());
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
         let flags = |p: &str| {
             idx.manifest
@@ -1231,6 +1341,9 @@ mod tests {
         }
         std::fs::write(dir.path().join(".env"), "token").unwrap();
         std::fs::write(dir.path().join(".gitignore"), "!.env\n").unwrap();
+        // Untouched files keep their entries only once their stat is
+        // trusted: outside the racy window.
+        age_files(dir.path());
         Index::build(dir.path(), 1_048_576).unwrap();
         let mut idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
         let env = |idx: &Index| {
@@ -1243,9 +1356,6 @@ mod tests {
         };
         let (id, hidden) = env(&idx);
         assert!(!hidden, "whitelisted at build time");
-        // A different size from "!.env\n": the sweep detects changes by
-        // (mtime, size), and a same-size rewrite inside one filesystem
-        // clock tick would look unchanged (see the racy-mtime issue).
         std::fs::write(dir.path().join(".gitignore"), "*.log\n*.tmp\n").unwrap();
         idx.update(1_048_576, 0).unwrap();
         assert!(idx.has_delta(), "one edited file must not compact");
@@ -1273,6 +1383,8 @@ mod tests {
             std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
             std::fs::write(dir.path().join("sub/deep/z.txt"), "hello deep").unwrap();
             std::fs::write(dir.path().join("sub/.dot"), "hello dot").unwrap();
+            // Racy flags would depend on how soon each build ran.
+            age_files(dir.path());
         }
         let plain = Index::build(a.path(), 1_048_576).unwrap();
         let mut swept = walk::sweep_unsorted(b.path()).unwrap();
@@ -1746,6 +1858,7 @@ mod tests {
             let len = 100 + rng.below(200);
             std::fs::write(dir.path().join(name(i)), rng.text(LETTERS, len)).unwrap();
         }
+        age_files(dir.path());
         let mut idx = Index::build(dir.path(), 1 << 20).unwrap();
         // A changed file and a new one: their postings land in the delta,
         // so lookups merge main and delta blobs.
@@ -1808,6 +1921,7 @@ mod tests {
         for i in 0..1200 {
             std::fs::write(dir.path().join(name(i)), "ab".repeat(20 + i % 13)).unwrap();
         }
+        age_files(dir.path());
         let mut idx = Index::build(dir.path(), 1 << 20).unwrap();
         let before: std::collections::HashMap<PathBuf, u32> = idx
             .manifest
@@ -1858,5 +1972,186 @@ mod tests {
         // Bytes, not components: the sweep walkers never spell one file
         // two ways, so the diff needs no component-wise equality.
         assert!(PathKey::new(Path::new("src//a.rs")) != a);
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// Overwrite `name` in `dir` with `body`, at its old size, and pin its
+    /// mtime back: a rewrite inside the filesystem clock tick of the last
+    /// write, which leaves the file's (mtime, size) as they were.
+    fn rewrite_in_the_same_tick(dir: &Path, name: &str, body: &[u8]) {
+        let path = dir.join(name);
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), body.len() as u64, "{name}: same size");
+        let mtime = before.modified().unwrap();
+        std::fs::write(&path, body).unwrap();
+        set_mtime(&path, mtime);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    /// `corpus()` plus two files written just now: `r.txt` (text) and
+    /// `t.bin` (binary). Their mtimes are pinned a second ahead, so an
+    /// index built within three seconds reads them inside the racy
+    /// window, and every later sweep finds them due.
+    fn racy_corpus() -> tempfile::TempDir {
+        let dir = corpus();
+        let soon = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+        for (name, body) in [("r.txt", &b"oldneedle\n"[..]), ("t.bin", b"\x00oldtext\n")] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+            set_mtime(&dir.path().join(name), soon);
+        }
+        dir
+    }
+
+    fn entry<'a>(idx: &'a Index, p: &str) -> &'a manifest::FileEntry {
+        idx.manifest
+            .live_entries()
+            .find(|e| e.path == Path::new(p))
+            .unwrap()
+    }
+
+    /// The candidates for the literal `pattern`, hidden files included.
+    fn holding(idx: &Index, pattern: &str) -> Vec<PathBuf> {
+        let plan = crate::plan::build(pattern, true, Case::Sensitive);
+        idx.candidates(&plan, Case::Sensitive, true, false)
+    }
+
+    /// A file rewritten at its size within the clock tick of the write its
+    /// entry recorded keeps its (mtime, size), so its stat alone would
+    /// serve the old content's postings and flags for good. An entry read
+    /// within the racy window is racy, and the next sweep reads its file
+    /// again: the new content is a candidate, the old is not (a text file
+    /// that turned binary, or back, takes its new flags too), and so it
+    /// stays once reopened. Older files are not racy.
+    #[test]
+    fn a_same_size_rewrite_in_the_same_tick_is_read_again() {
+        let dir = racy_corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        for p in ["r.txt", "t.bin"] {
+            assert_ne!(entry(&idx, p).flags & FLAG_RACY, 0, "{p} was just written");
+        }
+        for p in ["a.txt", "b.txt", "bin.dat", "big.txt"] {
+            assert_eq!(entry(&idx, p).flags & FLAG_RACY, 0, "{p} is old");
+        }
+        let recorded = |idx: &Index, p: &str| (entry(idx, p).mtime_ns, entry(idx, p).size);
+        let stats = [recorded(&idx, "r.txt"), recorded(&idx, "t.bin")];
+        rewrite_in_the_same_tick(dir.path(), "r.txt", b"newneedle\n");
+        rewrite_in_the_same_tick(dir.path(), "t.bin", b"xnewtext\n");
+        let swept = walk::sweep(dir.path()).unwrap();
+        for (p, stat) in ["r.txt", "t.bin"].into_iter().zip(stats) {
+            let m = swept.iter().find(|m| m.path == Path::new(p)).unwrap();
+            assert_eq!((m.mtime_ns, m.size), stat, "{p}: the stat cannot tell");
+        }
+        idx.update(1_048_576, 0).unwrap();
+        let check = |idx: &Index| {
+            assert_eq!(holding(idx, "newneedle"), vec![PathBuf::from("r.txt")]);
+            assert!(holding(idx, "oldneedle").is_empty());
+            assert_eq!(holding(idx, "newtext"), vec![PathBuf::from("t.bin")]);
+            assert!(!idx.binary_files().contains(Path::new("t.bin")));
+        };
+        check(&idx);
+        drop(idx);
+        check(&Index::open_or_build(dir.path(), 1_048_576).unwrap());
+    }
+
+    /// Under another glep's lock the sweep writes nothing, yet a racy
+    /// entry dies in this query's memory like a changed one, and its file
+    /// comes back as a fresh path, which the caller searches live.
+    #[test]
+    fn a_read_only_sweep_hands_racy_files_back_to_search_live() {
+        let dir = racy_corpus();
+        let _writer = Index::build(dir.path(), 1_048_576).unwrap(); // holds the lock
+        let mut reader = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        assert!(reader.read_only);
+        rewrite_in_the_same_tick(dir.path(), "r.txt", b"newneedle\n");
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let manifest = std::fs::read(&mpath).unwrap();
+        let mut extra = reader.update(1_048_576, 0).unwrap();
+        extra.sort();
+        assert_eq!(extra, vec![PathBuf::from("r.txt"), PathBuf::from("t.bin")]);
+        assert!(holding(&reader, "oldneedle").is_empty());
+        assert!(!reader.live_files(true).contains(&PathBuf::from("r.txt")));
+        assert_eq!(std::fs::read(&mpath).unwrap(), manifest);
+        assert!(!dir.path().join(".glep/delta.bin").exists());
+    }
+
+    /// --ttl keeps its meaning: inside the window no sweep runs, so a
+    /// racy entry stands, as any entry whose file changed since; the
+    /// first sweep after the window reads the file again and renews the
+    /// epoch.
+    #[test]
+    fn racy_entries_wait_for_the_ttl_like_any_edit() {
+        let dir = racy_corpus();
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        rewrite_in_the_same_tick(dir.path(), "r.txt", b"newneedle\n");
+        let id = entry(&idx, "r.txt").id;
+        idx.update(1_048_576, 3600).unwrap();
+        assert_eq!(entry(&idx, "r.txt").id, id, "no sweep inside the ttl");
+        assert_eq!(holding(&idx, "oldneedle"), vec![PathBuf::from("r.txt")]);
+        idx.manifest.last_sweep_epoch = 1;
+        idx.update(1_048_576, 3600).unwrap();
+        assert_eq!(holding(&idx, "newneedle"), vec![PathBuf::from("r.txt")]);
+        assert!(holding(&idx, "oldneedle").is_empty());
+        assert!(
+            idx.manifest.last_sweep_epoch > 1,
+            "a full sweep renews the epoch"
+        );
+    }
+
+    /// A racy entry read again from outside the window settles: its new
+    /// entry is not racy, and later sweeps trust its stat and write
+    /// nothing. No write so far can carry an mtime beyond the window (a
+    /// future date), so such an entry keeps its id and its flag until the
+    /// clock comes within the slack of it.
+    #[test]
+    fn racy_entries_settle_and_future_mtimes_wait() {
+        let dir = corpus();
+        // Enough postings that reading one file again does not compact.
+        for i in 0..200 {
+            let words: String = (0..30).map(|k| format!("w{i}x{k}y ")).collect();
+            std::fs::write(dir.path().join(format!("f{i:03}.txt")), words).unwrap();
+        }
+        age_files(dir.path());
+        let in_an_hour = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        set_mtime(&dir.path().join("b.txt"), in_an_hour);
+        let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
+        // As if a.txt, written an hour ago, had been read within its window.
+        let a = entry(&idx, "a.txt").id;
+        idx.manifest.entries[a as usize].flags |= FLAG_RACY;
+        let b = entry(&idx, "b.txt").id;
+        assert_ne!(entry(&idx, "b.txt").flags & FLAG_RACY, 0);
+        idx.update(1_048_576, 0).unwrap();
+        assert!(idx.has_delta(), "one file read again must not compact");
+        assert_ne!(entry(&idx, "a.txt").id, a, "read again");
+        assert_eq!(entry(&idx, "a.txt").flags & FLAG_RACY, 0, "settled");
+        assert_eq!(entry(&idx, "b.txt").id, b, "not due yet");
+        assert_ne!(entry(&idx, "b.txt").flags & FLAG_RACY, 0);
+        let mpath = dir.path().join(".glep/manifest.bin");
+        let manifest = std::fs::read(&mpath).unwrap();
+        idx.update(1_048_576, 0).unwrap();
+        assert_eq!(
+            std::fs::read(&mpath).unwrap(),
+            manifest,
+            "nothing to read again"
+        );
+    }
+
+    #[test]
+    fn the_racy_window_is_the_slack_on_either_side_of_its_reading() {
+        let sec = 1_000_000_000u128;
+        let w = RacyWindow::at(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        let (at, slack) = (1_000_000 * sec, crate::dircache::RACY_SLACK.as_nanos());
+        assert!(!w.racy(0) && !w.racy(at - slack - 1));
+        assert!(w.racy(at - slack) && w.racy(at));
+        assert!(w.racy(at + 3600 * sec), "an mtime past the reading is racy");
+        assert!(w.due(0) && w.due(at) && w.due(at + slack));
+        assert!(!w.due(at + slack + 1), "no write so far carries it");
     }
 }

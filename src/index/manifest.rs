@@ -20,6 +20,16 @@ pub const FLAG_TRANSCODE: u8 = 16;
 /// 64 KB buffer. rg's reader still detects it (binary quit), so such a
 /// file is never listed by --files-without-match, searched or not.
 pub const FLAG_NUL_LATE: u8 = 32;
+/// Racy entry (git's "racy git"): its content was read within
+/// `dircache::RACY_SLACK` of its mtime, or before it, so a same-size
+/// rewrite inside the same filesystem clock tick could leave (mtime,
+/// size) as recorded, and a matching stat does not prove its postings and
+/// flags current. Sweeps read such a file again (see `RacyWindow` in
+/// index/mod.rs) until a read lands outside that window, which records it
+/// without this flag. Never set on `FLAG_SKIP_TOO_LARGE` entries, whose
+/// content was never recorded. Older binaries ignore the bit, and their
+/// entries never carry it.
+pub const FLAG_RACY: u8 = 64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
