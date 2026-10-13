@@ -2317,3 +2317,75 @@ fn whitelist_edits_after_indexing_match_rg() {
     std::fs::write(d.join(".rgignore"), "main.txt\n").unwrap();
     check_cases(d, "rgignore edited", cases);
 }
+
+/// rg counts the matches of each line without its terminator (and, under
+/// multi-line, only matches starting inside the matched lines), so a
+/// pattern that can match empty does not match once more after a `\n`:
+/// --count-matches, -c -o, -U counts and the --stats match count agree
+/// with rg for `x*`, `^`, `$`, `a|` and friends.
+#[test]
+fn empty_matching_patterns_count_like_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("a.txt"), "abc\n").unwrap();
+    std::fs::write(d.join("b.txt"), "abc\nxyz\n").unwrap();
+    std::fs::write(d.join("c.txt"), "abc\r\nxxz\r\n").unwrap();
+    std::fs::write(d.join("d.txt"), "no newline at the end x").unwrap();
+    let cases: &[&[&str]] = &[
+        &["--count-matches", "-e", "x*"],
+        &["--count-matches", "-e", "^"],
+        &["--count-matches", "-e", "$"],
+        &["--count-matches", "-e", "a|"],
+        &["--count-matches", "-e", "c?"],
+        &["--count-matches", "-e", ""],
+        &["--count-matches", "-e", "x*", "a.txt"],
+        &["-c", "-o", "-e", "x*"],
+        &["-c", "-o", "^"],
+        &["-U", "--count-matches", "x*"],
+        &["-U", "-c", "x*"],
+        &["-U", "--count-matches", "c\\n?"],
+        &["--crlf", "--count-matches", "z?"],
+        &["-v", "--count-matches", "q"],
+    ];
+    check_cases(d, "counts", cases);
+    // The --stats block: compare the counters both tools share (the
+    // timings differ, and glep searches only the files its index keeps).
+    let shared = |args: &[&str], rg: bool| -> Vec<String> {
+        let out = if rg {
+            std::process::Command::new("rg")
+                .current_dir(d)
+                .args(["--sort", "path", "--no-require-git"])
+                .args(args)
+                .output()
+                .unwrap()
+        } else {
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("glep"))
+                .current_dir(d)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| l.ends_with(" matches") || l.ends_with(" matched lines"))
+            .map(str::to_string)
+            .collect()
+    };
+    // `N matches`, `N matched lines`, `N files contained matches`.
+    for args in [
+        &["-c", "--stats", "a|"][..],
+        &["-l", "--stats", "x*"],
+        &["-q", "--stats", "x*"],
+        &["--stats", "^"],
+        &["-U", "--stats", "-c", "x*"],
+    ] {
+        let g = shared(args, false);
+        assert_eq!(g.len(), 3, "{args:?}: {g:?}");
+        assert_eq!(g, shared(args, true), "stats diverged for {args:?}");
+    }
+}

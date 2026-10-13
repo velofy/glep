@@ -496,25 +496,63 @@ impl<'a, M: Matcher> CountSink<'a, M> {
     }
 }
 
+/// grep-printer's look-ahead cap (`MAX_LOOK_AHEAD`) for re-finding the
+/// matches of a multi-line sink match.
+const MAX_LOOK_AHEAD: usize = 128;
+
+/// The matches in one sink match, found exactly as rg's summary printer
+/// finds them (grep-printer's `find_iter_at_in_context`). Line by line,
+/// the matcher sees the line without its terminator, so a pattern that
+/// can match empty (`x*`, `^`, `a|`) does not match once more after the
+/// `\n`; under multi-line it searches the buffer from the match on, with
+/// a bounded look-ahead, and counts the matches that start inside it.
+fn count_in_context<M: Matcher>(
+    searcher: &grep_searcher::Searcher,
+    matcher: &M,
+    m: &grep_searcher::SinkMatch<'_>,
+) -> std::io::Result<u64> {
+    let range = m.bytes_range_in_buffer();
+    let mut bytes = m.buffer();
+    if searcher.multi_line_with_matcher(matcher) {
+        if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
+            bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
+        }
+    } else {
+        let term = searcher.line_terminator();
+        let mut end = range.end;
+        if term.is_suffix(&bytes[..end]) {
+            end -= 1;
+            if term.is_crlf() && end > 0 && bytes.get(end - 1) == Some(&b'\r') {
+                end -= 1;
+            }
+        }
+        bytes = &bytes[..end];
+    }
+    let mut n = 0u64;
+    matcher
+        .find_iter_at(bytes, range.start, |found| {
+            if found.start() >= range.end {
+                return false;
+            }
+            n += 1;
+            true
+        })
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(n)
+}
+
 impl<M: Matcher> grep_searcher::Sink for CountSink<'_, M> {
     type Error = std::io::Error;
     fn matched(
         &mut self,
-        _: &grep_searcher::Searcher,
+        searcher: &grep_searcher::Searcher,
         m: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
         if self.occurrences_mode {
             self.lines += m.lines().count() as u64;
-            let mut n = 0u64;
-            self.matcher
-                .find_iter(m.bytes(), |_| {
-                    n += 1;
-                    true
-                })
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
             // Under -v the sink is invoked on non-matching lines: the
             // matcher finds 0 occurrences but the line still counts once.
-            let n = n.max(1);
+            let n = count_in_context(searcher, self.matcher, m)?.max(1);
             self.occurrences += n;
             self.count += if self.count_occurrences { n } else { 1 };
         } else {
