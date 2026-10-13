@@ -511,10 +511,11 @@ impl Index {
     /// Scoped update: like `update_timed` but sweeps only `scope`
     /// subtrees (index-relative path filters). Manifest entries outside
     /// the scope keep their existing data untouched: they can be stale,
-    /// but they are also never consulted by the scoped query. The global
-    /// sweep epoch is only bumped for unscoped (full) sweeps: a scoped
-    /// sweep must not suppress the freshness sweep a later unscoped
-    /// query needs (ttl correctness).
+    /// but they are also never consulted by the scoped query. A full
+    /// sweep within the ttl already verified the scope, so the scoped
+    /// sweep is skipped too; but the global sweep epoch is only bumped for
+    /// unscoped (full) sweeps: a scoped sweep must not suppress the
+    /// freshness sweep a later unscoped query needs (ttl correctness).
     pub fn update_scoped(
         &mut self,
         max_filesize: u64,
@@ -532,16 +533,14 @@ impl Index {
         scope: Option<&[PathBuf]>,
         mut timings: Option<&mut Timings>,
     ) -> anyhow::Result<Vec<PathBuf>> {
-        // The ttl only gates FULL sweeps: it marks "the whole tree was
-        // verified as of epoch". A scoped sweep leaves other subtrees
-        // unverified, so it neither honors nor sets the epoch.
+        // The epoch marks "the whole tree was verified as of epoch", which
+        // covers every scope too: within the ttl no sweep runs, scoped or
+        // not. Only a full sweep sets it (below), since a scoped sweep
+        // leaves the other subtrees unverified.
         let scope: Option<&[PathBuf]> =
             scope.filter(|s| !s.is_empty() && !s.iter().any(|p| p.as_os_str().is_empty()));
         let scoped = scope.is_some();
-        if !scoped
-            && ttl_secs > 0
-            && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs
-        {
+        if ttl_secs > 0 && now_epoch().saturating_sub(self.manifest.last_sweep_epoch) <= ttl_secs {
             return Ok(Vec::new());
         }
         let swept = match scope {
@@ -1153,6 +1152,36 @@ mod tests {
             idx.candidates(&plan, Case::Sensitive, false, false).len(),
             1
         );
+    }
+
+    /// A scoped query honors a fresh ttl epoch like a full one (the full
+    /// sweep that set it covered the scope), yet never sets the epoch
+    /// itself.
+    #[test]
+    fn scoped_update_respects_ttl_but_never_sets_the_epoch() {
+        let dir = corpus();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        Index::build(dir.path(), 1_048_576).unwrap();
+        let mut idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
+        std::fs::write(dir.path().join("src/late.txt"), "ttlneedle").unwrap();
+        let scope = [PathBuf::from("src")];
+        let mut timings = Timings::new();
+        idx.update_scoped(1_048_576, 3600, &scope, &mut timings)
+            .unwrap(); // within ttl: sweep skipped
+        let plan = crate::plan::build("ttlneedle", true, Case::Sensitive);
+        assert!(idx
+            .candidates(&plan, Case::Sensitive, false, false)
+            .is_empty());
+        // An expired epoch: the scoped sweep runs, without renewing it.
+        idx.manifest.last_sweep_epoch = 1;
+        idx.update_scoped(1_048_576, 3600, &scope, &mut timings)
+            .unwrap();
+        assert_eq!(
+            idx.candidates(&plan, Case::Sensitive, false, false).len(),
+            1
+        );
+        assert_eq!(idx.manifest.last_sweep_epoch, 1);
+        assert!(!idx.swept_full());
     }
 
     #[test]

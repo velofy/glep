@@ -1421,3 +1421,34 @@ fn queries_during_another_build_answer_with_a_live_scan() {
     }
     assert!(dir.path().join(".glep/manifest.bin").exists());
 }
+
+/// --ttl skips the freshness sweep for a query with a path operand, and
+/// for one run from a subdirectory, exactly as for a root-wide query: the
+/// full sweep that set the epoch covered every scope. Without --ttl the
+/// scoped sweep runs and sees the new file.
+#[test]
+fn ttl_skips_the_sweep_for_scoped_queries_too() {
+    let dir = corpus();
+    glep(dir.path()).arg("hello").assert().success();
+    std::fs::write(dir.path().join("src/late.rs"), "ttlneedle\n").unwrap();
+    let swept = |cwd: &Path, args: &[&str]| -> (bool, i32) {
+        let out = glep(cwd)
+            .env("GLEP_TIMING", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        (err.contains("sweep_walk"), out.status.code().unwrap_or(-1))
+    };
+    let src = dir.path().join("src");
+    assert_eq!(
+        swept(dir.path(), &["--ttl", "600", "ttlneedle", "src"]),
+        (false, 1)
+    );
+    assert_eq!(swept(&src, &["--ttl", "600", "ttlneedle"]), (false, 1));
+    assert_eq!(
+        swept(dir.path(), &["--ttl", "600", "ttlneedle"]),
+        (false, 1)
+    );
+    assert_eq!(swept(dir.path(), &["ttlneedle", "src"]), (true, 0));
+}
