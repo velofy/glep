@@ -459,6 +459,12 @@ fn stack_verdict<'a>(
 /// own. `rel` is the root-relative path. Non-dot paths short-circuit
 /// through the component scan without a matcher call.
 fn still_hidden(stack: &[Arc<Gitignore>], root: &Path, rel: &Path) -> bool {
+    // Ordinary paths (no dot-prefixed component at all, nearly every file)
+    // cost one component scan, exactly what the sweep paid before
+    // whitelist rescue existed.
+    if !crate::walk::path_is_hidden(rel) {
+        return false;
+    }
     let mut p = rel;
     loop {
         if p.file_name()
