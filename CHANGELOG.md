@@ -45,6 +45,7 @@ All notable changes to glep. Dates are the tagged commit dates for versions up t
 - rg's nothing-searched warning (exit 2) also fires from a subdirectory, where the cwd is the implicit scope, and the check stops at the first file that survives the filters instead of building the whole file list.
 - Missing path filters print `glep: <path>: No such file or directory (os error 2)` and exit 2; valid paths still produce their matches. Implicit-scope runs whose filters empty the walked pool print rg's "No files were searched" warning and exit 2.
 - Literal analysis is a recursive required-literal extractor over the parsed regex: adjacent literals fuse into longer substrings, required literals survive unexpandable spans (`[0-9][0-9][0-9]-foo` narrows on `-foo`), and literals on both sides of a wildcard are AND-required.
+- On macOS the bulk sweep and the listing cache apply `.ignore` files above the root themselves (ahead of every `.gitignore`, as in rg), and the cache's fingerprint covers them. Before, any such file, even an empty `~/.ignore`, sent every query to the portable walker and bypassed the cache, which was then rewritten on every `--files` run: searches ran about 2x and listings about 8x slower.
 - The macOS listing cache is rebuilt only after a full, written sweep (never after a `--ttl` skip, a scoped sweep, or a lock-contended read-only pass), so a stale manifest is never re-certified by current directory mtimes.
 
 ## 0.3.1 (2026-09-30)

@@ -124,6 +124,9 @@ pub struct WhitelistChecker {
     global_loaded: bool,
     global: Option<Gitignore>,
     flags: WalkFlags,
+    /// `.ignore` files above the sweep root, deepest first, with the
+    /// canonical root their rules match against (loaded on first use).
+    ancestors: Option<(PathBuf, Vec<Gitignore>)>,
 }
 
 impl Default for WhitelistChecker {
@@ -143,7 +146,39 @@ impl WhitelistChecker {
             global_loaded: false,
             global: None,
             flags,
+            ancestors: None,
         }
+    }
+
+    /// The `.ignore` verdict of the files above the root (the walker's
+    /// `parents(true)`): the deepest one with an opinion decides.
+    fn ancestor_verdict(&mut self, root: &Path, rel: &Path, is_dir: bool) -> ignore::Match<()> {
+        let (canon, matchers) = self.ancestors.get_or_insert_with(|| {
+            let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let matchers = canon
+                .ancestors()
+                .skip(1)
+                .filter_map(|dir| {
+                    let file = dir.join(".ignore");
+                    if !file.is_file() {
+                        return None;
+                    }
+                    let mut b = GitignoreBuilder::new(dir);
+                    let _ = b.add(file);
+                    b.build().ok().filter(|g| !g.is_empty())
+                })
+                .collect();
+            (canon, matchers)
+        });
+        if matchers.is_empty() {
+            return ignore::Match::None;
+        }
+        let abs = canon.join(rel);
+        matchers
+            .iter()
+            .map(|g| g.matched(&abs, is_dir).map(|_| ()))
+            .find(|m| !m.is_none())
+            .unwrap_or(ignore::Match::None)
     }
 
     fn dir_matchers(&mut self, root: &Path, dir_rel: &Path) -> &DirMatchers {
@@ -210,6 +245,9 @@ impl WhitelistChecker {
                 break;
             }
             dir = dir.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        }
+        if m_ignore.is_none() && self.flags.dot {
+            m_ignore = self.ancestor_verdict(root, rel, is_dir);
         }
         if !self.global_loaded {
             self.global_loaded = true;
@@ -328,28 +366,6 @@ impl Drop for Collector<'_> {
     }
 }
 
-/// True when any ancestor of `root` holds a `.ignore` or `.rgignore`
-/// file. The portable walker applies ancestor `.ignore` rules through
-/// `parents(true)`; the macOS bulk walker seeds its matcher stack only
-/// with global excludes, `.git/info/exclude` and ancestor `.gitignore`
-/// files (see `walk_bulk::build_ancestor_stack`), and the listing cache
-/// fingerprints exactly those. So an ancestor `.ignore` (`.rgignore` kept
-/// for symmetry with the in-tree divergence trap) must send the sweep to
-/// the portable walker and must keep the listing cache out of play. A
-/// handful of stat calls; most roots have none.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn ancestors_have_dot_ignore(root: &Path) -> bool {
-    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut dir = canon.parent();
-    while let Some(d) = dir {
-        if d.join(".ignore").is_file() || d.join(".rgignore").is_file() {
-            return true;
-        }
-        dir = d.parent();
-    }
-    false
-}
-
 /// Parallel gitignore-aware sweep. Hidden (dot-prefixed) files and
 /// directories are INCLUDED in the result, each with `FileMeta::hidden` set;
 /// whether they are actually shown to the user is a query-time decision
@@ -382,7 +398,7 @@ pub fn sweep(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 pub fn sweep_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() && !ancestors_have_dot_ignore(root) {
+        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
             match crate::walk_bulk::sweep_bulk(root) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -425,7 +441,7 @@ pub fn sweep_scoped_unsorted(root: &Path, prefixes: &[PathBuf]) -> anyhow::Resul
     }
     #[cfg(target_os = "macos")]
     {
-        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() && !ancestors_have_dot_ignore(root) {
+        if std::env::var_os("GLEP_NO_BULK_SWEEP").is_none() {
             match crate::walk_bulk::sweep_bulk_scoped(root, prefixes) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -1270,6 +1286,33 @@ mod tests {
                 vec!["keep.txt".to_string(), "secret.txt".to_string()],
                 "both keep.txt and secret.txt should be swept, nothing else"
             );
+        }
+
+        /// An `.ignore` ABOVE the sweep root needs no fallback: the bulk
+        /// sweep applies it itself, ahead of every .gitignore (its
+        /// `!keep.log` beats the in-tree `*.log`), exactly like the walker.
+        #[test]
+        fn ancestor_dot_ignore_is_honored_on_the_bulk_path() {
+            let outer = tempfile::tempdir().unwrap();
+            std::fs::write(outer.path().join(".ignore"), "drop.txt\n!keep.log\n").unwrap();
+            let root = outer.path().join("sweep_root");
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+            std::fs::write(root.join("keep.txt"), "x").unwrap();
+            std::fs::write(root.join("sub/drop.txt"), "x").unwrap();
+            std::fs::write(root.join("sub/keep.log"), "x").unwrap();
+            std::fs::write(root.join("sub/other.log"), "x").unwrap();
+            let bulk = crate::walk_bulk::sweep_bulk(&root)
+                .expect("an ancestor .ignore must not force the walker fallback");
+            assert_eq!(
+                paths_of(&bulk),
+                vec![
+                    ".gitignore".to_string(),
+                    "keep.txt".to_string(),
+                    "sub/keep.log".to_string()
+                ]
+            );
+            assert_parity(&root);
         }
 
         /// Scenario 5: an `.ignore` whitelist (`!important.log`) overriding

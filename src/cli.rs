@@ -1459,12 +1459,6 @@ fn listing_via_cache(
     index_dir: &Path,
     timings: &mut Timings,
 ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
-    // Ancestor .ignore/.rgignore files apply to the whole tree but sit
-    // outside both the bulk walker's matcher stack and the cache's
-    // fingerprint: never serve a listing they could change.
-    if walk::ancestors_have_dot_ignore(root) {
-        return None;
-    }
     let t0 = std::time::Instant::now();
     let tree = crate::dircache::DirTree::load(index_dir)?;
     let t1 = std::time::Instant::now();

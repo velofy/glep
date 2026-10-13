@@ -37,8 +37,10 @@
 //! `.git/info/exclude`, ancestor `.gitignore` files above the sweep root,
 //! and `.ignore` files (plus their whitelist overrides). `build_ancestor_stack`
 //! seeds the matcher stack with the first three of those before the walk
-//! starts (see its doc comment for precedence order); `.ignore`/`.rgignore`
-//! are handled by refusing to walk at all wherever one is found, see below.
+//! starts (see its doc comment for precedence order), and
+//! `build_ancestor_dot_ignores` loads the `.ignore` files above the root,
+//! which outrank every gitignore source (see `verdict`); an in-tree
+//! `.ignore`/`.rgignore` is handled by refusing to walk at all, see below.
 //!
 //! Correctness posture: any anomaly while parsing a `getattrlistbulk`
 //! result buffer (an offset or length that doesn't fit inside the buffer)
@@ -423,14 +425,38 @@ fn name_eq(name: &OsStr, s: &str) -> bool {
 /// include them, each carrying a `FileMeta::hidden` flag for query-time
 /// filtering instead. `.git` and `.glep` are the one hard exclusion that
 /// bypasses the gitignore stack entirely, checked first.
-fn is_ignored(stack: &[Arc<Gitignore>], abs_path: &Path, is_dir: bool, name: &OsStr) -> bool {
+fn is_ignored(
+    dot: &[Arc<Gitignore>],
+    stack: &[Arc<Gitignore>],
+    abs_path: &Path,
+    is_dir: bool,
+    name: &OsStr,
+) -> bool {
     if is_hard_excluded(name) {
         return true;
     }
     matches!(
-        stack_verdict(stack, abs_path, is_dir),
+        verdict(dot, stack, abs_path, is_dir),
         ignore::Match::Ignore(_)
     )
+}
+
+/// The ignore crate's precedence across sources: `.ignore` rules outrank
+/// every gitignore source wherever they sit, so the `.ignore` files above
+/// the sweep root (`dot`; an in-tree `.ignore` sends the sweep to the
+/// walker instead) decide first, and the gitignore stack only when they
+/// have no opinion. Within each group the deepest file decides.
+fn verdict<'a>(
+    dot: &'a [Arc<Gitignore>],
+    stack: &'a [Arc<Gitignore>],
+    abs_path: &Path,
+    is_dir: bool,
+) -> ignore::Match<&'a ignore::gitignore::Glob> {
+    let d = stack_verdict(dot, abs_path, is_dir);
+    if !d.is_none() {
+        return d;
+    }
+    stack_verdict(stack, abs_path, is_dir)
 }
 
 /// The stack's combined verdict for `abs_path`: deepest non-None wins
@@ -458,7 +484,7 @@ fn stack_verdict<'a>(
 /// children ordinary files; `.github/.env` still needs a rescue of its
 /// own. `rel` is the root-relative path. Non-dot paths short-circuit
 /// through the component scan without a matcher call.
-fn still_hidden(stack: &[Arc<Gitignore>], root: &Path, rel: &Path) -> bool {
+fn still_hidden(dot: &[Arc<Gitignore>], stack: &[Arc<Gitignore>], root: &Path, rel: &Path) -> bool {
     // Ordinary paths (no dot-prefixed component at all, nearly every file)
     // cost one component scan, exactly what the sweep paid before
     // whitelist rescue existed.
@@ -471,8 +497,7 @@ fn still_hidden(stack: &[Arc<Gitignore>], root: &Path, rel: &Path) -> bool {
             .is_some_and(|n| n.as_encoded_bytes().first() == Some(&b'.'))
         {
             let is_dir = p != rel;
-            let verdict = stack_verdict(stack, &root.join(p), is_dir);
-            if !verdict.is_whitelist() {
+            if !verdict(dot, stack, &root.join(p), is_dir).is_whitelist() {
                 return true;
             }
         }
@@ -663,6 +688,39 @@ fn build_ancestor_stack(sweep_root: &Path) -> anyhow::Result<Vec<Arc<Gitignore>>
     Ok(stack)
 }
 
+/// `.ignore` files in every directory above the sweep root, shallowest
+/// first. The portable walker applies them through `parents(true)`, all
+/// the way up and ahead of every gitignore source, so the bulk walker
+/// does too (see `verdict`) instead of handing such sweeps to the walker.
+/// An empty file contributes nothing. `.rgignore` stays inert above the
+/// root, as in the walker, which registers no custom ignore file names.
+fn build_ancestor_dot_ignores(sweep_root: &Path) -> Vec<Arc<Gitignore>> {
+    let canon = sweep_root
+        .canonicalize()
+        .unwrap_or_else(|_| sweep_root.to_path_buf());
+    let mut dirs: Vec<&Path> = canon.ancestors().skip(1).collect();
+    dirs.reverse();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let file = dir.join(".ignore");
+        if !file.is_file() {
+            continue;
+        }
+        let mut builder = GitignoreBuilder::new(dir);
+        if let Some(err) = builder.add(&file) {
+            // Unreadable lines are reported; the readable ones still
+            // apply, as in the walker.
+            crate::messages::ignore_warning(format!("{}: {err}", file.display()));
+        }
+        match builder.build() {
+            Ok(gi) if !gi.is_empty() => out.push(Arc::new(gi)),
+            Ok(_) => {}
+            Err(err) => crate::messages::ignore_warning(format!("{}: {err}", file.display())),
+        }
+    }
+    out
+}
+
 /// True when `rel` (root-relative) lies inside one of the scope prefixes.
 fn in_scope(rel: &Path, prefixes: &[PathBuf]) -> bool {
     prefixes.iter().any(|p| rel.starts_with(p))
@@ -676,10 +734,12 @@ fn dir_in_scope(rel: &Path, prefixes: &[PathBuf]) -> bool {
         .any(|p| rel.starts_with(p) || p.starts_with(rel))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_recursive<'scope>(
     scope: &rayon::Scope<'scope>,
     root: &'scope Path,
     dir: PathBuf,
+    dot: &'scope [Arc<Gitignore>],
     matchers: Vec<Arc<Gitignore>>,
     buffers: &'scope [Mutex<Vec<FileMeta>>],
     fatal: &'scope Mutex<Option<anyhow::Error>>,
@@ -745,7 +805,7 @@ fn scan_recursive<'scope>(
     let mut local_files = Vec::with_capacity(scan.files.len());
     for entry in &scan.files {
         let abs = dir.join(&entry.name);
-        if is_ignored(&stack, &abs, false, &entry.name) {
+        if is_ignored(dot, &stack, &abs, false, &entry.name) {
             continue;
         }
         let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
@@ -754,7 +814,7 @@ fn scan_recursive<'scope>(
         }
         // still_hidden is cheap for ordinary paths (a component scan);
         // only dot-prefixed prefixes pay a matcher lookup.
-        let hidden = still_hidden(&stack, root, &rel);
+        let hidden = still_hidden(dot, &stack, root, &rel);
         local_files.push(FileMeta {
             path: rel,
             mtime_ns: entry.mtime_ns,
@@ -772,7 +832,7 @@ fn scan_recursive<'scope>(
     for sub in scan.subdirs {
         let name = sub.name;
         let abs = dir.join(&name);
-        if is_ignored(&stack, &abs, true, &name) {
+        if is_ignored(dot, &stack, &abs, true, &name) {
             continue;
         }
         if let Some(f) = filter {
@@ -782,7 +842,16 @@ fn scan_recursive<'scope>(
         }
         let child_matchers = stack.clone(); // Vec<Arc<Gitignore>>: cheap, just Arc pointer copies
         scope.spawn(move |scope| {
-            scan_recursive(scope, root, abs, child_matchers, buffers, fatal, filter);
+            scan_recursive(
+                scope,
+                root,
+                abs,
+                dot,
+                child_matchers,
+                buffers,
+                fatal,
+                filter,
+            );
         });
     }
 }
@@ -827,6 +896,7 @@ fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Resul
         root.display()
     );
     let seed_matchers = build_ancestor_stack(root)?;
+    let dot = build_ancestor_dot_ignores(root);
 
     let num_slots = rayon::current_num_threads().max(1);
     let buffers: Vec<Mutex<Vec<FileMeta>>> =
@@ -838,6 +908,7 @@ fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Resul
             scope,
             root,
             root.to_path_buf(),
+            &dot,
             seed_matchers,
             &buffers,
             &fatal,
@@ -892,6 +963,8 @@ struct ListingCtx<'a> {
     /// the final tree after the walk (scoped tasks cannot return values
     /// directly).
     nodes: Mutex<Vec<(PathBuf, crate::dircache::DirNode)>>,
+    /// `.ignore` files above the root (see `verdict`), fixed for the walk.
+    dot: Vec<Arc<Gitignore>>,
 }
 
 impl ListingCtx<'_> {
@@ -932,6 +1005,7 @@ pub fn sweep_bulk_listing<'a>(
         budget_exceeded: std::sync::atomic::AtomicBool::new(false),
         fatal: Mutex::new(None),
         nodes: Mutex::new(Vec::new()),
+        dot: build_ancestor_dot_ignores(root),
     };
     let dbg2 = std::env::var_os("GLEP_TIMING").is_some();
     let t_scope = std::time::Instant::now();
@@ -1164,13 +1238,13 @@ fn scan_listing<'a, 'b>(
         let mut out = ctx.files[slot_idx].lock().unwrap();
         for entry in &scan.files {
             let abs = dir.join(&entry.name);
-            if is_ignored(&stack, &abs, false, &entry.name) {
+            if is_ignored(&ctx.dot, &stack, &abs, false, &entry.name) {
                 continue;
             }
             let crel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
             // Same whitelist-aware rule as the sweep (and so the
             // manifest's FLAG_HIDDEN): a `!` rule can un-hide a dotfile.
-            let hidden = still_hidden(&stack, root, &crel);
+            let hidden = still_hidden(&ctx.dot, &stack, root, &crel);
             let fm = FileMeta {
                 path: crel,
                 mtime_ns: entry.mtime_ns,
@@ -1185,7 +1259,7 @@ fn scan_listing<'a, 'b>(
     for sub in scan.subdirs {
         let name = sub.name;
         let abs = dir.join(&name);
-        if is_ignored(&stack, &abs, true, &name) {
+        if is_ignored(&ctx.dot, &stack, &abs, true, &name) {
             continue;
         }
         let child_rel = rel.join(&name);

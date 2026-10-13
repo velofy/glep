@@ -1651,10 +1651,14 @@ fn listing_cache_bypass_no_index() {
     assert!(live.contains("brand_new.txt"), "{live}");
 }
 
-/// An `.ignore` above the tree sits outside the cache's fingerprint, so
-/// its presence must bypass the cache; rg honors it as a parent rule.
+/// An `.ignore` above the tree applies as a parent rule, as in rg, ahead
+/// of every .gitignore (its `!rule` beats an in-tree `*.log`). The bulk
+/// sweep and the listing cache honor it themselves (the cache's
+/// fingerprint covers it), so a common setup like a `~/.ignore` keeps
+/// both fast paths: once rebuilt, the cache serves the listing without
+/// being rewritten on every run.
 #[test]
-fn listing_cache_bypass_ancestor_dot_ignore() {
+fn listing_cache_with_ancestor_dot_ignore() {
     if !have_rg() {
         return;
     }
@@ -1664,14 +1668,44 @@ fn listing_cache_bypass_ancestor_dot_ignore() {
     std::fs::write(inner.join("keep.txt"), "hello keep\n").unwrap();
     std::fs::write(inner.join("sub/drop.txt"), "hello drop\n").unwrap();
     std::fs::write(inner.join("sub/keep2.txt"), "hello keep2\n").unwrap();
+    std::fs::write(inner.join("sub/app.log"), "hello app log\n").unwrap();
+    std::fs::write(inner.join("sub/keep.log"), "hello keep log\n").unwrap();
+    std::fs::write(inner.join(".gitignore"), "*.log\n").unwrap();
     warm_listing_cache(&inner);
-    std::fs::write(outer.path().join(".ignore"), "drop.txt\n").unwrap();
+    std::fs::write(outer.path().join(".ignore"), "drop.txt\n!keep.log\n").unwrap();
     let cases: &[&[&str]] = &[
         &["--files"],
         &["-l", "hello"],
+        &["-c", "hello", "sub"],
         &["--no-ignore-parent", "--files"],
+        &["--no-ignore-parent", "-l", "hello"],
     ];
     check_cases(&inner, "cache", cases);
+    // Editing the ancestor file changes the fingerprint: the cache is
+    // rebuilt, never served stale.
+    std::fs::write(outer.path().join(".ignore"), "keep2.txt\n").unwrap();
+    check_cases(&inner, "cache edited", cases);
+    #[cfg(target_os = "macos")]
+    {
+        let cache = inner.join(".glep/dirtree.bin");
+        let (_, code) = glep_out(&inner, &["--files"]);
+        assert_eq!(code, 0);
+        let before = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        let out = Command::cargo_bin("glep")
+            .unwrap()
+            .current_dir(&inner)
+            .env("GLEP_TIMING", "1")
+            .arg("--files")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("listing_cache"), "cache not used: {err}");
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().modified().unwrap(),
+            before,
+            "an unchanged tree must not rewrite the listing cache"
+        );
+    }
 }
 
 /// Filters applied after a listing (globs, types, depth, hidden, extra

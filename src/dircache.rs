@@ -30,11 +30,12 @@
 //!      (`chain_stable`): the cached listing was filtered by exactly
 //!      those matchers.
 //!   4. Ignore sources ABOVE the sweep root (global excludes,
-//!      `.git/info/exclude`, ancestor `.gitignore` files) are captured as
-//!      a (path, mtime, size) fingerprint at cache time and re-statted on
-//!      every use; any difference discards the whole cache. (`.ignore` /
-//!      `.rgignore` never coexist with a cache: their presence anywhere
-//!      makes the bulk walker itself fall back to the portable walker.)
+//!      `.git/info/exclude`, ancestor `.gitignore` and `.ignore` files)
+//!      are captured as a (path, mtime, size) fingerprint at cache time
+//!      and re-statted on every use; any difference discards the whole
+//!      cache. (An in-tree `.ignore` / `.rgignore` never coexists with a
+//!      cache: its presence makes the bulk walker itself fall back to the
+//!      portable walker.)
 //!
 //! The cache lives in `.glep/dirtree.bin`, is written atomically
 //! (tmp + rename), and is independent of the manifest's trigram postings:
@@ -128,10 +129,11 @@ fn stat_src(p: PathBuf) -> IgnoreSrc {
 /// Fingerprint every ignore source above (and including git plumbing for)
 /// `root`: the global excludes file (resolved exactly like the `ignore`
 /// crate resolves it, via `gitconfig_excludes_path`), `.git/info/exclude`
-/// of the enclosing repo, and every ancestor `.gitignore` up to the git
-/// root (bounded by the same cap the bulk walker uses). Mirrors
-/// `walk_bulk::build_ancestor_stack`'s discovery so the two never
-/// disagree about what "above the root" means.
+/// of the enclosing repo, every ancestor `.gitignore` up to the git root
+/// (bounded by the same cap the bulk walker uses), and every ancestor
+/// `.ignore`. Mirrors `walk_bulk::build_ancestor_stack` and
+/// `build_ancestor_dot_ignores` so they never disagree about what "above
+/// the root" means.
 pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
     let mut v = Vec::new();
     if let Some(p) = ignore::gitignore::gitconfig_excludes_path() {
@@ -163,6 +165,15 @@ pub fn source_fingerprint(root: &Path) -> Vec<IgnoreSrc> {
         let gi = dir.join(".gitignore");
         if gi.is_file() {
             v.push(stat_src(gi));
+        }
+    }
+    // Every `.ignore` above the root, all the way up, like the bulk
+    // walker's `build_ancestor_dot_ignores`: creating, editing or deleting
+    // one changes the fingerprint and discards the cache.
+    for dir in canon.ancestors().skip(1) {
+        let f = dir.join(".ignore");
+        if f.is_file() {
+            v.push(stat_src(f));
         }
     }
     v
