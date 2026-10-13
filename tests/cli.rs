@@ -798,8 +798,10 @@ fn no_ignore_parent_toggles_parent_rules() {
     assert!(s.contains("a.txt"), "{s}");
 }
 
+/// -uuu is rg's --no-ignore --hidden --binary: binary files are searched
+/// and reported with a notice, never printed as raw text.
 #[test]
-fn uuu_searches_binary_as_text() {
+fn uuu_searches_binary_files_like_binary() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.bin"), b"aa\x00hello\x00zz\n").unwrap();
     let out = glep(dir.path())
@@ -808,6 +810,10 @@ fn uuu_searches_binary_as_text() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(s.contains("b.bin"), "{s}");
+    let out = glep(dir.path()).args(["-uuu", "hello"]).assert().success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(s.contains("binary file matches"), "{s}");
+    assert!(!s.contains('\0'), "{s:?}");
 }
 
 #[test]

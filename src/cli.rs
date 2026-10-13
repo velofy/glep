@@ -94,7 +94,7 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub ignore_file: Vec<std::path::PathBuf>,
     /// Unrestricted search: -u = --no-ignore, -uu = --no-ignore + --hidden,
-    /// -uuu also implies -a/--text.
+    /// -uuu = --no-ignore + --hidden + --binary (rg's ladder).
     #[arg(short = 'u', action = clap::ArgAction::Count)]
     pub unrestricted: u8,
     /// Color output: never (default), always, auto (when stdout is a tty).
@@ -1408,6 +1408,17 @@ where
     Some(matched)
 }
 
+/// Where a flag last appeared on the command line (None when it was not
+/// given there: defaults carry indices too, so they are filtered out).
+/// Flags that interact the way rg's do, each acting where it stands, are
+/// resolved by comparing these positions.
+fn last_index(matches: &clap::ArgMatches, id: &str) -> Option<usize> {
+    if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+        return None;
+    }
+    matches.indices_of(id).and_then(|i| i.max())
+}
+
 pub fn run() -> anyhow::Result<i32> {
     use clap::{CommandFactory, FromArgMatches};
     let matches = Args::command().get_matches();
@@ -1429,16 +1440,21 @@ pub fn run() -> anyhow::Result<i32> {
             args.paths.insert(0, PathBuf::from(p));
         }
     }
-    // -u/-uu/-uuu fold into their flag equivalents (rg semantics).
+    // -u/-uu/-uuu fold into their flag equivalents, rg's ladder: -u is
+    // --no-ignore, -uu adds --hidden, -uuu adds --binary (binary files are
+    // searched and reported with a notice, not printed as text). As in rg
+    // the -u flags act where they stand, so an -a after -uuu still wins.
     if args.unrestricted > 0 {
         args.no_ignore = true;
         if args.unrestricted >= 2 {
             args.hidden = true;
         }
-        // -uuu adds binary-as-text: NUL is data (-a), not a quit signal.
-        if args.unrestricted >= 3 {
-            args.text = true;
-            args.binary = false;
+        if args.unrestricted >= 3
+            && last_index(&matches, "unrestricted")
+                > last_index(&matches, "text").max(last_index(&matches, "binary"))
+        {
+            args.binary = true;
+            args.text = false;
         }
     }
 
@@ -1512,21 +1528,15 @@ pub fn run() -> anyhow::Result<i32> {
         // -p is rg's alias for --color always --heading --line-number, so
         // each of those settings only holds unless a flag given AFTER -p
         // changes it again (`-p --color never` keeps the heading).
-        // Defaults carry indices too: only command-line occurrences count.
-        let at = |id: &str| {
-            (matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine))
-                .then(|| matches.indices_of(id).and_then(|i| i.max()))
-                .flatten()
-        };
-        let p = at("pretty");
-        if at("color") < p {
+        let p = last_index(&matches, "pretty");
+        if last_index(&matches, "color") < p {
             args.color = Some("always".to_string());
         }
-        if at("no_heading") < p {
+        if last_index(&matches, "no_heading") < p {
             args.heading = true;
             args.no_heading = false;
         }
-        if at("no_line_number") < p {
+        if last_index(&matches, "no_line_number") < p {
             args.line_number = true;
             args.no_line_number = false;
         }

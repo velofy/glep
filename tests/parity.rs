@@ -1041,6 +1041,12 @@ fn remaining_stack_flags_match_rg() {
         &["-uu", "-l", "hello"],
         &["-uuu", "-l", "binary"],
         &["-uuu", "-c", "binary"],
+        // -uuu is --no-ignore --hidden --binary: binary files report a
+        // notice in content mode, and a later -a still wins.
+        &["-uuu", "binary"],
+        &["-uuu", "match"],
+        &["-uuu", "-a", "binary"],
+        &["-a", "-uuu", "binary"],
         &["-M", "10", "--max-columns-preview", "a+"],
         &["-M", "10", "--max-columns-preview", "-o", "a+"],
         &["--stop-on-nonmatch", "foo"],
