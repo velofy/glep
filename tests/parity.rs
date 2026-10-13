@@ -810,6 +810,42 @@ fn terminators_and_separators_match_rg() {
     check_cases(pool.path(), "pool", cases);
 }
 
+/// rg's parser gives a flag that takes a value the next word verbatim,
+/// even one that starts with a dash. The agent hooks pass every Grep
+/// pattern as `-e '<pattern>'`, so a pattern like `-> u32` or `--` must
+/// search instead of failing as an unknown flag; separators, globs and
+/// replacements that start with a dash work the same way, and a bad
+/// value is still a flag error (exit 2).
+#[test]
+fn dash_leading_flag_values_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let cases: &[&[&str]] = &[
+        &["-e", "-> u32"],
+        &["--regexp", "-> u32", "-l"],
+        &["-F", "-e", "-> u32"],
+        &["-e", "hello", "-e", "-> u32", "-c"],
+        &["-e", "--", "-c"],
+        &["-e", "-1", "-c"],
+        &["-r", "-X-", "hello"],
+        &["-o", "-r", "--", "hel+o"],
+        &["-C", "1", "--context-separator", "--", "hello"],
+        &["-C", "1", "--context-separator", "-x-", "hello"],
+        &["-C", "1", "--field-context-separator", "-x", "hello"],
+        &["--field-match-separator", "-", "hello"],
+        &["--path-separator", "-", "-l", "hello"],
+        &["-g", "-*", "-l", "hello"],
+        &["-m", "-1", "hello"],
+        &["-C", "-1", "hello"],
+        &["-e"],
+    ];
+    check_cases(corpus().path(), "small", cases);
+    let pool = pool_corpus();
+    check_cases(pool.path(), "pool", cases);
+}
+
 /// The matcher is configured knob for knob like rg's: \n is the line
 /// terminator outside -U (a pattern that must match it is an error),
 /// -U --crlf keeps CRLF-aware anchors without a line terminator, a

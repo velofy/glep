@@ -1733,9 +1733,25 @@ fn resolve_flag_families(args: &mut Args, matches: &clap::ArgMatches) -> anyhow:
     Ok(())
 }
 
+/// glep's command line on clap, parsed like rg's: a flag that takes a
+/// value takes the next word verbatim, even one that starts with a dash
+/// (`-e -foo`, `-e '-> Result'`, `-g -x`, `--context-separator --`).
+/// Positionals keep clap's rule, so a dash-leading pattern needs `-e` or
+/// `--`, as in rg.
+fn command() -> clap::Command {
+    use clap::CommandFactory;
+    Args::command().mut_args(|a| {
+        if !a.is_positional() && a.get_action().takes_values() {
+            a.allow_hyphen_values(true)
+        } else {
+            a
+        }
+    })
+}
+
 pub fn run() -> anyhow::Result<i32> {
-    use clap::{CommandFactory, FromArgMatches};
-    let matches = Args::command().get_matches();
+    use clap::FromArgMatches;
+    let matches = command().get_matches();
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     messages::configure(!args.no_messages, !args.no_ignore_messages);
     if let Some(n) = args.threads {
