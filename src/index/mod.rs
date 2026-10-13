@@ -222,6 +222,7 @@ impl Index {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn live_files(&self, include_hidden: bool) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self
             .manifest
@@ -231,6 +232,40 @@ impl Index {
             .collect();
         v.sort();
         v
+    }
+
+    /// Every live file, split by `FLAG_HIDDEN` into (plain, hidden), both
+    /// path-sorted: rg may still show a hidden-flagged file (below a
+    /// hidden operand, or whitelisted by -g/-t), so the query layer
+    /// decides per file. With `include_hidden` every file is plain.
+    pub fn live_files_split(&self, include_hidden: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let ids: Vec<u32> = self.manifest.live_entries().map(|e| e.id).collect();
+        self.split_hidden(ids, include_hidden)
+    }
+
+    /// Sorted, deduplicated paths for `ids`, split into (plain, hidden)
+    /// unless `include_hidden`.
+    fn split_hidden(
+        &self,
+        mut ids: Vec<u32>,
+        include_hidden: bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        ids.retain(|&id| self.is_live(id));
+        let mut plain = Vec::with_capacity(ids.len());
+        let mut hidden = Vec::new();
+        for id in ids {
+            let e = &self.manifest.entries[id as usize];
+            if !include_hidden && e.flags & FLAG_HIDDEN != 0 {
+                hidden.push(e.path.clone());
+            } else {
+                plain.push(e.path.clone());
+            }
+        }
+        for v in [&mut plain, &mut hidden] {
+            v.sort();
+            v.dedup();
+        }
+        (plain, hidden)
     }
 
     fn postings_for(&self, tri: u32, ci: bool) -> Vec<u32> {
@@ -274,6 +309,7 @@ impl Index {
     /// -E): under the default quit detection a binary file can never emit
     /// output, so excluding it is a pure win (rg walks the file and quits
     /// at the first NUL instead; observably identical).
+    #[cfg(test)]
     pub fn candidates(
         &self,
         plan: &Plan,
@@ -281,7 +317,34 @@ impl Index {
         include_hidden: bool,
         search_binary: bool,
     ) -> Vec<PathBuf> {
-        let mut ids: Vec<u32> = match plan {
+        let mut ids = self.candidate_ids(plan, case_insensitive, search_binary);
+        ids.retain(|&id| self.is_live(id));
+        if !include_hidden {
+            ids.retain(|&id| self.manifest.entries[id as usize].flags & FLAG_HIDDEN == 0);
+        }
+        let mut paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|&id| self.manifest.entries[id as usize].path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// `candidates`, split by `FLAG_HIDDEN` like `live_files_split`.
+    pub fn candidates_split(
+        &self,
+        plan: &Plan,
+        case_insensitive: bool,
+        include_hidden: bool,
+        search_binary: bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let ids = self.candidate_ids(plan, case_insensitive, search_binary);
+        self.split_hidden(ids, include_hidden)
+    }
+
+    fn candidate_ids(&self, plan: &Plan, case_insensitive: bool, search_binary: bool) -> Vec<u32> {
+        match plan {
             Plan::All => self
                 .manifest
                 .live_entries()
@@ -321,18 +384,7 @@ impl Index {
                 union.dedup();
                 union
             }
-        };
-        ids.retain(|&id| self.is_live(id));
-        if !include_hidden {
-            ids.retain(|&id| self.manifest.entries[id as usize].flags & FLAG_HIDDEN == 0);
         }
-        let mut paths: Vec<PathBuf> = ids
-            .iter()
-            .map(|&id| self.manifest.entries[id as usize].path.clone())
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
     }
 
     /// Live files rg would detect as binary under quit detection without
@@ -353,13 +405,15 @@ impl Index {
     /// content), so all of them join the scan set when -z is active.
     /// Currently only gzip is supported; other extensions get scanned
     /// raw (binary-quit finds nothing, same as -z off).
-    pub fn zip_candidates(&self, include_hidden: bool) -> Vec<PathBuf> {
-        self.manifest
+    /// Split by `FLAG_HIDDEN` like `live_files_split`.
+    pub fn zip_candidates_split(&self, include_hidden: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let ids: Vec<u32> = self
+            .manifest
             .live_entries()
-            .filter(|e| include_hidden || e.flags & FLAG_HIDDEN == 0)
             .filter(|e| e.path.extension().is_some_and(|x| x == "gz"))
-            .map(|e| e.path.clone())
-            .collect()
+            .map(|e| e.id)
+            .collect();
+        self.split_hidden(ids, include_hidden)
     }
 
     /// See the `swept_full` field.

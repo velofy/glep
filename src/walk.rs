@@ -181,7 +181,7 @@ impl WhitelistChecker {
     /// level with a non-None verdict wins; then .ignore beats .gitignore
     /// beats git-exclude beats global excludes. Matchers are rooted at
     /// their own directory, and `matched` strips the dir prefix itself.
-    fn verdict(&mut self, root: &Path, rel: &Path, is_dir: bool) -> ignore::Match<()> {
+    pub(crate) fn verdict(&mut self, root: &Path, rel: &Path, is_dir: bool) -> ignore::Match<()> {
         let mut m_ignore = ignore::Match::None;
         let mut m_gi = ignore::Match::None;
         let mut m_excl = ignore::Match::None;

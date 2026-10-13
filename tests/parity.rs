@@ -276,6 +276,31 @@ const BASE_CASES: &[&[&str]] = &[
     &["--iglob", "!*.log", "-l", "hello"],
     &["-g", "*.rs", "-l", "hello"],
     &["-g", "*.rs", "-g", "!*main*", "-l", "fn main"],
+    // A `!dir` glob prunes the directory itself, wherever it sits, as
+    // rg's walker does; directory-only and nested forms too.
+    &["-g", "!src", "-l", "hello"],
+    &["-g", "!src/", "-l", "hello"],
+    &["-g", "!src/deep", "-l", "answer"],
+    &["-g", "!**/deep", "-l", "answer"],
+    &["--iglob", "!SRC", "-l", "hello"],
+    &["--files", "-g", "!src"],
+    &["-g", "*.rs", "-g", "!src/deep", "-l", "fn|answer"],
+    &["-g", "!pool/d1", "-c", "hello"],
+    &["-g", "!pool/d1/", "-c", "hello"],
+    &["-g", "!d2", "-c", "foo"],
+    // A -g or -t whitelist rescues a hidden file, not the contents of a
+    // hidden directory unless a glob whitelists the directory as well.
+    &["-g", "*.txt", "-l", "hiddentoken"],
+    &["-t", "txt", "-l", "hiddentoken"],
+    &["--files", "-t", "txt"],
+    &["-g", "*.yml", "-l", "hiddentoken"],
+    &["-g", ".github", "-g", "*.yml", "-l", "hiddentoken"],
+    // An operand is never filtered itself: a hidden directory operand is
+    // searched like any other.
+    &["hiddentoken", ".github"],
+    &["-c", "hiddentoken", ".github"],
+    &["-l", "wdirtoken", "dotkit"],
+    &["nopetoken", "dotkit"],
     // --multiline-dotall + -U: . spans newlines
     &["-U", "--multiline-dotall", "a.b\nc.d"],
     // -T type exclusion
@@ -1040,6 +1065,15 @@ fn remaining_stack_flags_match_rg() {
     let ignore_file = extra.path().join("extra.ignore");
     std::fs::write(&ignore_file, "src/\n*.md\n").unwrap();
     let ignore_file = ignore_file.to_str().unwrap();
+    let keep_ignore = extra.path().join("keep.ignore");
+    std::fs::write(&keep_ignore, ".keepme\nplain.txt\n").unwrap();
+    let keep_ignore = keep_ignore.to_str().unwrap();
+    let ignore_md = extra.path().join("md.ignore");
+    std::fs::write(&ignore_md, "*.md\n").unwrap();
+    let ignore_md = ignore_md.to_str().unwrap();
+    let keep_md = extra.path().join("keep_md.ignore");
+    std::fs::write(&keep_md, "!README.md\n").unwrap();
+    let keep_md = keep_md.to_str().unwrap();
     let cases: &[&[&str]] = &[
         &["--line-buffered", "hello"],
         &["-j", "2", "hello"],
@@ -1104,7 +1138,52 @@ fn remaining_stack_flags_match_rg() {
         &["-T", "rust", "-c", "hello"],
         &["--type-add", "web:*.{html,md}", "-t", "web", "hello"],
         &["--type-clear", "rust", "-t", "rust", "hello"],
+        // Type changes apply in command-line order, as in rg.
+        &["-T", "md", "-t", "md", "hello"],
+        &["-t", "md", "-T", "md", "-l", "hello"],
+        &[
+            "--type-clear",
+            "md",
+            "--type-add",
+            "md:*.txt",
+            "-t",
+            "md",
+            "-l",
+            "hello",
+        ],
+        &[
+            "--type-add",
+            "md:*.txt",
+            "--type-clear",
+            "md",
+            "-t",
+            "md",
+            "hello",
+        ],
+        &["-t", "md", "--type-add", "md:*.rs", "-l", "hello"],
         &["--ignore-file", ignore_file, "-l", "hello"],
+        // A missing --ignore-file is a warning: the search goes on.
+        &["--ignore-file", "no_such.ignore", "-l", "hello"],
+        // The tree's own whitelist (`!.keepme` in dotkit/.gitignore) beats
+        // an --ignore-file rule, and among --ignore-file rules the last
+        // file with an opinion decides.
+        &["--ignore-file", keep_ignore, "-l", "keeptoken"],
+        &[
+            "--ignore-file",
+            ignore_md,
+            "--ignore-file",
+            keep_md,
+            "-l",
+            "hello",
+        ],
+        &[
+            "--ignore-file",
+            keep_md,
+            "--ignore-file",
+            ignore_md,
+            "-l",
+            "hello",
+        ],
         &["--require-git", "-l", "hello"],
         &["--no-ignore-vcs", "-l", "hello"],
         &["--no-ignore-dot", "-l", "hello"],
@@ -1352,6 +1431,13 @@ fn subdirectory_runs_match_rg() {
         &["-l", "hello", "deep", "main.rs"],
         &["--files"],
         &["--files-without-match", "hello"],
+        // -g globs match the path relative to the cwd, as rg sees it.
+        &["-l", "-g", "deep/**", "answer|hello"],
+        &["-l", "-g", "/deep/*.rs", "answer|hello"],
+        &["-l", "-g", "!deep/**", "answer|hello"],
+        &["-l", "-g", "!/main.rs", "fn|answer"],
+        &["-l", "-g", "!deep", "answer|hello"],
+        &["--files", "-g", "deep/*"],
     ];
     check_cases(&sub, "subdir", cases);
 }

@@ -1,5 +1,6 @@
 mod cli;
 mod dircache;
+mod filters;
 mod index;
 mod messages;
 mod plan;
