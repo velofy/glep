@@ -435,15 +435,20 @@ struct CountSink<'a, M: Matcher> {
     count: u64,
     /// True match occurrences, for --stats.
     occurrences: u64,
-    /// When -c counts occurrences: count_matches || multiline || only_matching.
+    /// When -c counts occurrences: --count-matches, -o, or a -U search whose
+    /// matches can really span lines.
     count_occurrences: bool,
     /// Binary data seen under quit detection (see `FoundSink`).
     binary_quit: bool,
 }
 
 impl<'a, M: Matcher> CountSink<'a, M> {
-    fn new(matcher: &'a M, opts: &SearchOpts) -> CountSink<'a, M> {
-        let count_occurrences = opts.count_matches || opts.multiline || opts.only_matching;
+    /// `multi_line` is the searcher's verdict for this matcher
+    /// (`multi_line_with_matcher`): under -U, rg's -c counts matches only
+    /// when matches can really span lines; a pattern that can never match
+    /// a line terminator is searched line by line and counts lines.
+    fn new(matcher: &'a M, opts: &SearchOpts, multi_line: bool) -> CountSink<'a, M> {
+        let count_occurrences = opts.count_matches || multi_line || opts.only_matching;
         CountSink {
             matcher,
             occurrences_mode: count_occurrences || opts.stats,
@@ -1053,7 +1058,8 @@ fn search_hay<M: Matcher>(
         return Ok((res, consumed));
     }
     if opts.count || opts.count_matches {
-        let mut sink = CountSink::new(matcher, opts);
+        let multi_line = searcher.multi_line_with_matcher(matcher);
+        let mut sink = CountSink::new(matcher, opts, multi_line);
         let consumed = hay.search(searcher, matcher, &mut sink)?;
         let stats = opts
             .stats

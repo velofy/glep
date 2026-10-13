@@ -818,6 +818,13 @@ fn matcher_config_matches_rg() {
         &["-c", "-F", "hello\nfoo"],
         &["-U", "-c", "goodbye\\nfoo"],
         &["-U", "-c", "-F", "goodbye\nfoo"],
+        // -U -c counts lines when the pattern can never span lines, and
+        // matches when it can.
+        &["-U", "-c", "o"],
+        &["-U", "-c", "l+"],
+        &["-U", "-c", "o\\s+"],
+        &["-U", "--count-matches", "l+"],
+        &["-U", "-c", "-v", "l"],
         &["-c", "\\s+$"],
         &["-c", "^\\s"],
         &["-c", "(?-m)^use"],
