@@ -2587,3 +2587,297 @@ fn files_appended_after_indexing_are_searched_whole() {
         }
     }
 }
+
+/// A tree for scoped listings. Unlike `corpus()`, nothing at its root is
+/// an `.ignore`, which would send every bulk sweep to the walker, so the
+/// operand-start sweep serves these listings: 40-odd sources over nested
+/// directories (names that sort around the separator: `a`, `a-b`, `a.c`,
+/// `a.rs`), ignored and hidden directories, a `!.github/` whitelist, a
+/// directory of ignored files only, one of symlinks only, an empty one,
+/// an `.ignore` inside one operand and one on the way to another.
+fn listing_corpus() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write = |rel: &str, body: &str| {
+        let p = d.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(".gitignore", "*.log\nbuild/\ndrivers/\n");
+    write("README.md", "readme\n");
+    for i in 0..POOL_FILES {
+        write(&format!("src/m{}/f{i:02}.rs", i % 5), "fn f() {}\n");
+    }
+    write("src/main.rs", "fn main() {}\n");
+    write("src/deep/util.rs", "pub fn u() {}\n");
+    write("src/deep/notes.txt", "notes\n");
+    write("src/deep/trace.log", "ignored\n");
+    write("src/.env", "hidden\n");
+    write("src/a/y.rs", "y\n");
+    write("src/a-b/x.rs", "x\n");
+    write("src/a.c/z.rs", "z\n");
+    write("src/a.rs", "a\n");
+    write("build/out.txt", "ignored dir\n");
+    write("build/sub/deeper.txt", "ignored dir\n");
+    write("drivers/net/eth.c", "ignored at the root\n");
+    write("drivers/net/wifi/w.c", "ignored at the root\n");
+    write(".hdir/top.txt", "hidden dir\n");
+    write(".hdir/sub/inner.txt", "hidden dir\n");
+    write(".hdir/sub/.dot.txt", "hidden twice\n");
+    write("wl/.gitignore", ".*\n!.gitignore\n!.github/\n");
+    write("wl/.github/workflows/ci.yml", "whitelisted\n");
+    write("wl/.secret/key.txt", "ignored dot dir\n");
+    write("wl/.dotfile", "ignored dotfile\n");
+    write("wl/plain.txt", "plain\n");
+    write("logs/a.log", "ignored\n");
+    write("logs/b.log", "ignored\n");
+    write("ign/.ignore", "skip.txt\n");
+    write("ign/skip.txt", "dot-ignored\n");
+    write("ign/keep.txt", "kept\n");
+    write("chain/.ignore", "x.txt\n");
+    write("chain/sub/x.txt", "dot-ignored from above\n");
+    write("chain/sub/y.txt", "kept\n");
+    std::fs::create_dir_all(d.join("empty")).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(d.join("links")).unwrap();
+        std::os::unix::fs::symlink("../src/deep", d.join("links/to_deep")).unwrap();
+        std::os::unix::fs::symlink("../README.md", d.join("links/to_readme")).unwrap();
+    }
+    dir
+}
+
+/// One listing run: stdout, stderr and exit code.
+type Listed = (String, String, i32);
+
+/// glep's `--files '**' OPERANDS` and `rg --files OPERANDS`, both with
+/// `flags`, in `cwd`. glep runs with GLEP_TIMING: the second value says
+/// whether the scoped sweep served the listing, and its timing lines are
+/// dropped from stderr. rg's `rg: ` message prefix reads as glep's, and
+/// `rg_line`, when given, maps each line of rg's stdout (for spellings
+/// glep prints relative to the cwd, see README).
+fn listings(
+    cwd: &Path,
+    flags: &[&str],
+    operands: &[&str],
+    rg_line: Option<fn(&str) -> String>,
+) -> (Listed, bool, Listed) {
+    let g = Command::cargo_bin("glep")
+        .unwrap()
+        .current_dir(cwd)
+        .env("GLEP_TIMING", "1")
+        .args(flags)
+        .args(["--files", "**"])
+        .args(operands)
+        .output()
+        .unwrap();
+    let g_err = String::from_utf8_lossy(&g.stderr).into_owned();
+    let scoped = g_err
+        .lines()
+        .any(|l| l.starts_with("glep timing: scoped_sweep"));
+    let g_err: String = g_err
+        .lines()
+        .filter(|l| !l.starts_with("glep timing: "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let r = std::process::Command::new("rg")
+        .current_dir(cwd)
+        .args(["--sort", "path", "--no-require-git"])
+        .args(flags)
+        .arg("--files")
+        .args(operands)
+        .output()
+        .unwrap();
+    let r_out = String::from_utf8(r.stdout).unwrap();
+    let r_out: String = match rg_line {
+        Some(f) => r_out.lines().map(|l| format!("{}\n", f(l))).collect(),
+        None => r_out,
+    };
+    let r_err: String = String::from_utf8_lossy(&r.stderr)
+        .lines()
+        .map(|l| {
+            format!(
+                "{}\n",
+                l.strip_prefix("rg: ")
+                    .map_or(l.to_string(), |m| format!("glep: {m}"))
+            )
+        })
+        .collect();
+    (
+        (
+            String::from_utf8(g.stdout).unwrap(),
+            g_err,
+            g.status.code().unwrap_or(-1),
+        ),
+        scoped,
+        (r_out, r_err, r.status.code().unwrap_or(-1)),
+    )
+}
+
+/// Assert each (flags, operands) listing matches rg's and was served by
+/// the scoped sweep.
+fn check_scoped_listings(cwd: &Path, label: &str, cases: &[(&[&str], &[&str])]) {
+    for (flags, operands) in cases {
+        let (g, scoped, r) = listings(cwd, flags, operands, None);
+        assert_eq!(g, r, "{label}: {flags:?} --files {operands:?}");
+        assert!(
+            scoped,
+            "{label}: {flags:?} --files {operands:?} took the index path"
+        );
+    }
+}
+
+/// Scoped --files listings come from a live sweep that starts at each
+/// operand, never from the index (the tree stays unindexed), and print
+/// what rg prints: overlapping, repeated and file operands, operands rg
+/// walks itself (ignored, inside ignored or hidden directories, behind
+/// an ignore rule above them, symlinked, empty or holding ignored files
+/// only), `.ignore` files on the walker fallback, filters, sorts, and
+/// subdirectory runs.
+#[test]
+fn scoped_listings_from_the_sweep_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = listing_corpus();
+    let d = dir.path();
+    let none: &[&str] = &[];
+    let hidden: &[&str] = &["--hidden"];
+    let mut cases: Vec<(&[&str], &[&str])> = vec![
+        (none, &["src"]),
+        (none, &["src", "src"]),
+        (none, &["build"]),
+        (none, &["logs"]),
+        (&["-g", "*.log"], &["logs"]),
+        (&["-t", "rust"], &["logs"]),
+        (none, &["empty"]),
+        (none, &["ign"]),
+        (none, &["wl"]),
+        (hidden, &["wl"]),
+        (none, &[".hdir"]),
+        (hidden, &[".hdir"]),
+        (&["-g", "*.rs"], &["src"]),
+        (&["-g", "!m1"], &["src"]),
+        (&["-t", "rust"], &["src", "wl"]),
+        (&["--max-depth", "1"], &["src"]),
+        (&["--max-depth", "2"], &["src", "wl"]),
+        (&["--sortr", "path"], &["src", "wl"]),
+        (&["--sort", "modified"], &["src"]),
+        (&["-0"], &["src"]),
+        (none, &["src", "nope"]),
+    ];
+    #[cfg(unix)]
+    cases.extend_from_slice(&[
+        (none, &["src/deep"]),
+        (none, &["src", "src/deep"]),
+        (none, &["src/deep", "src"]),
+        (none, &["src/main.rs"]),
+        (none, &["README.md", "src/deep"]),
+        (none, &["build/sub"]),
+        (none, &["drivers/net"]),
+        (none, &[".hdir/sub"]),
+        (hidden, &[".hdir/sub"]),
+        (none, &["wl/.github"]),
+        (none, &["wl/.github/workflows"]),
+        (none, &["wl/.secret"]),
+        (hidden, &["wl/.secret"]),
+        (none, &["chain/sub"]),
+        (none, &["links"]),
+        (none, &["links/to_deep"]),
+        (&["-g", "!*.txt"], &["src/deep", "wl"]),
+        (&["--sort", "modified"], &["src/deep", "wl"]),
+        (&["--path-separator", "%"], &["src/deep"]),
+    ]);
+    check_scoped_listings(d, "scoped", &cases);
+    // None of that opened, built or wrote the index.
+    assert!(!d.join(".glep").exists());
+    #[cfg(unix)]
+    {
+        // `./src/` prints as `src/...` (cwd-relative, see README).
+        let (g, scoped, r) = listings(
+            d,
+            &[],
+            &["./src/"],
+            Some(|l| l.strip_prefix("./").unwrap_or(l).to_string()),
+        );
+        assert_eq!(g, r, "./src/");
+        assert!(scoped);
+        // A subdirectory run finds the tree's root by its index: build it,
+        // and the scoped listings below leave it untouched.
+        let (_, code) = glep_out(d, &["-c", "fn"]);
+        assert_eq!(code, 0);
+        let manifest = std::fs::read(d.join(".glep/manifest.bin")).unwrap();
+        // From a subdirectory: the cwd scope, operands below it and one
+        // beside it.
+        let sub = d.join("src");
+        check_scoped_listings(
+            &sub,
+            "src",
+            &[
+                (none, &[]),
+                (none, &["deep"]),
+                (none, &["../wl"]),
+                (hidden, &["a", "../wl"]),
+            ],
+        );
+        // The cwd inside an ignored and inside a hidden directory.
+        check_scoped_listings(&d.join("build"), "build", &[(none, &[]), (none, &["sub"])]);
+        check_scoped_listings(&d.join(".hdir"), ".hdir", &[(none, &[]), (hidden, &[])]);
+        check_scoped_listings(d, "indexed", &cases);
+        assert_eq!(
+            std::fs::read(d.join(".glep/manifest.bin")).unwrap(),
+            manifest
+        );
+        assert!(!d.join("src/.glep").exists());
+        // `..` from a subdirectory is the root: the index path, which
+        // prints cwd-relative paths (README).
+        let (g, scoped, r) = listings(
+            &sub,
+            &[],
+            &[".."],
+            Some(|l| l.strip_prefix("../src/").unwrap_or(l).to_string()),
+        );
+        assert_eq!(g, r, "..");
+        assert!(!scoped, "a root operand must take the index path");
+    }
+}
+
+/// An ignore rule above an operand that names the operand itself (here
+/// `net/` in drivers/.gitignore): rg walks the operand anyway, and the
+/// rule still applies below it.
+#[cfg(unix)]
+#[test]
+fn scoped_listings_under_a_rule_naming_the_operand_match_rg() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write = |rel: &str| {
+        let p = d.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "x\n").unwrap();
+    };
+    write("drivers/net/eth.c");
+    write("drivers/net/net/inner.c");
+    write("drivers/net/phy/p.c");
+    for i in 0..POOL_FILES {
+        write(&format!("drivers/gpu/g{}/f{i:02}.c", i % 3));
+    }
+    std::fs::write(d.join("drivers/.gitignore"), "net/\n").unwrap();
+    let none: &[&str] = &[];
+    check_scoped_listings(
+        d,
+        "net",
+        &[
+            (none, &["drivers/net"]),
+            (none, &["drivers/net/phy"]),
+            (none, &["drivers"]),
+            (none, &["drivers/gpu", "drivers/net"]),
+            (&["--max-depth", "1"], &["drivers/net"]),
+        ],
+    );
+    assert!(!d.join(".glep").exists());
+}

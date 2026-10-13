@@ -60,9 +60,10 @@
 
 #![cfg(target_os = "macos")]
 
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -110,6 +111,13 @@ extern "C" {
         attrbuf: *mut libc::c_void,
         attrbufsize: libc::size_t,
         options: u64,
+    ) -> libc::c_int;
+    fn getattrlist(
+        path: *const libc::c_char,
+        alist: *mut AttrList,
+        attrbuf: *mut libc::c_void,
+        attrbufsize: libc::size_t,
+        options: libc::c_ulong,
     ) -> libc::c_int;
 }
 
@@ -399,6 +407,138 @@ fn bulk_scan_dir(dir: &Path) -> Result<DirScan, ScanError> {
         *b.borrow_mut() = buf_storage;
     });
 
+    outcome.map(|()| DirScan { files, subdirs })
+}
+
+/// What a sweep reads for each directory entry.
+#[derive(Clone, Copy)]
+enum ScanAttrs {
+    /// Name, type, mtime and size, from getattrlistbulk (`bulk_scan_dir`):
+    /// the index's freshness diff compares mtimes and sizes.
+    Full,
+    /// Name and type only, from readdir (`names_scan_dir`): a listing
+    /// never looks at the rest.
+    Names,
+}
+
+fn scan_dir(dir: &Path, attrs: ScanAttrs) -> Result<DirScan, ScanError> {
+    match attrs {
+        ScanAttrs::Full => bulk_scan_dir(dir),
+        ScanAttrs::Names => names_scan_dir(dir),
+    }
+}
+
+/// `bulk_scan_dir` for a listing, which needs names and types only:
+/// readdir(3) reads both from the directory's own records, where
+/// getattrlistbulk also fetches every entry's mtime and size. An entry
+/// readdir cannot type (DT_UNKNOWN) is typed by fstatat(2) without
+/// following a symlink; symlinks and other non-file, non-directory
+/// entries are dropped, as in `bulk_scan_dir`. Every mtime and size is 0.
+/// Errors are reported in `bulk_scan_dir`'s words.
+fn names_scan_dir(dir: &Path) -> Result<DirScan, ScanError> {
+    let soft = |err: std::io::Error| ScanError::Soft(format!("{}: {err}", dir.display()));
+    let cpath = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| ScanError::Soft(format!("{}: {e}", dir.display())))?;
+    // Safety: cpath is a NUL-terminated string that outlives the call;
+    // O_DIRECTORY makes the kernel reject anything but a directory.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(soft(std::io::Error::last_os_error()));
+    }
+    // Safety: fd is an open directory descriptor owned here; on success
+    // the stream owns it and closedir below closes both.
+    let dirp = unsafe { libc::fdopendir(fd) };
+    if dirp.is_null() {
+        let err = std::io::Error::last_os_error();
+        // Safety: fdopendir failed, so fd is still ours to close.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(soft(err));
+    }
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    let outcome = loop {
+        // readdir returns NULL at the end and on an error alike; only
+        // errno tells them apart.
+        // Safety: __error is this thread's errno slot.
+        unsafe {
+            *libc::__error() = 0;
+        }
+        // Safety: dirp is the open stream from fdopendir above, used by
+        // this thread only.
+        let ent = unsafe { libc::readdir(dirp) };
+        if ent.is_null() {
+            // Safety: as above.
+            let errno = unsafe { *libc::__error() };
+            break if errno == 0 {
+                Ok(())
+            } else {
+                Err(soft(std::io::Error::from_raw_os_error(errno)))
+            };
+        }
+        // Safety: a non-NULL readdir result points at a dirent that stays
+        // valid until the next readdir or closedir on this stream; d_namlen
+        // counts the name's bytes, inside d_name.
+        let ent = unsafe { &*ent };
+        let name = unsafe {
+            std::slice::from_raw_parts(ent.d_name.as_ptr() as *const u8, ent.d_namlen as usize)
+        };
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let objtype = match ent.d_type {
+            libc::DT_REG => VREG,
+            libc::DT_DIR => VDIR,
+            libc::DT_UNKNOWN => {
+                // Safety: stat is plain data, and fstatat writes it whole
+                // on success; d_name is NUL-terminated and names an entry
+                // of the open directory dirfd(dirp).
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        libc::dirfd(dirp),
+                        ent.d_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc != 0 {
+                    // Gone since the listing.
+                    continue;
+                }
+                match st.st_mode & libc::S_IFMT {
+                    libc::S_IFREG => VREG,
+                    libc::S_IFDIR => VDIR,
+                    _ => continue,
+                }
+            }
+            // Symlinks, sockets, fifos and devices: dropped, as in
+            // bulk_scan_dir.
+            _ => continue,
+        };
+        let name = OsStr::from_bytes(name).to_os_string();
+        if objtype == VREG {
+            files.push(BulkEntry {
+                name,
+                objtype,
+                mtime_ns: 0,
+                size: 0,
+            });
+        } else {
+            subdirs.push(Subdir { name, mtime_ns: 0 });
+        }
+    };
+    // Safety: dirp came from fdopendir above and is closed exactly once,
+    // whichever way the loop ended; it closes fd with it.
+    unsafe {
+        libc::closedir(dirp);
+    }
     outcome.map(|()| DirScan { files, subdirs })
 }
 
@@ -741,6 +881,229 @@ fn dir_in_scope(rel: &Path, prefixes: &[PathBuf]) -> bool {
         .any(|p| rel.starts_with(p) || p.starts_with(rel))
 }
 
+/// A directory's own `.gitignore` as a matcher rooted at the directory.
+/// A rule that fails to parse, or a file that fails to read, is reported
+/// as an ignore warning and the readable rules still apply, as in the
+/// walker.
+fn load_dir_gitignore(dir: &Path) -> Option<Arc<Gitignore>> {
+    let path = dir.join(".gitignore");
+    let mut builder = GitignoreBuilder::new(dir);
+    if let Some(err) = builder.add(&path) {
+        crate::messages::ignore_warning(format!("{}: {err}", path.display()));
+    }
+    match builder.build() {
+        Ok(gi) => Some(Arc::new(gi)),
+        Err(err) => {
+            crate::messages::ignore_warning(format!("{}: {err}", path.display()));
+            None
+        }
+    }
+}
+
+/// One directory entry looked up by name instead of listed: what a bulk
+/// scan of its parent would report for it.
+enum Lookup {
+    /// The entry, stored under exactly the name looked up.
+    Found(BulkEntry),
+    /// No entry by that name.
+    Absent,
+    /// A lookup cannot settle it: an error other than "no such entry", or
+    /// an entry stored under another spelling (a case- or
+    /// normalization-insensitive volume finds `Src` for `src`, while a
+    /// listing reports only the stored name).
+    Unsure,
+}
+
+/// Look up `abs`, whose last component is `name`, with getattrlist(2):
+/// the attributes a bulk scan of its parent returns, for the entry itself
+/// (a symlink is not followed). The reply has a bulk entry's layout, so
+/// `parse_bulk_buffer` reads it.
+fn lookup_entry(abs: &Path, name: &OsStr) -> Lookup {
+    let Ok(cpath) = CString::new(abs.as_os_str().as_bytes()) else {
+        return Lookup::Unsure;
+    };
+    let mut attrlist = make_attrlist();
+    // One reply: the fixed attributes plus a name of at most 255 UTF-8
+    // characters, in a 4-byte aligned buffer.
+    let mut buf = [0u32; 1024];
+    // Safety: cpath is a NUL-terminated string that outlives the call;
+    // attrlist is the request struct the kernel reads; buf is a live
+    // allocation of size_of_val(&buf) bytes and the kernel writes at most
+    // that many into it.
+    let rc = unsafe {
+        getattrlist(
+            cpath.as_ptr(),
+            &mut attrlist as *mut AttrList,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            std::mem::size_of_val(&buf),
+            FSOPT_NOFOLLOW as libc::c_ulong,
+        )
+    };
+    if rc != 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT) => Lookup::Absent,
+            _ => Lookup::Unsure,
+        };
+    }
+    // Safety: buf is initialized u32s, and any byte view of them is valid.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr() as *const u8, std::mem::size_of_val(&buf))
+    };
+    let mut parsed = Vec::with_capacity(1);
+    if parse_bulk_buffer(bytes, 1, &mut parsed).is_err() {
+        return Lookup::Unsure;
+    }
+    match parsed.pop() {
+        Some(e) if e.name == name => Lookup::Found(e),
+        _ => Lookup::Unsure,
+    }
+}
+
+/// What a directory on the way down to a scope prefix contributes.
+enum Level {
+    /// Its own `.gitignore` matcher, if it has one.
+    Rules(Option<Arc<Gitignore>>),
+    /// One of its ignore files could not be settled by a lookup.
+    Unsure,
+}
+
+/// Read a directory on the way from the root to a scope prefix by name:
+/// the walk from the root lists it only to find its ignore files and the
+/// next level down. Err when it holds an `.ignore` or `.rgignore` (a
+/// regular file, as a listing counts it), which defers the sweep to the
+/// walker exactly as listing it would.
+fn level_rules(dir: &Path) -> anyhow::Result<Level> {
+    for name in [".ignore", crate::walk::RGIGNORE] {
+        match lookup_entry(&dir.join(name), OsStr::new(name)) {
+            Lookup::Found(e) if e.objtype == VREG => anyhow::bail!(
+                "{}: contains .ignore/.rgignore, deferring to the walker",
+                dir.display()
+            ),
+            Lookup::Found(_) | Lookup::Absent => {}
+            Lookup::Unsure => return Ok(Level::Unsure),
+        }
+    }
+    Ok(
+        match lookup_entry(&dir.join(".gitignore"), OsStr::new(".gitignore")) {
+            Lookup::Found(e) if e.objtype == VREG => Level::Rules(load_dir_gitignore(dir)),
+            Lookup::Found(_) | Lookup::Absent => Level::Rules(None),
+            Lookup::Unsure => Level::Unsure,
+        },
+    )
+}
+
+/// Where a scoped sweep starts below the root.
+enum ScopedStart {
+    /// A prefix naming a directory, with the matcher stack the walk from
+    /// the root holds when it reaches it.
+    Dir {
+        prefix: PathBuf,
+        abs: PathBuf,
+        stack: Vec<Arc<Gitignore>>,
+    },
+    /// A prefix naming a regular file, as the walk from the root yields it.
+    File(FileMeta),
+}
+
+/// The starting points of a scoped sweep, one per prefix that lies in no
+/// other prefix. The walk from the root lists each directory on the way
+/// to a prefix only to load its ignore files and to find the next level,
+/// so both are read by name instead (`level_rules`, `lookup_entry`): the
+/// next level must be stored under exactly its name, be a directory (or,
+/// last, a regular file) and not be ignored by the stack built so far,
+/// which is the stack the walk from the root carries there. A level that
+/// walk would not enter (absent, ignored, a symlink, `.git`) leaves the
+/// prefix with no files, as it does there. Err defers the sweep to the
+/// walker (an `.ignore` or `.rgignore` on the way); Ok(None) means some
+/// name could not be settled by a lookup, and the caller walks from the
+/// root instead.
+fn scoped_starts(
+    root: &Path,
+    dot: &[Arc<Gitignore>],
+    seed: &[Arc<Gitignore>],
+    prefixes: &[PathBuf],
+) -> anyhow::Result<Option<Vec<ScopedStart>>> {
+    if prefixes.iter().any(|p| p.as_os_str().is_empty()) {
+        return Ok(None);
+    }
+    // Path order puts each prefix right before the prefixes inside it,
+    // duplicates included; its own walk covers those.
+    let mut sorted: Vec<&Path> = prefixes.iter().map(PathBuf::as_path).collect();
+    sorted.sort();
+    let mut outer: Vec<&Path> = Vec::with_capacity(sorted.len());
+    for p in sorted {
+        if !outer.last().is_some_and(|o| p.starts_with(o)) {
+            outer.push(p);
+        }
+    }
+    // Each level's own .gitignore, loaded once however many prefixes
+    // pass through it.
+    let mut levels: HashMap<PathBuf, Option<Arc<Gitignore>>> = HashMap::new();
+    let mut starts = Vec::with_capacity(outer.len());
+    'prefix: for prefix in outer {
+        let mut names: Vec<&OsStr> = Vec::new();
+        for c in prefix.components() {
+            match c {
+                Component::Normal(n) => names.push(n),
+                // Swept paths are plain names below the root: an absolute,
+                // `.` or `..` prefix matches none of them.
+                _ => continue 'prefix,
+            }
+        }
+        let mut stack = seed.to_vec();
+        let mut dir = root.to_path_buf();
+        for (i, &name) in names.iter().enumerate() {
+            let own = match levels.get(&dir) {
+                Some(own) => own.clone(),
+                None => match level_rules(&dir)? {
+                    Level::Rules(own) => {
+                        levels.insert(dir.clone(), own.clone());
+                        own
+                    }
+                    Level::Unsure => return Ok(None),
+                },
+            };
+            stack.extend(own);
+            let abs = dir.join(name);
+            let entry = match lookup_entry(&abs, name) {
+                Lookup::Found(e) => e,
+                Lookup::Absent => continue 'prefix,
+                Lookup::Unsure => return Ok(None),
+            };
+            let last = i + 1 == names.len();
+            match entry.objtype {
+                VDIR if !is_ignored(dot, &stack, &abs, true, name) => {
+                    if last {
+                        starts.push(ScopedStart::Dir {
+                            prefix: prefix.to_path_buf(),
+                            abs,
+                            stack,
+                        });
+                        continue 'prefix;
+                    }
+                    dir = abs;
+                }
+                VREG if last && !is_ignored(dot, &stack, &abs, false, name) => {
+                    let rel = abs.strip_prefix(root).unwrap_or(&abs).to_path_buf();
+                    let hidden = still_hidden(dot, &stack, root, &rel);
+                    starts.push(ScopedStart::File(FileMeta {
+                        path: rel,
+                        mtime_ns: entry.mtime_ns,
+                        size: entry.size,
+                        hidden,
+                    }));
+                    continue 'prefix;
+                }
+                // Ignored, a symlink, a file on the way, or neither file
+                // nor directory: the walk from the root yields nothing
+                // under it.
+                _ => continue 'prefix,
+            }
+        }
+    }
+    Ok(Some(starts))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_recursive<'scope>(
     scope: &rayon::Scope<'scope>,
@@ -751,8 +1114,9 @@ fn scan_recursive<'scope>(
     buffers: &'scope [Mutex<Vec<FileMeta>>],
     fatal: &'scope Mutex<Option<anyhow::Error>>,
     filter: Option<&'scope [PathBuf]>,
+    attrs: ScanAttrs,
 ) {
-    let scan = match bulk_scan_dir(&dir) {
+    let scan = match scan_dir(&dir, attrs) {
         Ok(s) => s,
         Err(ScanError::Soft(msg)) => {
             crate::messages::error(msg);
@@ -795,17 +1159,7 @@ fn scan_recursive<'scope>(
 
     let mut stack = matchers;
     if has_local_gitignore {
-        let mut builder = GitignoreBuilder::new(&dir);
-        if let Some(err) = builder.add(dir.join(".gitignore")) {
-            crate::messages::ignore_warning(format!("{}: {err}", dir.join(".gitignore").display()));
-        }
-        match builder.build() {
-            Ok(gi) => stack.push(Arc::new(gi)),
-            Err(err) => crate::messages::ignore_warning(format!(
-                "{}: {err}",
-                dir.join(".gitignore").display()
-            )),
-        }
+        stack.extend(load_dir_gitignore(&dir));
     }
 
     let slot_idx = rayon::current_thread_index().unwrap_or(0) % buffers.len().max(1);
@@ -858,6 +1212,7 @@ fn scan_recursive<'scope>(
                 buffers,
                 fatal,
                 filter,
+                attrs,
             );
         });
     }
@@ -881,22 +1236,56 @@ fn scan_recursive<'scope>(
 /// `sweep_bulk` like any other fatal error, sending the whole sweep to the
 /// walker fallback.
 pub fn sweep_bulk(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
-    sweep_bulk_filtered(root, None)
+    Ok(sweep_bulk_filtered(root, None, false, ScanAttrs::Full)?.0)
 }
 
-/// `sweep_bulk` restricted to `prefixes` (root-relative): the SAME walk
-/// from the root, with the same matcher stack, pruned to directories on
-/// the way to or inside a prefix and to files inside one. The result is
-/// exactly the full sweep's subset under the prefixes, so an ignored
-/// directory named as a prefix yields nothing (it never enters the index)
-/// and every ancestor `.gitignore` between the root and a prefix applies.
-/// A `.ignore`/`.rgignore` on the scanned path defers to the walker like
-/// the full sweep does. Unsorted, like `sweep_bulk`.
+/// `sweep_bulk` restricted to `prefixes` (root-relative): exactly the
+/// full sweep's subset under the prefixes, so an ignored directory named
+/// as a prefix yields nothing (it never enters the index) and every
+/// ancestor `.gitignore` between the root and a prefix applies. The walk
+/// starts at each prefix, with the matcher stack the walk from the root
+/// would carry there (`scoped_starts` reads the levels above by name, and
+/// several prefixes walk in parallel); when a level cannot be read that
+/// way, it runs from the root, pruned to directories on the way to or
+/// inside a prefix and to files inside one. A `.ignore`/`.rgignore` on
+/// the way to or inside a prefix defers to the walker like the full sweep
+/// does. Unsorted, like `sweep_bulk`.
 pub fn sweep_bulk_scoped(root: &Path, prefixes: &[PathBuf]) -> anyhow::Result<Vec<FileMeta>> {
-    sweep_bulk_filtered(root, Some(prefixes))
+    Ok(sweep_bulk_filtered(root, Some(prefixes), true, ScanAttrs::Full)?.0)
 }
 
-fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Result<Vec<FileMeta>> {
+/// `sweep_bulk_scoped` for a listing: the same paths and hidden flags,
+/// read with readdir (mtimes and sizes are 0, except for a prefix that
+/// names a file, which is looked up whole), plus the prefixes whose
+/// walk started at the prefix itself, as a directory every level above
+/// which the walk from the root enters: the files under such a prefix
+/// are exactly the ones returned, none or many.
+pub fn sweep_bulk_scoped_names(
+    root: &Path,
+    prefixes: &[PathBuf],
+) -> anyhow::Result<(Vec<FileMeta>, Vec<PathBuf>)> {
+    sweep_bulk_filtered(root, Some(prefixes), true, ScanAttrs::Names)
+}
+
+/// `sweep_bulk_scoped` walked from the root only: the reference the
+/// prefix-start walk is tested against.
+#[cfg(test)]
+pub fn sweep_bulk_scoped_from_root(
+    root: &Path,
+    prefixes: &[PathBuf],
+) -> anyhow::Result<Vec<FileMeta>> {
+    Ok(sweep_bulk_filtered(root, Some(prefixes), false, ScanAttrs::Full)?.0)
+}
+
+/// The bulk sweep, scoped by `filter` when given (see `sweep_bulk_scoped`;
+/// `from_prefixes` false always walks from the root). Also returns the
+/// prefixes whose walk started at the prefix itself, as a directory.
+fn sweep_bulk_filtered(
+    root: &Path,
+    filter: Option<&[PathBuf]>,
+    from_prefixes: bool,
+    attrs: ScanAttrs,
+) -> anyhow::Result<(Vec<FileMeta>, Vec<PathBuf>)> {
     anyhow::ensure!(
         root.is_dir(),
         "{}: No such file or directory (os error 2)",
@@ -904,23 +1293,53 @@ fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Resul
     );
     let seed_matchers = build_ancestor_stack(root)?;
     let dot = build_ancestor_dot_ignores(root);
+    let starts = match filter {
+        Some(prefixes) if from_prefixes => scoped_starts(root, &dot, &seed_matchers, prefixes)?,
+        _ => None,
+    };
 
     let num_slots = rayon::current_num_threads().max(1);
     let buffers: Vec<Mutex<Vec<FileMeta>>> =
         (0..num_slots).map(|_| Mutex::new(Vec::new())).collect();
     let fatal: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
-    rayon::scope(|scope| {
-        scan_recursive(
+    let mut entered = Vec::new();
+    let (dot_ref, buffers_ref, fatal_ref) = (&dot[..], &buffers[..], &fatal);
+    rayon::scope(|scope| match starts {
+        Some(starts) => {
+            for start in starts {
+                match start {
+                    ScopedStart::Dir { prefix, abs, stack } => {
+                        entered.push(prefix);
+                        scope.spawn(move |scope| {
+                            scan_recursive(
+                                scope,
+                                root,
+                                abs,
+                                dot_ref,
+                                stack,
+                                buffers_ref,
+                                fatal_ref,
+                                None,
+                                attrs,
+                            );
+                        })
+                    }
+                    ScopedStart::File(meta) => buffers_ref[0].lock().unwrap().push(meta),
+                }
+            }
+        }
+        None => scan_recursive(
             scope,
             root,
             root.to_path_buf(),
-            &dot,
+            dot_ref,
             seed_matchers,
-            &buffers,
-            &fatal,
+            buffers_ref,
+            fatal_ref,
             filter,
-        );
+            attrs,
+        ),
     });
 
     if let Some(e) = fatal.into_inner().unwrap() {
@@ -934,7 +1353,7 @@ fn sweep_bulk_filtered(root: &Path, filter: Option<&[PathBuf]>) -> anyhow::Resul
     // Deliberately unsorted: callers (`walk::sweep`) sort when they need
     // ordered output; the freshness-diff caller does not, and sorting 86k
     // paths costs ~30ms on a kernel-scale tree.
-    Ok(all)
+    Ok((all, entered))
 }
 
 // ---------------------------------------------------------------------
@@ -1208,17 +1627,7 @@ fn scan_listing<'a, 'b>(
 
     let mut stack = stack;
     if has_local_gitignore {
-        let mut builder = GitignoreBuilder::new(&dir);
-        if let Some(err) = builder.add(dir.join(".gitignore")) {
-            crate::messages::ignore_warning(format!("{}: {err}", dir.join(".gitignore").display()));
-        }
-        match builder.build() {
-            Ok(gi) => stack.push(Arc::new(gi)),
-            Err(err) => crate::messages::ignore_warning(format!(
-                "{}: {err}",
-                dir.join(".gitignore").display()
-            )),
-        }
+        stack.extend(load_dir_gitignore(&dir));
     }
 
     // This dir's own .gitignore must match the cached observation for its

@@ -1040,8 +1040,9 @@ impl Scope {
 /// printed: relative to the cwd, like -g.
 fn files_glob(args: &Args) -> anyhow::Result<Option<globset::GlobMatcher>> {
     match args.pattern.as_deref() {
+        // `**` (built as `**/**`) matches every path: nothing to filter.
+        Some("**") | None => Ok(None),
         Some(g) => Ok(Some(build_glob_icase(g, args.glob_case_insensitive)?)),
-        None => Ok(None),
     }
 }
 
@@ -1423,6 +1424,151 @@ fn run_live(
     timings.stage("search");
     timings.finish();
     Ok(exit_code(args, had_error || nothing_searched, found))
+}
+
+/// True when `p` (root-relative after `normalize_path_filters`) is a path
+/// of plain names below the root: not the root itself, not absolute, no
+/// `.` or `..` component.
+fn names_below_root(p: &Path) -> bool {
+    !p.as_os_str().is_empty()
+        && p.components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Whether some swept path lies under each prefix, in one pass over the
+/// sweep: a path is under a prefix when its bytes start with the
+/// prefix's and the next byte is a separator or the end (both are plain
+/// names joined by single separators). Stops once every prefix has one.
+fn prefixes_with_files(metas: &[walk::FileMeta], prefixes: &[PathBuf]) -> Vec<bool> {
+    let sep = std::path::MAIN_SEPARATOR as u8;
+    let mut found = vec![false; prefixes.len()];
+    let mut missing = prefixes.len();
+    for m in metas {
+        if missing == 0 {
+            break;
+        }
+        let path = m.path.as_os_str().as_encoded_bytes();
+        for (prefix, seen) in prefixes.iter().zip(found.iter_mut()) {
+            let prefix = prefix.as_os_str().as_encoded_bytes();
+            if !*seen
+                && path.starts_with(prefix)
+                && path.get(prefix.len()).is_none_or(|&b| b == sep)
+            {
+                *seen = true;
+                missing -= 1;
+            }
+        }
+    }
+    found
+}
+
+/// A scoped --files listing (directory operands below the root, see
+/// `run`) from a live sweep of the operands, never the index: a listing
+/// needs neither postings nor the manifest, and the scoped sweep is the
+/// one `Index::update_scoped` runs (read with names only), whose result
+/// is exactly the set the index path lists under the operands. Nothing
+/// here opens, builds or writes the index (or the listing cache), so an
+/// unindexed tree lists without a build.
+///
+/// Operands the sweep holds no file under are walked live with rg's
+/// rules, as on the index path (`Scope::walk_unserved`), unless the sweep
+/// entered the operand as a directory (every level above it one the walk
+/// from the root enters) and no -g/--iglob is given: rg's walk of such an
+/// operand applies the same ignore rules, and every other filter (-t,
+/// --ignore-file, --max-depth, hidden) only drops files, so it could
+/// yield nothing either. Only a glob override can bring back files that
+/// ignore rules exclude, so with one those operands still walk live,
+/// exactly as on the index path. The rest of the listing is the index
+/// path's: the scope's selection, the --files glob, --sort, the printer.
+fn list_scoped(
+    root: &Path,
+    cwd_rel: &Path,
+    args: &Args,
+    scope: &mut Scope,
+    prefixes: &[PathBuf],
+    timings: &mut Timings,
+    had_error: bool,
+) -> anyhow::Result<i32> {
+    // The sweep's directory reads contend in the kernel the way a
+    // search's opens and reads do, so without -j (which sized the pool
+    // already) the pool takes the search pool's width: on an M3 Pro the
+    // readdir walk of the kernel's drivers/ takes about 20 ms on the 5
+    // performance cores against 25 ms on all 11.
+    if args.threads.is_none() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(search::default_threads())
+            .build_global();
+    }
+    // Only explicit file operands: nothing to sweep.
+    let swept = if prefixes.is_empty() {
+        walk::ScopedListing {
+            files: Vec::new(),
+            entered: Vec::new(),
+        }
+    } else {
+        walk::sweep_scoped_listing(root, prefixes)?
+    };
+    timings.stage("scoped_sweep");
+    let found = prefixes_with_files(&swept.files, prefixes);
+    let empty_is_final = scope.filters.overrides().is_none();
+    scope.walk_unserved(args, cwd_rel, |op| {
+        prefixes.iter().zip(&found).any(|(p, &has)| has && p == op)
+            || (empty_is_final && swept.entered.iter().any(|p| p == op))
+    });
+    timings.stage("operands");
+    // Split by the sweep's hidden flag, as the index splits by
+    // FLAG_HIDDEN; under --hidden every file is plain.
+    use rayon::prelude::*;
+    let (mut hidden, mut plain): (Vec<PathBuf>, Vec<PathBuf>) =
+        swept.files.into_par_iter().partition_map(|m| {
+            if m.hidden && !args.hidden {
+                rayon::iter::Either::Left(m.path)
+            } else {
+                rayon::iter::Either::Right(m.path)
+            }
+        });
+    sort_swept_paths(&mut plain);
+    sort_swept_paths(&mut hidden);
+    let mut files = scope.select(plain, hidden);
+    // With --files the pattern slot is the glob.
+    retain_glob(&mut files, files_glob(args)?.as_ref(), cwd_rel);
+    apply_sort(&mut files, args, root, cwd_rel)?;
+    print_paths(&files, cwd_rel, args)?;
+    timings.stage("listing");
+    timings.finish();
+    Ok(exit_code(args, had_error, !files.is_empty()))
+}
+
+/// Sort paths a sweep yielded (relative, plain names joined by single
+/// separators, each path once) into `Path` order. For such paths the
+/// component-wise order is byte order with the separator ranked below
+/// every other byte, and no name holds a NUL. On Unix each path's bytes
+/// are sorted in place with the separator swapped for NUL: a plain byte
+/// comparison per pair instead of `Path::cmp`'s component parsing (1.6 ms
+/// against about 0.3 ms for a 6k-file listing).
+fn sort_swept_paths(paths: &mut Vec<PathBuf>) {
+    use rayon::prelude::*;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let swap = |mut b: Vec<u8>, from: u8, to: u8| {
+            for c in b.iter_mut().filter(|c| **c == from) {
+                *c = to;
+            }
+            b
+        };
+        let mut keys: Vec<Vec<u8>> = std::mem::take(paths)
+            .into_par_iter()
+            .map(|p| swap(p.into_os_string().into_vec(), b'/', 0))
+            .collect();
+        keys.par_sort_unstable();
+        *paths = keys
+            .into_par_iter()
+            .map(|k| PathBuf::from(std::ffi::OsString::from_vec(swap(k, 0, b'/'))))
+            .collect();
+    }
+    #[cfg(not(unix))]
+    paths.par_sort_unstable();
 }
 
 /// How the matcher will compare letters, for the index plan. -S always
@@ -2081,6 +2227,27 @@ pub fn run() -> anyhow::Result<i32> {
         }
     }
 
+    // A scoped listing (every directory operand below the root, spelled as
+    // plain names: no `..`, nothing absolute outside the tree) lists
+    // straight from a live sweep of its operands, without the index; see
+    // `list_scoped`. A root-wide listing never gets here with operands
+    // like these: its only operand is the root itself.
+    if args.files {
+        if let Some(prefixes) = scope.dir_prefixes() {
+            if prefixes.iter().all(|p| names_below_root(p)) {
+                return list_scoped(
+                    &root,
+                    &cwd_rel,
+                    &args,
+                    &mut scope,
+                    &prefixes,
+                    &mut timings,
+                    had_error,
+                );
+            }
+        }
+    }
+
     let mut idx = match Index::open_or_build(&root, args.max_filesize) {
         Ok(idx) => idx,
         // Another glep is building the index right now (parallel first
@@ -2294,5 +2461,103 @@ mod tests {
         );
         let abs = std::env::temp_dir();
         assert_eq!(root_relative(Path::new("a"), &abs), abs);
+    }
+
+    /// Paths with names that sort before the separator byte (`-`, `.`,
+    /// space, `!`), shared prefixes and, on Unix, non-UTF-8 bytes: the
+    /// swept-path sort gives `Path` order.
+    #[test]
+    fn swept_paths_sort_in_path_order() {
+        let mut paths: Vec<PathBuf> = [
+            "a/y.rs",
+            "a-b/x.rs",
+            "a.c/z.rs",
+            "a.rs",
+            "a",
+            "a b/c",
+            "a!/d",
+            "ab",
+            "a/b/c/d",
+            "a/b",
+            "a/b.c",
+            "a/b-c/e",
+            "a/b/c",
+            "z",
+            ".hidden/x",
+            ".a",
+            "-",
+            "a/.b",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            for raw in [&b"a/\xff/x"[..], b"a\xfe", b"\xc3\xa9/b", b"e/\x01"] {
+                paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(raw)));
+            }
+        }
+        let mut expected = paths.clone();
+        expected.sort();
+        for rotate in 0..paths.len() {
+            let mut v = paths.clone();
+            v.rotate_left(rotate);
+            v.reverse();
+            sort_swept_paths(&mut v);
+            assert_eq!(v, expected);
+        }
+    }
+
+    /// `--files '**'` filters nothing, which `files_glob` relies on to
+    /// skip it: the glob it builds (`**/**`) matches every path, dotted,
+    /// with a newline or non-UTF-8 bytes, at any depth, either case mode.
+    #[test]
+    fn match_all_glob_matches_every_path() {
+        let mut paths: Vec<PathBuf> = ["a", ".a", "a/b/c", "a\nb", "-x", ".git/x", "a b/.c d"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(b"\xff/\xfe.c")));
+        }
+        for icase in [false, true] {
+            let g = build_glob_icase("**", icase).unwrap();
+            for p in &paths {
+                assert!(g.is_match(p), "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefixes_with_files_compares_whole_names() {
+        let meta = |p: &str| walk::FileMeta {
+            path: PathBuf::from(p),
+            mtime_ns: 0,
+            size: 0,
+            hidden: false,
+        };
+        let metas = [meta("src/a.rs"), meta("srcx/b.rs"), meta("src2/c/d")];
+        let prefixes: Vec<PathBuf> = ["src", "srcx", "sr", "src/a.rs", "src2/c", "nope", "src"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            prefixes_with_files(&metas, &prefixes),
+            [true, true, false, true, true, false, true]
+        );
+        assert_eq!(prefixes_with_files(&[], &prefixes), [false; 7]);
+    }
+
+    #[test]
+    fn names_below_root_takes_plain_names_only() {
+        for p in ["src", "src/deep", ".github/workflows", "a b"] {
+            assert!(names_below_root(Path::new(p)), "{p}");
+        }
+        for p in ["", "..", "../x", "/abs", "./src"] {
+            assert!(!names_below_root(Path::new(p)), "{p}");
+        }
     }
 }

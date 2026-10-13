@@ -1452,3 +1452,61 @@ fn ttl_skips_the_sweep_for_scoped_queries_too() {
     );
     assert_eq!(swept(dir.path(), &["ttlneedle", "src"]), (true, 0));
 }
+
+/// A scoped --files listing reads the tree live and never touches the
+/// index: on an unindexed tree it builds nothing, on an indexed one the
+/// manifest stays byte for byte what it was, and a file created after the
+/// index is listed by the next scoped listing and found by the next
+/// search.
+#[test]
+fn scoped_listings_never_touch_the_index() {
+    let dir = corpus();
+    let d = dir.path();
+    for i in 0..40 {
+        let f = d.join(format!("src/gen/g{}/f{i:02}.rs", i % 4));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, "fn gen() {}\n").unwrap();
+    }
+    let list = |args: &[&str]| -> String {
+        let out = glep(d)
+            .args(["--files", "**"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(out).unwrap()
+    };
+    let mut expected: Vec<String> = (0..40)
+        .map(|i| p(&format!("src/gen/g{}/f{i:02}.rs", i % 4)))
+        .collect();
+    expected.sort();
+    expected.push(p("src/lib.rs"));
+    let expected: String = expected.iter().map(|l| format!("{l}\n")).collect();
+    assert_eq!(list(&["src"]), expected);
+    assert_eq!(
+        list(&["src", "notes.txt"]),
+        format!("{expected}notes.txt\n")
+    );
+    assert!(!d.join(".glep").exists(), "a scoped listing built an index");
+
+    glep(d).arg("index").assert().success();
+    let manifest = std::fs::read(d.join(".glep/manifest.bin")).unwrap();
+    assert_eq!(list(&["src"]), expected);
+    std::fs::write(d.join("src/late.rs"), "late_needle\n").unwrap();
+    let listed = list(&["src"]);
+    assert!(listed.contains(&p("src/late.rs\n")), "{listed}");
+    assert_eq!(listed.lines().count(), 42);
+    assert_eq!(
+        std::fs::read(d.join(".glep/manifest.bin")).unwrap(),
+        manifest,
+        "a scoped listing wrote the manifest"
+    );
+    assert!(!d.join(".glep/dirtree.bin").exists());
+    glep(d)
+        .arg("late_needle")
+        .assert()
+        .success()
+        .stdout(p("src/late.rs:1:late_needle\n"));
+}
