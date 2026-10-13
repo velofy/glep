@@ -11,8 +11,24 @@ mod walk;
 #[cfg(target_os = "macos")]
 mod walk_bulk;
 
+/// Stack for the thread that runs the CLI. Windows gives the main thread
+/// only 1 MiB, which the argument struct and the run path overflow in
+/// debug builds; 8 MiB matches the Linux and macOS main-thread default.
+const MAIN_STACK: usize = 8 * 1024 * 1024;
+
 fn main() {
-    match cli::run() {
+    let result = std::thread::Builder::new()
+        .name("glep-main".into())
+        .stack_size(MAIN_STACK)
+        .spawn(cli::run)
+        .expect("spawn the glep main thread")
+        .join();
+    let result = match result {
+        Ok(r) => r,
+        // A panic already printed its message; exit like an error.
+        Err(_) => std::process::exit(2),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         // A reader that went away (`glep ... | head -1`) ends the run
         // quietly with success, as in rg. Rust ignores SIGPIPE, so a
