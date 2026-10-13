@@ -55,15 +55,77 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Stable-enough path hash for sharding the freshness diff. Only ever
-/// used to pick a bucket; never persisted, so DefaultHasher's per-run
-/// seed is fine.
-fn hash_path(p: &Path) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.hash(&mut h);
-    h.finish() as usize
+/// A path keyed by its bytes for the freshness diff, hashed once: the
+/// shard pick and the shard map's lookup share that hash, so Path's
+/// component-wise Hash and Eq never run. Manifest and sweep paths both
+/// come from the sweep walkers (`strip_prefix` of the root off a joined
+/// path), so the same file is the same bytes on both sides. The hash is
+/// never persisted.
+#[derive(Clone, Copy)]
+struct PathKey<'a> {
+    hash: u64,
+    bytes: &'a [u8],
 }
+
+impl<'a> PathKey<'a> {
+    fn new(p: &'a Path) -> Self {
+        use std::hash::Hasher;
+        let bytes = p.as_os_str().as_encoded_bytes();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(bytes);
+        PathKey {
+            hash: h.finish(),
+            bytes,
+        }
+    }
+
+    /// Shard index from bits the map's probing leaves alone: it takes the
+    /// low bits for the slot and the top seven as the tag.
+    fn shard(&self, mask: usize) -> usize {
+        (self.hash >> 32) as usize & mask
+    }
+}
+
+impl std::hash::Hash for PathKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for PathKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.bytes == other.bytes
+    }
+}
+
+impl Eq for PathKey<'_> {}
+
+/// Hands a `PathKey`'s precomputed hash to the map untouched.
+#[derive(Default)]
+struct PrehashedHasher(u64);
+
+impl std::hash::Hasher for PrehashedHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only `write_u64` is ever called (see `PathKey`'s Hash).
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+type PathMap<'a> = std::collections::HashMap<
+    PathKey<'a>,
+    &'a manifest::FileEntry,
+    std::hash::BuildHasherDefault<PrehashedHasher>,
+>;
 
 fn new_generation() -> u64 {
     std::time::SystemTime::now()
@@ -337,18 +399,25 @@ impl Index {
         (plain, hidden)
     }
 
-    fn postings_for(&self, tri: u32, case: Case) -> Vec<u32> {
-        let tris = match case {
+    /// Every spelling `case` looks `tri` up as.
+    fn lookup_variants(tri: u32, case: Case) -> Vec<u32> {
+        match case {
             Case::Sensitive => vec![tri],
             Case::Ascii => trigram::case_variants(tri),
             Case::Unicode => trigram::fold_variants(tri),
-        };
+        }
+    }
+
+    fn segments(&self) -> impl Iterator<Item = &Postings> {
+        [self.main.as_ref(), self.delta.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+
+    fn postings_for(&self, tri: u32, case: Case) -> Vec<u32> {
         let mut ids = Vec::new();
-        for t in tris {
-            for seg in [self.main.as_ref(), self.delta.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+        for t in Self::lookup_variants(tri, case) {
+            for seg in self.segments() {
                 if let Some(v) = seg.lookup(t) {
                     ids.extend(v);
                 }
@@ -357,6 +426,46 @@ impl Index {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Total stored blob bytes of `tri`'s postings, every spelling `case`
+    /// looks it up as, main and delta, without decoding any of them: 0
+    /// when no indexed file holds the trigram.
+    fn postings_len(&self, tri: u32, case: Case) -> usize {
+        Self::lookup_variants(tri, case)
+            .into_iter()
+            .map(|t| self.segments().map(|seg| seg.blob_len(t)).sum::<usize>())
+            .sum()
+    }
+
+    /// Narrow `acc` (ascending, unique) to the ids `tri`'s postings hold,
+    /// under any spelling `case` looks it up as, main and delta. Each
+    /// stored blob is merged against `acc` as it decodes, so no list is
+    /// materialized and none decodes past `acc`'s last id. A blob that
+    /// fails to decode before then counts as empty, as `Postings::lookup`
+    /// treats it.
+    fn retain_postings(&self, acc: &mut Vec<u32>, tri: u32, case: Case) {
+        let mut hits = Vec::with_capacity(acc.len());
+        let mut sources = 0;
+        for t in Self::lookup_variants(tri, case) {
+            for seg in self.segments() {
+                let Some(blob) = seg.blob(t) else {
+                    continue;
+                };
+                sources += 1;
+                let before = hits.len();
+                if postings::intersect_blob(acc, blob, &mut hits).is_err() {
+                    hits.truncate(before);
+                    postings::report_corrupt();
+                }
+            }
+        }
+        if sources > 1 {
+            // Several spellings or segments: their hits interleave.
+            hits.sort_unstable();
+            hits.dedup();
+        }
+        *acc = hits;
     }
 
     fn is_live(&self, id: u32) -> bool {
@@ -423,17 +532,27 @@ impl Index {
             Plan::Groups(groups) => {
                 let mut union: Vec<u32> = Vec::new();
                 for group in groups {
-                    let mut iter = group.iter();
-                    let mut acc = match iter.next() {
-                        Some(&t) => self.postings_for(t, case),
-                        None => continue,
+                    // Rarest first, by stored blob size (nothing decoded):
+                    // the narrowest list starts the intersection, and a
+                    // group holding an absent trigram matches no indexed
+                    // file, so it is skipped before decoding anything.
+                    let mut by_size: Vec<(usize, u32)> = group
+                        .iter()
+                        .map(|&t| (self.postings_len(t, case), t))
+                        .collect();
+                    by_size.sort_unstable();
+                    let Some(&(smallest, rarest)) = by_size.first() else {
+                        continue;
                     };
-                    for &t in iter {
+                    if smallest == 0 {
+                        continue;
+                    }
+                    let mut acc = self.postings_for(rarest, case);
+                    for &(_, t) in &by_size[1..] {
                         if acc.is_empty() {
                             break;
                         }
-                        let next = self.postings_for(t, case);
-                        acc.retain(|id| next.binary_search(id).is_ok());
+                        self.retain_postings(&mut acc, t, case);
                     }
                     union.extend(acc);
                 }
@@ -568,21 +687,38 @@ impl Index {
         //      marking seen manifest entries atomically;
         //   2. dead = live entries never marked seen.
         // Unchanged files touch nothing but an atomic store; fresh and
-        // changed ids come out of phase 1 per shard.
+        // changed ids come out of phase 1 per shard. Every path is hashed
+        // exactly once, as bytes (see `PathKey`).
         let n_shards = rayon::current_num_threads().max(1).next_power_of_two();
         let shard_mask = n_shards - 1;
-        // Phase 0a: bucket live entries by path hash (serial, cheap push
-        // per entry) so phase 0b can give each shard to exactly one
-        // thread, no concurrent HashMap mutation anywhere.
-        let mut buckets: Vec<Vec<&manifest::FileEntry>> =
-            (0..n_shards).map(|_| Vec::new()).collect();
-        for e in self.manifest.live_entries().filter(|e| in_scope(&e.path)) {
-            buckets[hash_path(&e.path) & shard_mask].push(e);
-        }
-        // Phase 0b: build each shard's lookup map in parallel.
-        let shard_maps: Vec<std::collections::HashMap<&Path, &manifest::FileEntry>> = buckets
+        // Phase 0a: key every live in-scope entry, in parallel.
+        let keyed: Vec<(PathKey, &manifest::FileEntry)> = self
+            .manifest
+            .entries
+            .par_iter()
+            .filter(|e| e.flags & manifest::FLAG_DEAD == 0 && in_scope(&e.path))
+            .map(|e| (PathKey::new(&e.path), e))
+            .collect();
+        // Phase 0b: build each shard's lookup map in parallel, each from
+        // its own keys only, so no HashMap is ever shared or mutated
+        // concurrently.
+        // An even share plus headroom, so no shard map rehashes.
+        let per_shard = keyed.len() / n_shards;
+        let shard_maps: Vec<PathMap> = (0..n_shards)
             .into_par_iter()
-            .map(|bucket| bucket.into_iter().map(|e| (e.path.as_path(), e)).collect())
+            .map(|shard| {
+                let mut map = PathMap::with_capacity_and_hasher(
+                    per_shard + per_shard / 4 + 16,
+                    Default::default(),
+                );
+                map.extend(
+                    keyed
+                        .iter()
+                        .filter(|(k, _)| k.shard(shard_mask) == shard)
+                        .copied(),
+                );
+                map
+            })
             .collect();
         // seen flags for dead detection: 1 = present on disk unchanged or
         // changed-in-place (either way, not deleted)
@@ -609,8 +745,8 @@ impl Index {
                     let mut my_changed = Vec::new();
                     let mut my_flips = Vec::new();
                     for meta in metas {
-                        let h = hash_path(&meta.path) & shard_mask;
-                        match shard_maps[h].get(meta.path.as_path()) {
+                        let key = PathKey::new(&meta.path);
+                        match shard_maps[key.shard(shard_mask)].get(&key) {
                             Some(e) => {
                                 seen[e.id as usize].store(1, std::sync::atomic::Ordering::Relaxed);
                                 if e.mtime_ns != meta.mtime_ns || e.size != meta.size {
@@ -1339,5 +1475,172 @@ mod tests {
             idx.candidates(&plan, Case::Sensitive, true, false),
             vec![std::path::PathBuf::from(".newhidden.txt")]
         );
+    }
+
+    /// xorshift64*: deterministic randomness for the model tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) % n
+        }
+
+        fn text(&mut self, letters: &[u8], len: u64) -> Vec<u8> {
+            (0..len)
+                .map(|_| letters[self.below(letters.len() as u64) as usize])
+                .collect()
+        }
+    }
+
+    /// A group holding a trigram no file has narrows to nothing (it is
+    /// skipped before any list decodes); other alternatives still count.
+    #[test]
+    fn candidates_skip_a_group_with_an_absent_trigram() {
+        let dir = corpus();
+        let idx = Index::build(dir.path(), 1_048_576).unwrap();
+        let plan = crate::plan::build("hello|zqzqz", false, Case::Sensitive);
+        assert!(matches!(&plan, Plan::Groups(g) if g.len() == 2));
+        assert_eq!(
+            idx.candidates(&plan, Case::Sensitive, false, false),
+            vec![PathBuf::from("a.txt")]
+        );
+        // `zqz` is absent, though `wor` and `orl` sit in two files.
+        let plan = crate::plan::build("worlzqz", true, Case::Sensitive);
+        assert!(idx
+            .candidates(&plan, Case::Sensitive, false, false)
+            .is_empty());
+    }
+
+    /// Rarest-first, streaming candidate narrowing agrees with a naive
+    /// model (a file is a candidate when, for some group, it holds every
+    /// trigram under some spelling the case mode looks it up as), with
+    /// trigrams ranging from every file to none, postings split across
+    /// main and delta, in every case mode.
+    #[test]
+    fn candidates_match_a_naive_model() {
+        // Skewed letters: `a` is in every file, `K` and `k` in few.
+        const LETTERS: &[u8] = b"aaaaaaaaaabbbbbccdKk";
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let dir = tempfile::tempdir().unwrap();
+        let name = |i: usize| PathBuf::from(format!("f{i:03}.txt"));
+        for i in 0..400 {
+            let len = 100 + rng.below(200);
+            std::fs::write(dir.path().join(name(i)), rng.text(LETTERS, len)).unwrap();
+        }
+        let mut idx = Index::build(dir.path(), 1 << 20).unwrap();
+        // A changed file and a new one: their postings land in the delta,
+        // so lookups merge main and delta blobs.
+        for i in [7, 400] {
+            let len = 400 + rng.below(100); // never a built file's size
+            std::fs::write(dir.path().join(name(i)), rng.text(LETTERS, len)).unwrap();
+        }
+        idx.update(1 << 20, 0).unwrap();
+        assert!(idx.has_delta(), "two edits must not compact");
+        // Each file's trigrams, straight from its bytes.
+        let files: Vec<(PathBuf, std::collections::HashSet<u32>)> = (0..=400)
+            .map(|i| {
+                let text = std::fs::read(dir.path().join(name(i))).unwrap();
+                (name(i), text.windows(3).map(trigram::pack).collect())
+            })
+            .collect();
+        for _ in 0..80 {
+            let (la, lb) = (3 + rng.below(4), 3 + rng.below(4));
+            let a = String::from_utf8(rng.text(LETTERS, la)).unwrap();
+            let b = String::from_utf8(rng.text(LETTERS, lb)).unwrap();
+            for (pattern, fixed) in [(a.clone(), true), (format!("{a}|{b}"), false)] {
+                for case in [Case::Sensitive, Case::Ascii, Case::Unicode] {
+                    let plan = crate::plan::build(&pattern, fixed, case);
+                    let Plan::Groups(groups) = &plan else {
+                        panic!("{pattern}: a literal plan narrows");
+                    };
+                    let want: Vec<PathBuf> = files
+                        .iter()
+                        .filter(|(_, tris)| {
+                            groups.iter().any(|g| {
+                                g.iter().all(|&t| {
+                                    Index::lookup_variants(t, case)
+                                        .iter()
+                                        .any(|v| tris.contains(v))
+                                })
+                            })
+                        })
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    assert_eq!(
+                        idx.candidates(&plan, case, false, false),
+                        want,
+                        "{pattern:?} {case:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sharded freshness diff on a tree that fills every shard:
+    /// unchanged files keep their entries, changed and new files get new
+    /// ones, deleted files are tombstoned, and nothing else moves.
+    #[test]
+    fn update_diff_classifies_files_in_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = |i: usize| PathBuf::from(format!("d{}/f{i:04}.txt", i % 7));
+        for d in 0..7 {
+            std::fs::create_dir_all(dir.path().join(format!("d{d}"))).unwrap();
+        }
+        for i in 0..1200 {
+            std::fs::write(dir.path().join(name(i)), "ab".repeat(20 + i % 13)).unwrap();
+        }
+        let mut idx = Index::build(dir.path(), 1 << 20).unwrap();
+        let before: std::collections::HashMap<PathBuf, u32> = idx
+            .manifest
+            .live_entries()
+            .map(|e| (e.path.clone(), e.id))
+            .collect();
+        let changed: Vec<usize> = (0..1200).step_by(101).collect();
+        let deleted: Vec<usize> = (50..1200).step_by(97).collect();
+        for &i in &changed {
+            // A size no built file has, so coarse mtimes cannot hide it.
+            std::fs::write(dir.path().join(name(i)), "ab".repeat(60)).unwrap();
+        }
+        for &i in &deleted {
+            std::fs::remove_file(dir.path().join(name(i))).unwrap();
+        }
+        for i in 1200..1210 {
+            std::fs::write(dir.path().join(name(i)), "ab".repeat(5)).unwrap();
+        }
+        idx.update(1 << 20, 0).unwrap();
+        assert!(idx.has_delta(), "a few edits must not compact");
+        let mut want: Vec<PathBuf> = (0..1210)
+            .filter(|i| !deleted.contains(i))
+            .map(name)
+            .collect();
+        want.sort();
+        assert_eq!(idx.live_files(true), want);
+        assert_eq!(idx.manifest.live_entries().count(), want.len());
+        for e in idx.manifest.live_entries() {
+            let i: usize = e.path.file_stem().unwrap().to_str().unwrap()[1..]
+                .parse()
+                .unwrap();
+            if changed.contains(&i) || i >= 1200 {
+                assert!(e.id as usize >= before.len(), "{:?} re-added", e.path);
+            } else {
+                assert_eq!(before[&e.path], e.id, "{:?} kept its entry", e.path);
+            }
+        }
+    }
+
+    #[test]
+    fn path_keys_compare_bytes_and_share_one_hash() {
+        let owned = PathBuf::from("src/a.rs");
+        let (a, b) = (PathKey::new(Path::new("src/a.rs")), PathKey::new(&owned));
+        assert!(a == b);
+        assert_eq!(a.hash, b.hash);
+        assert_eq!(a.shard(15), b.shard(15));
+        assert!(PathKey::new(Path::new("src/b.rs")) != a);
+        // Bytes, not components: the sweep walkers never spell one file
+        // two ways, so the diff needs no component-wise equality.
+        assert!(PathKey::new(Path::new("src//a.rs")) != a);
     }
 }
