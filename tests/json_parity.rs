@@ -181,3 +181,76 @@ fn json_summary_matches_rg_structurally() {
         // file is opened (see the module doc comment above).
     }
 }
+
+/// Drop the wall-clock fields from one event so the rest can be compared
+/// exactly: `end` events carry per-file `stats.elapsed`.
+fn without_timing(line: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
+    if let Some(stats) = v["data"]["stats"].as_object_mut() {
+        stats.remove("elapsed");
+    }
+    v
+}
+
+/// Every begin/match/context/end event, per-file stats included, is
+/// identical to rg's (timings aside) over a corpus big enough for the
+/// worker pool, with context, CRLF and case-folding variants.
+#[test]
+fn json_events_match_rg_on_the_worker_pool() {
+    if !have_rg() {
+        eprintln!("json_parity: rg not installed, skipping");
+        return;
+    }
+    let dir = corpus();
+    for i in 0..48 {
+        let p = dir.path().join(format!("pool/d{}/f{i:02}.txt", i % 3));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let body = if i % 2 == 0 {
+            format!("before {i}\nhello pool {i}\nafter {i}\n")
+        } else {
+            format!("Hello crlf {i}\r\nmiddle\r\nhello again {i}\r\n")
+        };
+        std::fs::write(&p, body).unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["--json", "hello"],
+        &["--json", "-C", "1", "hello"],
+        &["--json", "-i", "HELLO"],
+        &["--json", "--crlf", "hello$"],
+        &["--json", "-m", "1", "hello"],
+        &["--json", "zz_totally_absent_zz"],
+    ];
+    for args in cases {
+        let g = Command::cargo_bin("glep")
+            .unwrap()
+            .current_dir(dir.path())
+            .args(*args)
+            .output()
+            .unwrap();
+        let r = std::process::Command::new("rg")
+            .current_dir(dir.path())
+            .args(["--sort", "path", "--no-require-git"])
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(g.status.code(), r.status.code(), "{args:?}");
+        let g = String::from_utf8(g.stdout).unwrap();
+        let r = String::from_utf8(r.stdout).unwrap();
+        let (g, r) = (lines(&g), lines(&r));
+        assert_eq!(g.len(), r.len(), "event count diverged for {args:?}");
+        // Everything but the closing summary, exactly.
+        for (gl, rl) in g[..g.len() - 1].iter().zip(&r[..r.len() - 1]) {
+            assert_eq!(without_timing(gl), without_timing(rl), "{args:?}");
+        }
+        let (gs, rs) = (
+            without_timing(g.last().unwrap()),
+            without_timing(r.last().unwrap()),
+        );
+        for key in ["matches", "matched_lines", "bytes_printed"] {
+            assert_eq!(
+                gs["data"]["stats"][key], rs["data"]["stats"][key],
+                "summary {key} diverged for {args:?}"
+            );
+        }
+    }
+}
