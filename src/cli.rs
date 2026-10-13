@@ -266,12 +266,13 @@ pub struct Args {
     /// with --null-data, like rg.
     #[arg(long, overrides_with = "null_data")]
     pub crlf: bool,
-    /// Use memory-mapped IO when searching files (rg --mmap). Already
-    /// glep's default: files are searched straight from the page cache.
+    /// Search using memory maps when possible (rg --mmap). Accepted for
+    /// compat: glep already searches each file as one slice, read whole
+    /// into a reused buffer, or mapped when over 1 MiB.
     #[arg(long)]
     pub mmap: bool,
-    /// Never use memory maps: read every file through the searcher's
-    /// buffer instead (rg --no-mmap)
+    /// Never search a file as one slice: stream every file through the
+    /// searcher's buffer instead (rg --no-mmap)
     #[arg(long, overrides_with = "mmap")]
     pub no_mmap: bool,
     /// Accepted for script compat; glep streams output either way

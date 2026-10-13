@@ -2531,3 +2531,59 @@ fn empty_matching_patterns_count_like_rg() {
         assert_eq!(g, shared(args, true), "stats diverged for {args:?}");
     }
 }
+
+/// Files appended to after the index was built are searched to their
+/// end, as rg searches them, whatever size the index recorded: also
+/// under --ttl, which trusts the index without a freshness sweep. One
+/// file grows past the searcher's 64 KiB first buffer and one past
+/// glep's 1 MiB read buffer, and the search runs on the worker pool.
+#[test]
+fn files_appended_after_indexing_are_searched_whole() {
+    if !have_rg() {
+        eprintln!("parity: rg not installed, skipping");
+        return;
+    }
+    use std::io::Write;
+    let dir = pool_corpus();
+    let d = dir.path();
+    // The first search builds the index.
+    assert_eq!(glep_out(d, &["hello"]).1, 0);
+    let append = |rel: &str, extra: &[u8]| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.join(rel))
+            .unwrap()
+            .write_all(extra)
+            .unwrap();
+    };
+    let filler = |lines: usize| -> Vec<u8> {
+        (0..lines)
+            .flat_map(|i| format!("filler line {i}\n").into_bytes())
+            .collect()
+    };
+    append("pool/d0/f00.txt", b"hello appended\n");
+    let mut past_64k = filler(6_000);
+    past_64k.extend_from_slice(b"hello past the first buffer\n");
+    append("pool/d1/f01.txt", &past_64k);
+    let mut past_1m = filler(80_000);
+    past_1m.extend_from_slice(b"hello past the read buffer\n");
+    append("pool/d2/f02.txt", &past_1m);
+    assert_eq!(search_path(d, &["--ttl", "60", "hello"]), "pool");
+    // Every pattern hits these files before the append too, so a stale
+    // index (--ttl) still lists them as candidates.
+    for args in [
+        &["hello"][..],
+        &["-c", "hello"],
+        &["--count-matches", "hello"],
+        &["-B", "1", "hello"],
+    ] {
+        let (r, rc) = rg_out(d, args);
+        for ttl in [true, false] {
+            let mut full: Vec<&str> = if ttl { vec!["--ttl", "60"] } else { vec![] };
+            full.extend_from_slice(args);
+            let (g, gc) = glep_out(d, &full);
+            assert_eq!(g, r, "stdout diverged for {full:?}");
+            assert_eq!(gc, rc, "exit code diverged for {full:?}");
+        }
+    }
+}
