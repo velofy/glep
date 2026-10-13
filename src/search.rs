@@ -757,7 +757,11 @@ impl<'a> Haystack<'a> {
     ) -> Haystack<'a> {
         if let Some(cmd) = &opts.pre {
             if opts.pre_glob.as_ref().is_none_or(|g| g.is_match(rel)) {
-                return Haystack::Pre(cmd, full.to_path_buf(), display.to_path_buf());
+                // The cwd-relative path, as rg passes it; the full path
+                // when glep runs from outside the tree (GLEP_INDEX_PATH),
+                // where the display path names nothing from the cwd.
+                let arg = if display.exists() { display } else { full };
+                return Haystack::Pre(cmd, full.to_path_buf(), arg.to_path_buf());
             }
         }
         if opts.search_zip && rel.extension().is_some_and(|x| x == "gz") {

@@ -1385,6 +1385,9 @@ fn unix_only_flags_match_rg() {
         &["--pre", "cat", "-c", "hello"],
         &["--pre", "cat", "--pre-glob", "*.md", "hello"],
         &["--pre-glob", "*.rs", "--pre", "cat", "-l", "hello"],
+        // The command gets the cwd-relative path as its argument, like
+        // rg: `echo` prints it back as the searched text.
+        &["--pre", "echo", "-e", "md", "-e", "rs"],
     ];
     if have_cmd("gzip") {
         use std::io::Write;
