@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(flags("u16be.txt"), manifest::FLAG_TRANSCODE);
         assert_eq!(flags("mid.txt"), manifest::FLAG_SKIP_BINARY);
         assert_eq!(flags("late.txt"), manifest::FLAG_NUL_LATE);
-        let plan = crate::plan::build("needle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("needle", true, Case::Sensitive);
         let c = idx.candidates(&plan, Case::Sensitive, false, false);
         for p in ["u16.txt", "u16be.txt", "late.txt"] {
             assert!(c.contains(&PathBuf::from(p)), "{p} must be a candidate");
@@ -890,13 +890,13 @@ mod tests {
         idx.update_scoped(1_048_576, 0, &scope, &mut timings)
             .unwrap();
         // The in-scope change is now indexed (fresh files join the delta).
-        let plan = crate::plan::build("v2x a", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("v2x a", true, Case::Sensitive);
         let c = idx.candidates(&plan, Case::Sensitive, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("src/a.txt")]);
         // Out-of-scope changes were never looked at: b.txt's new
         // contents are NOT a candidate (still stale, which is sound,
         // since a scoped query never returns it anyway).
-        let plan2 = crate::plan::build("b v2x", true, crate::plan::Case::Sensitive);
+        let plan2 = crate::plan::build("b v2x", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan2, Case::Sensitive, false, false)
             .is_empty());
@@ -959,12 +959,12 @@ mod tests {
         )
         .unwrap();
         // y.txt is indexed; the ignored y.ign was never swept.
-        let plan = crate::plan::build("new visible", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("new visible", true, Case::Sensitive);
         assert_eq!(
             idx.candidates(&plan, Case::Sensitive, false, false),
             vec![std::path::PathBuf::from("src/y.txt")]
         );
-        let plan2 = crate::plan::build("new ignored", true, crate::plan::Case::Sensitive);
+        let plan2 = crate::plan::build("new ignored", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan2, Case::Sensitive, false, false)
             .is_empty());
@@ -1002,7 +1002,7 @@ mod tests {
     fn candidates_narrow_by_trigram() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("hello", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("hello", true, Case::Sensitive);
         let c = idx.candidates(&plan, Case::Sensitive, false, false);
         assert_eq!(c, vec![std::path::PathBuf::from("a.txt")]);
     }
@@ -1011,7 +1011,7 @@ mod tests {
     fn candidates_case_insensitive_uses_variants() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("HELLO", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("HELLO", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan, Case::Sensitive, false, false)
             .is_empty());
@@ -1023,7 +1023,7 @@ mod tests {
     fn candidates_include_oversized_files_always() {
         let dir = corpus();
         let idx = Index::build(dir.path(), 50).unwrap(); // big.txt skip-flagged
-        let plan = crate::plan::build("hello", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("hello", true, Case::Sensitive);
         let c = idx.candidates(&plan, Case::Sensitive, false, false);
         assert!(c.contains(&std::path::PathBuf::from("a.txt")));
         assert!(c.contains(&std::path::PathBuf::from("big.txt")));
@@ -1052,12 +1052,12 @@ mod tests {
         // ensure mtime moves even on coarse filesystems
         std::fs::write(dir.path().join("a.txt"), "hello changedneedle").unwrap();
         idx.update(1_048_576, 0).unwrap();
-        let plan = crate::plan::build("freshneedle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("freshneedle", true, Case::Sensitive);
         assert_eq!(
             idx.candidates(&plan, Case::Sensitive, false, false),
             vec![std::path::PathBuf::from("new.txt")]
         );
-        let plan2 = crate::plan::build("changedneedle", true, crate::plan::Case::Sensitive);
+        let plan2 = crate::plan::build("changedneedle", true, Case::Sensitive);
         assert_eq!(
             idx.candidates(&plan2, Case::Sensitive, false, false),
             vec![std::path::PathBuf::from("a.txt")]
@@ -1070,7 +1070,7 @@ mod tests {
         let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::remove_file(dir.path().join("a.txt")).unwrap();
         idx.update(1_048_576, 0).unwrap();
-        let plan = crate::plan::build("hello", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("hello", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan, Case::Sensitive, false, false)
             .is_empty());
@@ -1082,7 +1082,7 @@ mod tests {
         let mut idx = Index::build(dir.path(), 1_048_576).unwrap();
         std::fs::write(dir.path().join("late.txt"), "ttlneedle").unwrap();
         idx.update(1_048_576, 3600).unwrap(); // within ttl: sweep skipped
-        let plan = crate::plan::build("ttlneedle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("ttlneedle", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan, Case::Sensitive, false, false)
             .is_empty());
@@ -1102,7 +1102,7 @@ mod tests {
             idx.update(1_048_576, 0).unwrap();
         }
         let idx = Index::open_or_build(dir.path(), 1_048_576).unwrap();
-        let plan = crate::plan::build("persistneedle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("persistneedle", true, Case::Sensitive);
         assert_eq!(
             idx.candidates(&plan, Case::Sensitive, false, false).len(),
             1
@@ -1125,7 +1125,7 @@ mod tests {
             idx.manifest.generation, gen_before,
             "compaction rebuilds with a fresh generation"
         );
-        let plan = crate::plan::build("uniqtoken1999", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("uniqtoken1999", true, Case::Sensitive);
         assert_eq!(
             idx.candidates(&plan, Case::Sensitive, false, false),
             vec![std::path::PathBuf::from("bulk.txt")]
@@ -1210,7 +1210,7 @@ mod tests {
         );
         assert_eq!(by_path("a.txt").flags & manifest::FLAG_HIDDEN, 0);
 
-        let plan = crate::plan::build("hiddenneedle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("hiddenneedle", true, Case::Sensitive);
         assert!(
             idx.candidates(&plan, Case::Sensitive, false, false)
                 .is_empty(),
@@ -1240,7 +1240,7 @@ mod tests {
         std::fs::write(dir.path().join(".newhidden.txt"), "healneedle appears").unwrap();
         idx.update(1_048_576, 0).unwrap();
 
-        let plan = crate::plan::build("healneedle", true, crate::plan::Case::Sensitive);
+        let plan = crate::plan::build("healneedle", true, Case::Sensitive);
         assert!(idx
             .candidates(&plan, Case::Sensitive, false, false)
             .is_empty());
