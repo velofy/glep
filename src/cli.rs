@@ -763,15 +763,13 @@ fn report_missing_paths(paths: &[PathBuf], cwd: &Path, files_mode: bool) -> bool
             missing = true;
             if files_mode {
                 messages::error(format!(
-                    "{}: IO error for operation on {}: No such file or directory (os error 2)",
+                    "{}: IO error for operation on {}: {}",
                     p.display(),
-                    p.display()
+                    p.display(),
+                    crate::messages::not_found()
                 ));
             } else {
-                messages::error(format!(
-                    "{}: No such file or directory (os error 2)",
-                    p.display()
-                ));
+                messages::error(format!("{}: {}", p.display(), crate::messages::not_found()));
             }
         }
     }

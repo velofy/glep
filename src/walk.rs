@@ -557,8 +557,9 @@ fn sweep_walker_scoped_unsorted(
 ) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let scope: std::sync::Arc<Vec<PathBuf>> = std::sync::Arc::new(prefixes.to_vec());
@@ -615,8 +616,9 @@ fn sweep_walker(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
 fn sweep_walker_unsorted(root: &Path) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let walker = add_rgignore(&mut ignore::WalkBuilder::new(root))
@@ -681,8 +683,9 @@ pub fn sweep_unfiltered(
     }
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let collected: Mutex<Vec<FileMeta>> = Mutex::new(Vec::new());
     let walker = ignore::WalkBuilder::new(root)
@@ -1038,10 +1041,7 @@ mod tests {
         let err = sweep_unfiltered(&missing, false, false).unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!(
-                "{}: No such file or directory (os error 2)",
-                missing.display()
-            )
+            format!("{}: {}", missing.display(), crate::messages::not_found())
         );
     }
 

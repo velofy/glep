@@ -1243,7 +1243,10 @@ mod tests {
         };
         let (id, hidden) = env(&idx);
         assert!(!hidden, "whitelisted at build time");
-        std::fs::write(dir.path().join(".gitignore"), "*.log\n").unwrap();
+        // A different size from "!.env\n": the sweep detects changes by
+        // (mtime, size), and a same-size rewrite inside one filesystem
+        // clock tick would look unchanged (see the racy-mtime issue).
+        std::fs::write(dir.path().join(".gitignore"), "*.log\n*.tmp\n").unwrap();
         idx.update(1_048_576, 0).unwrap();
         assert!(idx.has_delta(), "one edited file must not compact");
         assert_eq!(env(&idx), (id, true), "rule removed: hidden, same entry");

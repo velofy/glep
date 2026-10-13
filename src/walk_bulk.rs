@@ -1291,8 +1291,9 @@ fn sweep_bulk_filtered(
 ) -> anyhow::Result<(Vec<FileMeta>, Vec<PathBuf>)> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let seed_matchers = build_ancestor_stack(root)?;
     let dot = build_ancestor_dot_ignores(root);
@@ -1424,8 +1425,9 @@ pub fn sweep_bulk_listing<'a>(
 ) -> anyhow::Result<ListingOutcome<'a>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let stack = build_ancestor_stack(root)?;
     let num_slots = rayon::current_num_threads().max(1);
@@ -1815,8 +1817,9 @@ struct UnfilteredCtx {
 pub fn sweep_bulk_unfiltered(root: &Path, include_hidden: bool) -> anyhow::Result<Vec<FileMeta>> {
     anyhow::ensure!(
         root.is_dir(),
-        "{}: No such file or directory (os error 2)",
-        root.display()
+        "{}: {}",
+        root.display(),
+        crate::messages::not_found()
     );
     let num_slots = rayon::current_num_threads().max(1);
     let ctx = UnfilteredCtx {
