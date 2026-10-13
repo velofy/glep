@@ -284,7 +284,7 @@ fn unserved_operands_list_the_same_through_the_cache() {
 /// root-wide listing takes it. A listing scoped to a path operand or to a
 /// subdirectory cwd goes through the index's scoped sweep, which walks
 /// just that subtree (on a kernel-scale tree `--files` in a small
-/// subdirectory took 75 ms through the cache and takes 14 ms this way).
+/// subdirectory took 64 ms through the cache and takes 14 ms this way).
 /// Either way the answer is the authoritative one.
 #[test]
 fn only_root_wide_listings_use_the_cache() {

@@ -1452,7 +1452,7 @@ fn report_nothing_searched() {
 /// listing (a path operand below the root, or the cwd scope of a
 /// subdirectory run) is cheaper through the index's scoped sweep, which
 /// walks only the operands: on a kernel-scale tree `--files` in `rust/`
-/// takes about 9 ms that way against 75 ms through the cache.
+/// takes about 14 ms that way against 64 ms through the cache.
 #[cfg(target_os = "macos")]
 fn listing_cache_eligible(args: &Args) -> bool {
     sort_is_path_order(args) && args.paths.iter().all(|p| p.as_os_str().is_empty())
