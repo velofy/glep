@@ -39,9 +39,13 @@ pub struct Args {
     #[arg(short = 'c', long = "count", overrides_with_all = ["files_with_matches", "files_without_match", "json", "count_matches"])]
     pub count: bool,
     /// Filter candidate files by glob (repeatable; gitignore-style `!`
-    /// negation, last match wins). --iglob is an alias for ag compat.
-    #[arg(short = 'g', long = "glob", visible_alias = "iglob")]
+    /// negation, last match wins).
+    #[arg(short = 'g', long = "glob")]
     pub globs: Vec<String>,
+    /// Like -g/--glob but matched case-insensitively (rg --iglob). As in
+    /// rg, these rules come after every -g rule, so they win ties.
+    #[arg(long = "iglob", value_name = "GLOB")]
+    pub iglobs: Vec<String>,
     /// Filter candidate files by type from the ignore crate's defaults (repeatable)
     #[arg(short = 't', long = "type")]
     pub types: Vec<String>,
@@ -740,53 +744,79 @@ fn wsl_prefix() -> Option<String> {
 /// are pure functions of the root-relative path, so they apply
 /// identically to the index, the live-scan escape hatches, and the
 /// listing cache.
-fn apply_filters(files: &mut Vec<PathBuf>, args: &Args, root: &Path) -> anyhow::Result<()> {
-    if !args.paths.is_empty() {
-        files.retain(|f| args.paths.iter().any(|p| f.starts_with(p)));
+fn apply_filters(
+    files: &mut Vec<PathBuf>,
+    args: &Args,
+    root: &Path,
+    cwd_rel: &Path,
+) -> anyhow::Result<()> {
+    // Path operands, with --max-depth counted from each operand (a file
+    // operand itself is depth 0; with no operand the root is the operand).
+    // rg walks its operands one after another, so with several operands
+    // the results group by operand in command-line order (path order
+    // within each), and a file under two operands is searched and printed
+    // twice. `files` arrives in path order.
+    let within = |f: &Path, base: usize| {
+        args.max_depth
+            .is_none_or(|d| f.components().count().saturating_sub(base) <= d)
+    };
+    match args.paths.as_slice() {
+        [] => files.retain(|f| within(f, 0)),
+        [p] => {
+            let base = p.components().count();
+            files.retain(|f| f.starts_with(p) && within(f, base));
+        }
+        operands => {
+            let mut grouped = Vec::with_capacity(files.len());
+            for p in operands {
+                let base = p.components().count();
+                grouped.extend(
+                    files
+                        .iter()
+                        .filter(|f| f.starts_with(p) && within(f, base))
+                        .cloned(),
+                );
+            }
+            *files = grouped;
+        }
     }
-    if !args.globs.is_empty() {
+    if !args.globs.is_empty() || !args.iglobs.is_empty() {
         // Gitignore-style overrides (rg's -g semantics): positives
         // whitelist, `!` negates, last matching rule wins; with only
-        // negations, unmatched files pass.
+        // negations, unmatched files pass. Exactly rg's order: every -g
+        // rule (case-insensitive under --glob-case-insensitive), then
+        // every --iglob rule, always case-insensitive.
         let mut ob = ignore::overrides::OverrideBuilder::new("");
         ob.case_insensitive(args.glob_case_insensitive)?;
         for g in &args.globs {
+            ob.add(g)?;
+        }
+        ob.case_insensitive(true)?;
+        for g in &args.iglobs {
             ob.add(g)?;
         }
         let overrides = ob.build()?;
         files.retain(|f| !overrides.matched(f, false).is_ignore());
     }
     if !args.ignore_file.is_empty() {
-        // Build one Gitignore per extra rules file, anchored at the
-        // file's parent dir so its patterns resolve like a .gitignore
-        // sitting there (rg semantics).
-        let mut gbs = Vec::new();
+        // Each extra rules file matches relative to the directory glep
+        // runs in, as rg's --ignore-file does (the ignore crate anchors
+        // add_ignore at the CWD), wherever the file itself lives.
+        let mut gis = Vec::new();
         for p in &args.ignore_file {
-            let parent = p.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-            let mut b = ignore::gitignore::GitignoreBuilder::new(&parent);
+            let mut b = ignore::gitignore::GitignoreBuilder::new(root.join(cwd_rel));
             b.case_insensitive(args.ignore_file_case_insensitive)?;
             if let Some(e) = b.add(p) {
                 anyhow::bail!("{}: {e}", p.display());
             }
-            // Canonicalize for the strip below (macOS /var -> /private/var
-            // etc.); matched_path_or_any_parents panics on paths outside
-            // the gitignore root, so only call it when the strip works.
-            let parent = if parent.as_os_str().is_empty() {
-                std::env::current_dir()?
-            } else {
-                parent
-            };
-            let parent = std::fs::canonicalize(&parent).unwrap_or(parent);
-            gbs.push((parent, b.build()?));
+            gis.push(b.build()?);
         }
-        // `root` is canonical (discover_index_root), so joining keeps the
-        // comparison canonical without a syscall per file.
         files.retain(|f| {
-            let abs = root.join(f);
-            !gbs.iter().any(|(base, g)| {
-                abs.strip_prefix(base)
-                    .is_ok_and(|rel| g.matched_path_or_any_parents(rel, false).is_ignore())
-            })
+            // The cwd-relative form, with `..` for files reached through
+            // an operand above the cwd, like the paths rg's walk yields.
+            let rel = search::display_rel(f, cwd_rel);
+            !gis.iter()
+                .any(|g| g.matched_path_or_any_parents(&rel, false).is_ignore())
         });
     }
     if !args.types.is_empty()
@@ -815,21 +845,6 @@ fn apply_filters(files: &mut Vec<PathBuf>, args: &Args, root: &Path) -> anyhow::
             // -t present: require whitelist; -T only: keep unless
             // explicitly ignored (same rule as globs' overrides).
             !m.is_ignore() && (args.types.is_empty() || m.is_whitelist())
-        });
-    }
-    if let Some(maxd) = args.max_depth {
-        // Depth is operand-relative: a file's depth is its component count
-        // minus the containing operand's. With no operands the implicit
-        // root is the operand, so depth is the whole component count.
-        files.retain(|f| {
-            let depth = f.components().count();
-            if args.paths.is_empty() {
-                depth <= maxd
-            } else {
-                args.paths.iter().any(|p| {
-                    f.starts_with(p) && depth.saturating_sub(p.components().count()) <= maxd
-                })
-            }
         });
     }
     Ok(())
@@ -934,7 +949,9 @@ fn apply_sort(
         "none" => {}
         "path" => {
             if reverse {
-                files.reverse();
+                // rg collects every result and sorts it descending, across
+                // operands (stable, so duplicates stay adjacent).
+                files.sort_by(|a, b| b.cmp(a));
             }
         }
         "modified" | "accessed" | "created" => {
@@ -1148,7 +1165,7 @@ fn run_live_files(
             let glob = build_glob_icase(g, args.glob_case_insensitive)?;
             files.retain(|f| glob.is_match(f));
         }
-        apply_filters(&mut files, args, root)?;
+        apply_filters(&mut files, args, root, cwd_rel)?;
         apply_sort(&mut files, args, root, cwd_rel)?;
         print_paths(&files, cwd_rel, args)?;
         timings.finish();
@@ -1156,7 +1173,7 @@ fn run_live_files(
     }
 
     let (pattern, effective_fixed) = resolve_pattern(args);
-    apply_filters(&mut files, args, root)?;
+    apply_filters(&mut files, args, root, cwd_rel)?;
     apply_sort(&mut files, args, root, cwd_rel)?;
     timings.stage("candidates");
     let mut opts = search_opts(args, root, cwd_rel);
@@ -1541,6 +1558,18 @@ pub fn run() -> anyhow::Result<i32> {
     // ones, matching the reference's report-and-continue contract).
     if had_error {
         args.paths.retain(|p| cwd.join(p).exists());
+        if args.paths.is_empty() && !subcommand {
+            // Every operand was missing: rg searches nothing at all (not
+            // the cwd), still prints the --json summary or --stats block,
+            // and exits 2.
+            if !args.files {
+                let (pattern, fixed) = resolve_pattern(&args);
+                let mut opts = search_opts(&args, &root, &cwd_rel);
+                opts.fixed = fixed;
+                search::run(&pattern, &root, &[], None, &opts, &mut search::StdoutOut)?;
+            }
+            return Ok(2);
+        }
     }
     normalize_path_filters(&mut args.paths, &root, &cwd_rel);
     // No explicit paths: the implicit scope is the cwd subtree (rg's
@@ -1654,9 +1683,10 @@ pub fn run() -> anyhow::Result<i32> {
             }
         };
         if let Some(mut files) = listing_via_cache(&root, &root.join(".glep"), keep, &mut timings) {
-            apply_filters(&mut files, &args, &root)?;
+            // Path order first: apply_filters groups by operand from it.
             use rayon::prelude::*;
             files.par_sort();
+            apply_filters(&mut files, &args, &root, &cwd_rel)?;
             apply_sort(&mut files, &args, &root, &cwd_rel)?;
             print_paths(&files, &cwd_rel, &args)?;
             timings.stage("listing_cache");
@@ -1695,7 +1725,7 @@ pub fn run() -> anyhow::Result<i32> {
             let glob = build_glob_icase(g, args.glob_case_insensitive)?;
             files.retain(|f| glob.is_match(f));
         }
-        apply_filters(&mut files, &args, &root)?;
+        apply_filters(&mut files, &args, &root, &cwd_rel)?;
         apply_sort(&mut files, &args, &root, &cwd_rel)?;
         print_paths(&files, &cwd_rel, &args)?;
         timings.finish();
@@ -1767,7 +1797,7 @@ pub fn run() -> anyhow::Result<i32> {
     files.extend(extra.iter().cloned());
     files.sort();
     files.dedup();
-    apply_filters(&mut files, &args, &root)?;
+    apply_filters(&mut files, &args, &root, &cwd_rel)?;
     apply_sort(&mut files, &args, &root, &cwd_rel)?;
     timings.stage("candidates");
 
@@ -1780,7 +1810,7 @@ pub fn run() -> anyhow::Result<i32> {
         u.extend(extra.iter().cloned());
         u.sort();
         u.dedup();
-        apply_filters(&mut u, &args, &root)?;
+        apply_filters(&mut u, &args, &root, &cwd_rel)?;
         apply_sort(&mut u, &args, &root, &cwd_rel)?;
         Some(search::Universe {
             files: u,
@@ -1805,7 +1835,7 @@ pub fn run() -> anyhow::Result<i32> {
     if files.is_empty() && args.paths.is_empty() {
         let mut pool = idx.live_files(args.hidden);
         pool.extend(extra.iter().cloned());
-        apply_filters(&mut pool, &args, &root)?;
+        apply_filters(&mut pool, &args, &root, &cwd_rel)?;
         if pool.is_empty() {
             nothing_searched = true;
             eprintln!(

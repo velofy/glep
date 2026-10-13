@@ -1469,6 +1469,16 @@ fn run_impl<M: Matcher + Sync>(
         None => None,
     };
 
+    if std::env::var_os("GLEP_TIMING").is_some() {
+        // Which search path ran: tests use it to prove the worker pool is
+        // exercised.
+        let path = if files.len() <= SMALL_WORKLOAD {
+            "small"
+        } else {
+            "pool"
+        };
+        eprintln!("glep timing: search path {path} ({} files)", files.len());
+    }
     let mut printer = if files.len() <= SMALL_WORKLOAD {
         // Small workloads: stay on this thread, one reusable searcher,
         // zero synchronization. This is the agent-small-repo fast path.
