@@ -24,7 +24,7 @@ pip install glep          # binary wheel, no Rust toolchain needed
 cargo install glep
 ```
 
-`pipx install glep` and `uv tool install glep` also work. crates.io currently has 0.2.3; PyPI has 0.3.0. See [Installation](https://velofy.co/glep/installation/) for platforms and other routes.
+`pipx install glep` and `uv tool install glep` also work. From 0.4.0 on, PyPI and crates.io carry the same versions; 0.3.0 and 0.3.1 were published to PyPI only, so crates.io goes from 0.2.3 to 0.4.0. See [Installation](https://velofy.co/glep/installation/) for platforms and other routes.
 
 ## Example
 
@@ -105,7 +105,7 @@ Stick with rg / fd for:
 
 ## Numbers
 
-Linux kernel 6.12 source tree (a tarball extract, not a git checkout): 86,604 files, 86,218 of them searched, 1.6 GB. Apple M3 Pro, macOS, glep 0.3.1 (the code on this branch), rg 15.0 and fd 10.4 at their default parallelism, hyperfine means of 5 to 10 runs after warmup, warm filesystem cache, with other work running on the machine. glep's numbers did not move between sessions. rg's full scan did, from 1.3 s on its best run to 3.5 s under load, so the rg column shows the observed spread and every ratio is a lower bound, rounded down: indexed rows are compared against rg's fastest full scan (1.3 s), full-scan rows against the row's own fastest rg run.
+Linux kernel 6.12 source tree (a tarball extract, not a git checkout): 86,604 files, 86,218 of them searched, 1.6 GB. Apple M3 Pro, macOS, glep 0.3.1 (the release before the 0.4.0 performance rewrite), rg 15.0 and fd 10.4 at their default parallelism, hyperfine means of 5 to 10 runs after warmup, warm filesystem cache, with other work running on the machine. glep's numbers did not move between sessions. rg's full scan did, from 1.3 s on its best run to 3.5 s under load, so the rg column shows the observed spread and every ratio is a lower bound, rounded down: indexed rows are compared against rg's fastest full scan (1.3 s), full-scan rows against the row's own fastest rg run.
 
 | Scenario | glep | glep --ttl 60 | ripgrep | glep vs rg (lower bound) |
 |---|---|---|---|---|
@@ -116,9 +116,9 @@ Linux kernel 6.12 source tree (a tarball extract, not a git checkout): 86,604 fi
 | Single char `q` (no trigram, full scan) | 3.36 s | 3.13 s | 2.8 to 3.3 s | 0.8x / 0.8x |
 | List all .c files (`--files`, 34,657 files) | 195 ms | 45 ms | rg --files 71 ms, fd 74 ms | 0.3x / 1.5x |
 
-Index build (one-time): 28 s. Index size: 154 MB, about 10% of the corpus. Default glep pays the self-healing freshness sweep on each query: on macOS one bulk attribute call per directory, elsewhere a stat per file. `--ttl` skips the sweep inside a read burst, which is the 20 to 81 ms column. Patterns shorter than three bytes, or otherwise trigram-free like `.*`, cannot be narrowed by any trigram index, so glep falls back to a full parallel scan and runs at ripgrep speed (the `q` row). On macOS such a query over the whole tree, without `--ttl`, skips the index and its freshness sweep and searches the file set the dir-mtime listing cache lists, once a root-wide `--files` listing has built that cache. Listings read the manifest after the sweep, so `--files` only beats `rg --files` and `fd` inside a `--ttl` window. On a small 86-file Python repository both tools answer in single-digit milliseconds (glep 4.5 ms, rg 7.0 ms; `--files` 3.4 ms against `rg --files` 4.9 ms and `fd` 7.5 ms), so the index pays off at scale, not on small trees.
+Index build (one-time): 28 s. Index size: 154 MB, about 10% of the corpus. Default glep pays the self-healing freshness sweep on each query: on macOS one bulk attribute call per directory, elsewhere a stat per file. `--ttl` skips the sweep inside a read burst, which is the 20 to 81 ms column. Patterns shorter than three bytes, or otherwise trigram-free like `.*`, cannot be narrowed by any trigram index, so glep falls back to a full parallel scan and runs at ripgrep speed (the `q` row). In 0.3.1 listings read the manifest after the sweep, so `--files` only beats `rg --files` and `fd` inside a `--ttl` window. On a small 86-file Python repository both tools answer in single-digit milliseconds (glep 4.5 ms, rg 7.0 ms; `--files` 3.4 ms against `rg --files` 4.9 ms and `fd` 7.5 ms), so the index pays off at scale, not on small trees.
 
-A perf branch not yet on main (worker-pool search with one reusable searcher per thread, zero-copy mmap verification, parallel freshness diff, dir-mtime listing cache) was measured in the same sessions on the same corpus: rare pattern 97 ms (24 ms with `--ttl`), common pattern 152 ms (76 ms), `static` 1.50 s (1.28 s), `--files` 61 ms with or without `--ttl`, ahead of `rg --files` (71 ms) and `fd` (74 ms). This table will be updated when it lands. Details: [Benchmarks](https://velofy.co/glep/benchmarks/).
+0.4.0 ships the performance rewrite: worker-pool search with one reusable searcher per thread, a parallel freshness diff and, on macOS, a dir-mtime listing cache. Measured as a branch in the same sessions on the same corpus, before it merged (it then memory-mapped every file it searched; 0.4.0 reads files up to 1 MiB into a reused buffer instead): rare pattern 97 ms (24 ms with `--ttl`), common pattern 152 ms (76 ms), `static` 1.50 s (1.28 s), `--files` 61 ms with or without `--ttl`, ahead of `rg --files` (71 ms) and `fd` (74 ms). Later 0.4.0 changes were measured in sessions of their own, so they are not directly comparable with the table: on macOS a root-wide `--files` listing answered from the listing cache took 31.7 ms against rg's 72.1 ms, and a query no trigram can narrow, over the whole tree without `--ttl`, skips the index and its freshness sweep and searches the file set that cache lists. Details: [Benchmarks](https://velofy.co/glep/benchmarks/) and the [CHANGELOG](https://github.com/velofy/glep/blob/main/CHANGELOG.md).
 
 ## Documentation
 
