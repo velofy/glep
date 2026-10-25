@@ -1,11 +1,11 @@
 [package]
 name = "glep"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Indexed grep + glob for AI agents"
 license = "MIT"
 authors = ["anishfyi"]
-exclude = ["site/", "docs/", "assets/", ".github/", "claude/", "bench/", "pyproject.toml"]
+exclude = ["site/", "docs/", "assets/", ".github/", "claude/", "cursor/", "bench/", "pyproject.toml"]
 repository = "https://github.com/velofy/glep"
 homepage = "https://velofy.co/glep/"
 documentation = "https://velofy.co/glep/"
