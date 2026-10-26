@@ -101,7 +101,7 @@ def build_grep_cmd(ti):
         return None
     output_mode = ti.get("output_mode")
     # The suggested command always prints line numbers: -N exists only
-    # from glep 0.4.0 on, and an older glep rejects it, so the built-in
+    # from glep 2.0.0 on, and an older glep rejects it, so the built-in
     # tool honors -n:false in content mode instead.
     if ti.get("-n") is False and output_mode in (None, "content"):
         return None

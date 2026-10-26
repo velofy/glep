@@ -2,11 +2,13 @@
 
 All notable changes to glep. Dates are the release dates of the tagged commits. A condensed version with install notes is at https://velofy.co/glep/changelog/.
 
-PyPI has every version. crates.io has 0.1.1 to 0.2.3 and then 0.4.0: 0.1.0, 0.3.0 and 0.3.1 were published to PyPI only.
+PyPI has every version. crates.io has 0.1.1 to 0.2.3 and then 2.0.0: 0.1.0, 0.3.0 and 0.3.1 were published to PyPI only.
 
-## 0.4.0 (2026-10-26)
+## 2.0.0 (2026-10-26)
 
 ripgrep parity and a parallel search pipeline: most of rg's flags with rg's semantics, checked byte for byte against rg on both the single-thread and the worker-pool search paths, and a first crates.io release since 0.2.3.
+
+2.0.0 follows 0.3.1 directly; there was no 0.4.0 release.
 
 Upgrading from 0.3.1:
 

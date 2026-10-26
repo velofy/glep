@@ -1,6 +1,6 @@
 [package]
 name = "glep"
-version = "0.4.0"
+version = "2.0.0"
 edition = "2021"
 description = "Indexed grep + glob for AI agents"
 license = "MIT"
