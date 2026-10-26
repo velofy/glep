@@ -31,7 +31,9 @@ pip install glep          # binary wheel, no Rust toolchain needed
 cargo install glep
 ```
 
-`pipx install glep` and `uv tool install glep` also work. From 2.0.0 on, PyPI and crates.io carry the same versions; 0.3.0 and 0.3.1 were published to PyPI only, so crates.io goes from 0.2.3 to 2.0.0. See [Installation](https://velofy.co/glep/installation/) for platforms and other routes.
+`pipx install glep` and `uv tool install glep` also work. Prebuilt binaries for macOS (Apple silicon and Intel), Linux (x86_64 and aarch64, plus a static musl build) and Windows are attached to each [GitHub release](https://github.com/velofy/glep/releases/latest) with a `SHA256SUMS` file: unpack one and put `glep` on your PATH.
+
+From 2.0.0 on, PyPI and crates.io carry the same versions; 0.3.0 and 0.3.1 were published to PyPI only, so crates.io goes from 0.2.3 to 2.0.0. See [Installation](https://velofy.co/glep/installation/) for platforms and other routes.
 
 ## Example
 
