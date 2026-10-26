@@ -66,8 +66,9 @@ def main():
         if not pat:
             allow()
         output_mode = ti.get("output_mode")
-        # glep always prints line numbers and has no flag to suppress
-        # them; only the built-in tool can honor -n:false in content mode.
+        # The suggested command always prints line numbers: -N exists
+        # only from glep 2.0.0 on, and an older glep rejects it, so the
+        # built-in tool honors -n:false in content mode instead.
         if ti.get("-n") is False and output_mode in (None, "content"):
             allow()
         cmd = ["glep"]

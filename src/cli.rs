@@ -98,14 +98,16 @@ pub struct Args {
     #[arg(long)]
     pub require_git: bool,
     /// Additional ignore rules file applied to results (repeatable,
-    /// rg --ignore-file). Rules resolve relative to the file's dir.
+    /// rg --ignore-file). Rules match paths relative to the current
+    /// directory, as in rg, wherever the file itself lives.
     #[arg(long, value_name = "PATH")]
     pub ignore_file: Vec<std::path::PathBuf>,
     /// Unrestricted search: -u = --no-ignore, -uu = --no-ignore + --hidden,
     /// -uuu = --no-ignore + --hidden + --binary (rg's ladder).
     #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count)]
     pub unrestricted: u8,
-    /// Color output: never (default), always, auto (when stdout is a tty).
+    /// Color output: auto (the default: color when stdout is a tty, none
+    /// when it is a pipe or file), always, ansi, or never, as in rg.
     /// --colors sets individual specs like the reference's --colors flag.
     #[arg(long, value_name = "WHEN")]
     pub color: Option<String>,

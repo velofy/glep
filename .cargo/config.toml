@@ -1,0 +1,10 @@
+# Build PCRE2 from the bundled source and link it statically. Without
+# this, pcre2-sys links a system libpcre2-8 whenever pkg-config finds
+# one, and a binary built where Homebrew's pcre2 is installed (the
+# macos-14 GitHub runners that build the release wheels) then needs
+# /opt/homebrew/opt/pcre2/lib/libpcre2-8.0.dylib on every machine it
+# runs on. Set in this file rather than in the workflow because
+# maturin-action does not pass PCRE2_SYS_STATIC into its Linux
+# containers. An explicit PCRE2_SYS_STATIC in the environment wins.
+[env]
+PCRE2_SYS_STATIC = "1"
