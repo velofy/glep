@@ -14,7 +14,7 @@
 
 Documentation: **https://velofy.co/glep/**
 
-ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced in CI by a differential harness of about 400 rg-vs-glep cases that runs on both the single-thread and the worker-pool search paths. No daemon.
+ripgrep pays the full scan cost on every query. glep pays it once: a persistent, self-healing trigram index answers warm queries in 20 to 234 ms on a Linux-kernel-sized tree where ripgrep's full scan takes 1.3 s at best, with text output byte-compatible with ripgrep's, enforced in CI by a differential harness that runs about 2,000 rg-vs-glep comparisons (some 880 distinct command lines), on both the single-thread and the worker-pool search paths. No daemon.
 
 ## Install
 
@@ -80,7 +80,7 @@ Known differences from rg:
 - `.git` and `.glep` are never listed or searched, even under `-uu`.
 - `.gitignore` rules apply even outside a git repository (like `rg --no-require-git`); pass `--require-git` for rg's default.
 - `--max-filesize` caps what the index stores (larger files are still searched) instead of skipping files.
-- glep never reads stdin, so a search with no path argument always searches the tree.
+- glep never searches stdin (it reads stdin only for patterns, under `-f -`), so a search with no path argument always searches the tree.
 - The `searches` and `bytes searched` counters of `--stats` and the `--json` summary count only the files glep actually opened, after index narrowing.
 - A binary file is read as rg 15.0 reads it: in buffers of 64 KiB, each filled whole before it is searched, and a NUL ends the search before the buffer holding it is searched. rg 15.1 and later search after any read that ends a line, and their byte-order-mark check hands a file's first three bytes over in a read of their own, so on a binary file whose first line is one or two bytes long they print that line, and with a NUL past the first 64 KiB they can stop at another line than rg 15.0 and glep do.
 - Every file is read with a fresh 64 KiB buffer. rg keeps one buffer per search thread, and a line of 64 KiB or more grows it for every file that thread searches afterwards, so under `--sort path` (one thread, in path order) a file with a NUL past its first 64 KiB that sorts after such a line can stop earlier in rg, or print nothing. rg's output for that file then depends on which files it searched before it, and without `--sort` on which thread searched them.
